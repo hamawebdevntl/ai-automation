@@ -1,95 +1,93 @@
-# Final stack — decided 2026-08-30
+# Final stack — revised 2026-08-30 (production core swapped)
 
-Four repos kept. Two roles are "deploy/fork and own", two are "harvest".
+## Change: MoneyPrinterTurbo replaces OpenMontage as the production core
 
-| # | Repo | License | Role | How we use it |
+Made on the user's judgement that OpenMontage's **output** is weak next to
+MoneyPrinterTurbo's. My earlier promotion of OpenMontage was based on repo
+signals (commit velocity, architecture, declarative pipelines) — those measure
+the project, not the videos. Re-measured MPT properly and it wins on the repo
+signals too; my earlier "no valid data" reading came from a shallow clone.
+
+| | MoneyPrinterTurbo | OpenMontage |
+|---|---|---|
+| License | **MIT** | AGPL-3.0 |
+| Last commit | 2026-08-30 | 2026-08-22 |
+| Commits 90d | 224 | 345 |
+| Contributors 365d | **79** | 53 |
+| Top-author share | 59% | 69% |
+| Orchestration | **deterministic REST API** | requires an AI coding assistant |
+| Render engine | FFmpeg (no license) | Remotion |
+
+## Final repo set
+
+| # | Repo | License | Role | How |
 |---|---|---|---|---|
-| 1 | postiz-app | AGPL-3.0 | Publish + analytics (stages 11-12) | Deploy as-is to AWS. **Never fork.** Call REST v1 over the network. |
-| 2 | OpenMontage | AGPL-3.0 | Production core (stages 4-9) | **Fork and import.** Pipeline styles, cost governance, QC, remotion-composer. |
-| 3 | ViralMint | AGPL-3.0 | Trend research (stage 1) | Harvest `trend_velocity_service`, `youtube_scout`, `google_trends_svc`, `news_scout`. |
-| 4 | TikTok-Api | MIT | TikTok trend source (stage 1) | Dependency. **Thin: 12 commits/365d, 1 author** — wrap behind an interface. |
+| 1 | MoneyPrinterTurbo | MIT | Production core, stages 4-8 | **Fork and own.** Drive its REST API. |
+| 2 | postiz-app | AGPL-3.0 | Publish + analytics, 11-12 | Deploy as-is, never fork, call over REST. |
+| 3 | OpenMontage | AGPL-3.0 | **Read-only QC reference** | Never imported. Port the *ideas* into our MIT code. |
+| 4 | ViralMint | AGPL-3.0 | Trend research reference | Reimplement velocity scoring (337 LOC) rather than import. |
+| 5 | TikTok-Api | MIT | TikTok trend source | Dependency, wrapped. 1 author — expect it to break. |
 
-Removed: `vanta` (2,723 LOC of fetch wrappers + affiliate funnel), `short-video-maker`
-(abandoned 14 months, Remotion hardcoded), `revideo` (24 commits in 2 years, 1 author),
-`MoneyPrinterTurbo` (no role once we chose style-variety over engine-variety;
-its activity was never successfully measured — repo stayed shallow through two fetches).
+## What MoneyPrinterTurbo actually gives us
+- **Script**: `llm.py` — Azure / Gemini / Qwen / Ollama and others.
+- **Voice**: `voice.py` — Azure, Edge, **ElevenLabs**, SiliconFlow.
+- **Visuals**: 7 sources — `pexels`, `pixabay`, `coverr`, `local`, plus two
+  **generative** lanes (`wavespeed` text-to-video and `volcengine_seedance`).
+- **Captions**: `subtitle.py` with full styling — font, size, fore/stroke
+  colour, stroke width, position, rounded background.
+- **Music**: `bgm.py`, `elevenlabs_music.py`, `sonilo.py` (AI music from a prompt).
+- **API**: `POST /videos`, `POST /audio`, `POST /subtitle`, `GET /tasks`,
+  `GET /download`, `GET /stream`. Headless, deterministic, Step-Functions-friendly.
+- **Portrait 9:16 is the default** (`schema.py:84`).
 
-## Licensing position
-- **Remotion: free tier.** Non-profit, so the 4+ headcount rule does not apply. $0.
-- **AGPL: accepted, internal-only.** Never distributed, never offered to third
-  parties, so the source-provision trigger never fires.
-- **Containment rule (enforce architecturally):** AGPL code lives only in the
-  render service and the trend service. It must never be linked into the staff
-  approval web app, and that app must never be exposed publicly. If this
-  system ever becomes customer-facing or is sold, the obligation activates and
-  this decision must be revisited.
+## What this change buys
+1. **The AGPL problem on the production core disappears.** Only Postiz stays
+   AGPL, and it was always behind a network boundary. The containment rule
+   gets much easier to hold.
+2. **Remotion is gone entirely** — no license question at all, not even the
+   non-profit exemption to track.
+3. **The orchestration decision mostly dissolves.** MPT is deterministic Python
+   behind REST. Agentic work retreats to stages 1-2 (trend research, idea
+   generation) where variability is actually wanted. "Hybrid" now means
+   agentic research + wholly deterministic production.
+4. **Better AWS fit.** Python + FFmpeg on Fargate is far simpler to run than
+   headless Remotion in a container.
 
-## Pipeline map
-```
-1  Trend research      ViralMint scouts + TikTok-Api + Google Trends
-2  Idea generation     custom (Claude on Bedrock)
-3  GATE 1 approval     custom Next.js app - shows style options + $ estimate each
-4  Script              OpenMontage script-director
-5  Voice               OpenMontage tts_selector
-6  Visuals             OpenMontage video_selector / image_selector
-7  Compose             OpenMontage remotion-composer (Remotion, free tier)
-8  Captions            OpenMontage subtitle burn-in
-9  QC                  composition_validator + slideshow_risk + final_review
-10 GATE 2 approval     custom Next.js app
-11 Publish             Postiz POST /upload -> POST /posts
-12 Analytics           Postiz GET /analytics/:integration
-13 Orchestration       AWS Step Functions, both gates via task tokens
-```
+## What we must build to not break requirements
+| Lost with OpenMontage | Replacement | Est. |
+|---|---|---|
+| QC ("quality-checked" is an explicit requirement) | Our own MIT service: ffprobe validation, audio-level check, caption presence, and a slideshow-risk score. Port the *design* from OpenMontage, write our own code. | ~1 week |
+| Cost estimate per style at Gate 1 | Cost table per provider x preset. Simpler than OpenMontage's estimate/reserve/reconcile because `video_source` is the dominant cost driver: pexels/pixabay/coverr are free, wavespeed/seedance bill per request. | ~3 days |
+| 13 declarative pipeline styles | **Named presets over `VideoParams`** (~35 knobs: video_source, concat/transition mode, clip duration/speed, voice, bgm, full subtitle styling, `custom_system_prompt` for brand voice). Cleaner than the YAML because it is our code. | ~3 days |
+| Avatar / talking-head lane | **MPT has none** — no avatar, heygen, lipsync or musetalk anywhere in `app/`. Open question: do we need this style at all? If yes, call HeyGen directly. | ~3 days if wanted |
 
-## How "owner picks a style with cost shown" is wired
-`pipeline_defs/*.yaml` each declare `budget_default_usd` and
-`max_wall_time_minutes`. `tools/cost_tracker.py` produces a preflight estimate
-before any paid call. We expose a `/estimate` endpoint on the render service
-that runs the preflight across the candidate styles for a given idea and
-returns cost + ETA per style. Gate 1 in the Next.js app renders that as the
-choice the owner makes. Budget `cap` mode then enforces the ceiling at runtime.
+## Requirements check after the swap
+- R1 trend research — unchanged (still the weakest area, see GAPS.md).
+- R2 human approval — unchanged, custom Next.js app, both gates.
+- R3 scripted / voiced / visual / captioned / **quality-checked** — first four
+  native to MPT; QC is the one genuine rebuild.
+- R4 publish to IG / TikTok / YT Shorts / LinkedIn — unchanged, Postiz.
+  (MPT ships `upload_post.py` for a third-party cross-poster; we ignore it —
+  it lacks LinkedIn and Postiz is better.)
+- R5 AWS — unchanged, and now a better fit.
+- R6 10/day — easier than before. Platform quotas remain the binding constraint.
 
-## Decisions (all confirmed 2026-08-30)
+**No requirement breaks. QC moves from third-party to ours.**
 
-| Question | Decision |
-|---|---|
-| Variety | **Style, not engine.** One engine (Remotion), 13 pipeline styles at different price points. |
-| Publishing | Self-host Postiz, call REST v1. |
-| AGPL | Fork + import, internal-only. Containment rule above is binding. |
-| Remotion license | Free tier — non-profit. $0. |
-| Approval gates | Custom Next.js app, both gates. |
-| AWS depth | **Infrastructure only.** Step Functions / Fargate / S3 / RDS / Secrets Manager on AWS; generation stays with Kling / Runway / HeyGen / ElevenLabs, which OpenMontage already supports. No Bedrock provider to write. |
-| Orchestration | **Hybrid.** Agentic for research, script and scene planning; deterministic Python for asset generation, compose, QC and publish. |
+## Decision: HeyGen presenter lane (confirmed)
+MPT has no avatar capability, so the presenter style is added as its own lane
+beside MPT's, fed the same script and caption styling so output stays on-brand
+across lanes. ~3 days. It becomes the premium option at Gate 1.
 
-### What hybrid orchestration means concretely
-- **Agentic zone** (Claude Agent SDK inside the render service, invoked per job):
-  stages 1-2 research and idea generation, stage 4 scripting, stage 6 scene
-  planning. Variability is a feature here.
-- **Deterministic zone** (plain Python over OpenMontage's importable modules —
-  `tools/tool_registry.py`, `tools/cost_tracker.py`, the `*_selector.py` tools,
-  `composition_validator.py`, `lib/slideshow_risk.py`): asset generation,
-  compose, captions, QC, publish. Variability is a liability here, and none of
-  this layer needs an agent.
-- Step Functions owns the job state machine and both human gates via task tokens.
+**Budget flag:** HeyGen runs roughly $1-2/reel against ~$0.10-0.40 for the
+stock lanes. If the owner picks it for all 10 reels/day that is **$300-600/month**
+versus ~$30-120 for stock. This is exactly why the Gate 1 cost display matters
+— it is the control, so build it before the lane goes live, and set a monthly
+ceiling on the presenter lane specifically.
 
-## Build order
-1. **Postiz on AWS**, publish one hand-made video to all four platforms via its
-   API. Proves the hardest external dependency first.
-   **Start TikTok app approval on day one — it takes 2-4 weeks and is critical path.**
-2. **Fork OpenMontage**, render one reel through one pipeline style with real
-   provider keys, deterministic path only.
-3. **`/estimate` endpoint** — preflight cost across candidate styles. This is
-   what makes Gate 1 meaningful.
-4. **Next.js approval app**, both gates, wired to Step Functions task tokens.
-5. **Step Functions** state machine end to end.
-6. **Trend research service** — harvest ViralMint's scouts, wrap TikTok-Api
-   behind an interface (it is a 1-author repo; assume it breaks).
-7. **Analytics loop** — Postiz `/analytics/:integration` back into idea scoring.
-
-## Known risks
-- **OpenMontage bus factor is 1.** 310 of 448 commits in the last year are the
-  maintainer's. Very active now, but pin a commit and vendor the fork.
-- **TikTok-Api is 1 author, 12 commits/year**, scraping an API that fights
-  scrapers. Wrap it; expect to replace it.
-- **Brand templates built in `remotion-composer` are AGPL-derived.** Fine while
-  internal-only, per the containment rule.
+## Final style registry (presets over VideoParams + one external lane)
+| Style | Source | Rough cost/reel | Notes |
+|---|---|---|---|
+| Stock b-roll | pexels / pixabay / coverr | ~$0.10-0.40 | Default. TTS + kinetic captions. |
+| Generative | wavespeed / volcengine_seedance | billed per request | Novel visuals; verify per-model pricing before enabling. |
+| Presenter | HeyGen (external lane) | ~$1-2 | Premium. Best for LinkedIn. Cap monthly spend. |
