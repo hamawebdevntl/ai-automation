@@ -2,7 +2,8 @@ import { Clock3Icon, CoinsIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
-import type { StylePresetRow } from '@/lib/database.types';
+import { useOwner } from '@/features/auth/use-owner';
+import { RENDER_MODE_LABELS, type StylePresetRow } from '@/lib/database.types';
 import { formatCostRange, formatMinutes } from '@/lib/format';
 import { cn } from '@/lib/utils';
 
@@ -21,6 +22,12 @@ export function StylePicker({
   onChange: (styleId: string) => void;
   disabled?: boolean;
 }) {
+  // Which engine runs is operational detail rather than an editorial choice,
+  // so it is shown only to the people who can actually act on it. `video_source`
+  // alone is ambiguous now that two presets share the value "fal" and differ in
+  // how much of the render it does.
+  const { isOwner } = useOwner();
+
   return (
     <RadioGroup
       value={value ?? ''}
@@ -48,6 +55,11 @@ export function StylePicker({
                 <Badge variant="secondary" className="text-[0.7rem] font-normal">
                   {preset.video_source}
                 </Badge>
+                {isOwner && preset.render_mode !== 'mpt' && (
+                  <Badge variant="outline" className="text-[0.7rem] font-normal">
+                    {RENDER_MODE_LABELS[preset.render_mode]}
+                  </Badge>
+                )}
               </div>
               {preset.description && <p className="text-sm font-normal text-muted-foreground">{preset.description}</p>}
               <div className="flex flex-wrap items-center gap-4 pt-1 text-sm">

@@ -47,6 +47,15 @@ DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
 
 
 def lambda_handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
+    # A state may pass its entire input through as `payload` rather than
+    # enumerating fields. That matters once a render can run on more than one
+    # backend: the state carries different keys depending on which one is in
+    # play, and Step Functions fails on a missing JSONPath rather than treating
+    # it as null, so listing them would break the moment a backend differed.
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        event = {**payload, **{k: v for k, v in event.items() if k != "payload"}}
+
     activity = event.get("activity") or _activity_from_sqs(event)
     if not activity:
         raise ValueError(f"no activity in payload: {sorted(event)[:8]}")

@@ -21,6 +21,7 @@ into the trend task, so they live here too.
   "MPT_API_KEY":               "a long random string; MoneyPrinterTurbo compares it in constant time",
   "POSTIZ_API_KEY":            "from Postiz Settings → Public API",
   "ANTHROPIC_API_KEY":         "for idea generation",
+  "FAL_API_KEY":               "only needed if a fal preset is active; sent as 'Authorization: Key …', not Bearer",
   "GATE_BRIDGE_SECRET":        "shared header for the webhook bridge",
   "NICHE_BRIEF":               "what we do, who we speak to, and what we must NOT claim",
   "TREND_HASHTAGS":            "comma,separated,hashtags",

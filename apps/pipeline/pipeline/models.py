@@ -134,6 +134,10 @@ class VideoParams(BaseModel):
     video_terms: str | list[str] | None = None
     video_aspect: str = "9:16"
     video_source: str = "pexels"
+    # Required whenever video_source is "local", which is how clips generated
+    # elsewhere are handed to MoneyPrinterTurbo for assembly. Each entry's
+    # `url` is a filename inside its storage/local_videos, not a link.
+    video_materials: list[dict[str, Any]] | None = None
     video_count: int = 1
     video_clip_duration: int = 5
     video_concat_mode: str = "random"

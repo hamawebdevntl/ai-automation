@@ -37,6 +37,17 @@ class Settings(BaseSettings):
     postiz_base_url: str = Field(alias="POSTIZ_BASE_URL")
     postiz_api_key: str = Field(alias="POSTIZ_API_KEY")
 
+    # --- fal.ai -------------------------------------------------------------
+    # The second render backend. Selected per style preset via
+    # style_presets.render_mode, so nothing here decides which one a video uses.
+    fal_api_key: str = Field(default="", alias="FAL_API_KEY")
+    fal_transcribe_model: str = Field(
+        default="fal-ai/whisper", alias="FAL_TRANSCRIBE_MODEL"
+    )
+    # A generated clip's URL is public and expires, so the end-to-end path must
+    # fetch promptly rather than storing the URL and coming back to it.
+    fal_poll_budget_seconds: int = Field(default=1800, alias="FAL_POLL_BUDGET_SECONDS")
+
     # --- Trend research -----------------------------------------------------
     # The niche brief is what makes idea generation relevant rather than
     # generically topical. There is no sensible default: without it every idea

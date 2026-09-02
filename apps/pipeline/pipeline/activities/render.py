@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pipeline.clients.fal import FalClient, FalError, FalRefused
 from pipeline.clients.mpt import MptClient, MptError, MptQueueFull, MptTaskStateLost
 from pipeline.clients.supa import Supa
 from pipeline.config import settings
@@ -28,6 +29,11 @@ log = logging.getLogger(__name__)
 # "state lost", so the poller tolerates a few before calling it terminal.
 GRACE_POLLS_ON_404 = 3
 
+# render_mode values, from style_presets.render_mode.
+MPT = "mpt"                  # MoneyPrinterTurbo does everything
+FAL_VISUALS = "fal_visuals"  # fal generates clips, MPT assembles them
+FAL_FULL = "fal_full"        # fal generates visuals and voice, we assemble
+
 
 def submit_render(
     event: dict[str, Any], supa: Supa | None = None, mpt: MptClient | None = None
@@ -40,11 +46,14 @@ def submit_render(
     production = supa.production(production_id)
     idea = supa.idea(production["idea_id"])
     preset = supa.style_preset(production["style_preset_id"])
+    mode = preset.get("render_mode") or MPT
 
     task_id = production_id
 
     # Claim the right to submit. Only one caller can win, so a duplicated
-    # activity invocation cannot start a second paid render.
+    # activity invocation cannot start a second paid render. The claim is taken
+    # before the backend is chosen, so it guards fal spend exactly as it guards
+    # MoneyPrinterTurbo's.
     if not supa.claim_render_slot(production_id, task_id):
         existing = supa.production(production_id).get("task_id")
         log.info("production %s already claimed with task %s", production_id, existing)
@@ -53,11 +62,18 @@ def submit_render(
         # on a missing path rather than treating it as null.
         return {
             "production_id": production_id,
+            "backend": mode,
+            "phase": MPT if mode == MPT else "fal",
             "task_id": existing or task_id,
             "deduplicated": True,
             "polls": 0,
             "started_at": time.time(),
         }
+
+    supa.update_production(production_id, render_backend=mode)
+
+    if mode in (FAL_VISUALS, FAL_FULL):
+        return _submit_fal(production_id, idea, preset, mode, supa)
 
     params = _build_params(idea, preset, task_id)
 
@@ -90,7 +106,88 @@ def submit_render(
 
     return {
         "production_id": production_id,
+        "backend": MPT,
+        "phase": MPT,
         "task_id": returned,
+        "started_at": time.time(),
+        "polls": 0,
+    }
+
+
+def _submit_fal(
+    production_id: str,
+    idea: dict[str, Any],
+    preset: dict[str, Any],
+    mode: str,
+    supa: Supa,
+    fal: FalClient | None = None,
+) -> dict[str, Any]:
+    """Enqueue generation on fal.
+
+    fal has no idempotency key of its own, so the conditional claim taken by
+    the caller is the only guard against paying twice. Unlike the
+    MoneyPrinterTurbo path, the claim is *not* released on an ambiguous
+    failure: a resubmit there is safe because our fork deduplicates on our task
+    id, whereas here it would be a second billed generation. An ambiguous fal
+    failure parks instead.
+    """
+    fal = fal or FalClient()
+    cfg = (preset.get("params") or {}).get("fal") or {}
+    model = cfg.get("model")
+    if not model:
+        raise ValueError(
+            f"preset {preset.get('slug')!r} has render_mode {mode} but no params.fal.model"
+        )
+
+    subject = " -- ".join(p for p in (idea.get("title") or "", idea.get("hook") or "") if p)
+
+    # One generation of the whole runtime, not one request per clip. The models
+    # we use accept a duration up to their own ceiling, so a single request is
+    # one thing to poll and one thing billed -- and on the visuals path
+    # MoneyPrinterTurbo subdivides it anyway, since preprocess_video cuts
+    # supplied material to video_clip_duration.
+    wanted = int(cfg.get("clips", 1)) * int(cfg.get("clip_seconds", 5))
+    duration = max(1, min(wanted, int(cfg.get("max_duration_seconds", 20))))
+
+    payload: dict[str, Any] = {
+        "prompt": (idea.get("angle") or subject or "").strip()[:1500],
+        "aspect_ratio": cfg.get("aspect_ratio", "9:16"),
+        "resolution": cfg.get("resolution", "1080p"),
+        "duration": duration,
+    }
+    if cfg.get("fps"):
+        payload["fps"] = int(cfg["fps"])
+
+    try:
+        handles = fal.submit(model, payload)
+    except FalRefused as exc:
+        # A refusal is about the content, so it parks rather than retrying or
+        # quietly falling back to another backend.
+        return _fail(supa, production_id, f"fal declined the prompt: {exc}")
+    except Exception:
+        supa.update_production(production_id, task_id=None, status=ProductionStatus.QUEUED.value)
+        raise
+
+    # The end-to-end path has no other source of narration text: fal generates
+    # pictures and speech, not a script. Written now rather than at assembly
+    # time so a failure here costs nothing -- no generation has been billed yet.
+    if mode == FAL_FULL:
+        try:
+            script = MptClient().generate_script(subject or idea.get("title") or "", paragraphs=1)
+            supa.update_production(production_id, script=script)
+        except Exception as exc:  # noqa: BLE001
+            return _fail(supa, production_id, f"could not write a narration script: {exc}")
+
+    supa.update_production(production_id, stage=f"fal generating ({model})")
+    return {
+        "production_id": production_id,
+        "backend": mode,
+        "phase": "fal",
+        "task_id": production_id,
+        "fal_model": model,
+        "fal_request_id": handles["request_id"],
+        "fal_status_url": handles["status_url"],
+        "fal_response_url": handles["response_url"],
         "started_at": time.time(),
         "polls": 0,
     }
@@ -136,14 +233,23 @@ def poll_render(
     task_id = event.get("task_id") or production_id
     polls = int(event.get("polls", 0)) + 1
     started_at = float(event.get("started_at") or 0)
+    backend = event.get("backend") or MPT
+
+    # While generation is still on fal, poll fal. Once the visuals path has
+    # handed its clips to MoneyPrinterTurbo the phase flips and the rest of this
+    # function serves both backends unchanged -- which is why the state machine
+    # does not need to know which one ran.
+    if backend in (FAL_VISUALS, FAL_FULL) and event.get("phase") == "fal":
+        return _poll_fal(event, supa, mpt, polls)
 
     try:
         status = mpt.get_task(task_id)
     except MptTaskStateLost:
         if polls <= GRACE_POLLS_ON_404:
             # Probably not registered yet rather than lost.
-            return {"production_id": production_id, "state": "running", "polls": polls,
-                    "progress": 0, "task_id": task_id, "started_at": started_at}
+            return {"production_id": production_id, "backend": backend, "phase": MPT,
+                    "state": "running", "polls": polls, "progress": 0,
+                    "task_id": task_id, "started_at": started_at}
         return _fail(
             supa, production_id,
             "render state was lost -- MPT restarted without Redis, or the task never registered",
@@ -161,7 +267,8 @@ def poll_render(
     if status.is_failed:
         return _fail(
             supa, production_id,
-            f"render failed at stage {status.failed_stage or 'unknown'}: {status.error or 'no detail'}",
+            f"render failed at stage {status.failed_stage or 'unknown'}: "
+            f"{status.error or 'no detail'}",
         )
 
     if status.is_complete:
@@ -171,6 +278,8 @@ def poll_render(
         supa.update_production(production_id, stage="rendered")
         return {
             "production_id": production_id,
+            "backend": backend,
+            "phase": MPT,
             "state": "complete",
             "task_id": task_id,
             "polls": polls,
@@ -181,8 +290,138 @@ def poll_render(
         }
 
     supa.update_production(production_id, stage=f"render {status.progress}%")
-    return {"production_id": production_id, "state": "running", "polls": polls,
-            "progress": status.progress, "task_id": task_id, "started_at": started_at}
+    return {"production_id": production_id, "backend": backend, "phase": MPT,
+            "state": "running", "polls": polls, "progress": status.progress,
+            "task_id": task_id, "started_at": started_at}
+
+
+def _poll_fal(
+    event: dict[str, Any], supa: Supa, mpt: MptClient, polls: int, fal: FalClient | None = None
+) -> dict[str, Any]:
+    """Poll a fal generation, and hand off when it finishes.
+
+    On the visuals path this is where the two backends meet: the clips are
+    uploaded into MoneyPrinterTurbo and an ordinary render is submitted against
+    them, after which the phase flips to `mpt` and every later poll takes the
+    original code path.
+    """
+    fal = fal or FalClient()
+    production_id = event["production_id"]
+    backend = event["backend"]
+    started_at = float(event.get("started_at") or 0)
+
+    carry = {
+        "production_id": production_id,
+        "backend": backend,
+        "phase": "fal",
+        "task_id": event.get("task_id") or production_id,
+        "fal_model": event.get("fal_model"),
+        "fal_request_id": event.get("fal_request_id"),
+        "fal_status_url": event.get("fal_status_url"),
+        "fal_response_url": event.get("fal_response_url"),
+        "started_at": started_at,
+        "polls": polls,
+    }
+
+    budget = settings().fal_poll_budget_seconds
+    if started_at and (time.time() - started_at) > budget:
+        return _fail(
+            supa, production_id,
+            f"fal generation exceeded its {budget}s budget (request {event.get('fal_request_id')})",
+        )
+
+    try:
+        body = fal.status(event["fal_status_url"])
+        if not fal.is_terminal(body):
+            supa.update_production(production_id, stage=f"fal {str(body.get('status','')).lower()}")
+            return {**carry, "state": "running", "progress": 25}
+        # COMPLETED is not success: it means no longer queued. The result call
+        # raises on an error carried alongside that status.
+        result = fal.result(event["fal_response_url"])
+    except FalRefused as exc:
+        return _fail(supa, production_id, f"fal declined this content: {exc}")
+    except FalError as exc:
+        return _fail(supa, production_id, f"fal generation failed: {exc}")
+
+    urls = fal.video_urls(result)
+    if not urls:
+        return _fail(supa, production_id, f"fal reported success but returned no video: {result}")
+
+    if backend == FAL_FULL:
+        # Nothing else to do on fal's side; assembly happens where ffmpeg is.
+        supa.update_production(production_id, stage="fal generated")
+        return {
+            **carry,
+            "state": "complete",
+            "progress": 100,
+            "phase": "fal",
+            "fal_video_urls": urls,
+            "video_ref": urls[0],
+            "subtitle_path": None,
+            "script": None,
+        }
+
+    return _handoff_to_mpt(event, supa, mpt, fal, urls, carry)
+
+
+def _handoff_to_mpt(
+    event: dict[str, Any],
+    supa: Supa,
+    mpt: MptClient,
+    fal: FalClient,
+    urls: list[str],
+    carry: dict[str, Any],
+) -> dict[str, Any]:
+    """Upload fal's clips into MoneyPrinterTurbo and start the real render.
+
+    `video_source="local"` is the only mode that accepts material MPT did not
+    fetch itself, and it resolves each entry as a path inside
+    storage/local_videos -- so the bytes must be uploaded, not linked. fal's
+    URLs also expire, which is the other reason this happens now rather than
+    later.
+    """
+    production_id = event["production_id"]
+    production = supa.production(production_id)
+    idea = supa.idea(production["idea_id"])
+    preset = supa.style_preset(production["style_preset_id"])
+
+    supa.update_production(production_id, stage="uploading fal clips")
+    names: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=f"fal-{production_id}-") as tmp:
+        for index, url in enumerate(urls):
+            local = fal.download(url, Path(tmp) / f"clip-{index:02d}.mp4")
+            names.append(mpt.upload_material(local))
+
+    params = _build_params(idea, preset, production_id)
+    # Forced, not taken from the preset: any other source would make MPT fetch
+    # its own footage and silently discard everything fal just generated.
+    params.video_source = "local"
+    params.video_materials = [{"provider": "local", "url": name} for name in names]
+
+    try:
+        returned = mpt.submit_render(params)
+    except MptQueueFull:
+        # The clips are uploaded and paid for, so releasing the claim would
+        # risk regenerating them. Keep the claim and let the state machine
+        # retry this state instead.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return _fail(
+            supa, production_id,
+            f"fal clips were generated but the assembling render could not start: {exc}",
+        )
+
+    supa.update_production(production_id, stage="assembling")
+    return {
+        **carry,
+        "phase": MPT,
+        "task_id": returned,
+        "state": "running",
+        "progress": 50,
+        # The clock restarts: the render budget applies to the render, not to
+        # the fal generation that preceded it.
+        "started_at": time.time(),
+    }
 
 
 def _fail(supa: Supa, production_id: str, message: str) -> dict[str, Any]:
@@ -215,11 +454,20 @@ def fetch_and_qc(
     mpt = mpt or MptClient()
     production_id = event["production_id"]
     video_ref = event["video_ref"]
+    backend = event.get("backend") or MPT
 
     has_subtitles = bool(event.get("subtitle_path"))
 
     with tempfile.TemporaryDirectory(prefix=f"render-{production_id}-") as tmp:
-        local = mpt.download_artifact(video_ref, Path(tmp) / "final.mp4")
+        if backend == FAL_FULL:
+            # No MoneyPrinterTurbo render exists to fetch: fal produced raw
+            # clips and speech, and everything MPT would have done has to
+            # happen here.
+            local, has_subtitles = _assemble_fal_full(event, supa, Path(tmp))
+        else:
+            # Both the pure-MPT path and the visuals path converge here: the
+            # visuals path's finished file is an ordinary MPT render.
+            local = mpt.download_artifact(video_ref, Path(tmp) / "final.mp4")
 
         info = probe_mod.probe(local)
         key = supa.upload_render(production_id, local, "final.mp4")
@@ -271,6 +519,76 @@ def fetch_and_qc(
         "qc_passed": report.passed,
         "slideshow_risk": report.slideshow_risk,
     }
+
+
+def _assemble_fal_full(
+    event: dict[str, Any], supa: Supa, tmp: Path, fal: FalClient | None = None
+) -> tuple[Path, bool]:
+    """Turn fal's raw output into a finished reel.
+
+    This is the cost of the end-to-end path, and the reason the visuals path is
+    the default: everything MoneyPrinterTurbo does after generation has to be
+    reproduced here.
+
+    Captions come from transcribing the narration we just synthesised, not from
+    splitting the script on punctuation. A caption track built from text alone
+    drifts within a couple of sentences, and captions that are visibly out of
+    sync read as broken rather than absent.
+    """
+    from pipeline import assemble
+
+    fal = fal or FalClient()
+    production_id = event["production_id"]
+    production = supa.production(production_id)
+    preset = supa.style_preset(production["style_preset_id"])
+    cfg = (preset.get("params") or {}).get("fal") or {}
+
+    urls = event.get("fal_video_urls") or [event["video_ref"]]
+    clips = [
+        fal.download(url, tmp / f"clip-{i:02d}.mp4") for i, url in enumerate(urls)
+    ]
+
+    supa.update_production(production_id, stage="assembling (fal)")
+    joined = assemble.concat(clips, tmp / "joined.mp4")
+    portrait = assemble.to_portrait(joined, tmp / "portrait.mp4")
+
+    script = (production.get("script") or "").strip()
+    if not script:
+        # Without narration there is nothing to voice or caption, so ship the
+        # visuals and let the quality report say what is missing rather than
+        # discarding a generation that has already been paid for.
+        log.warning("production %s has no script; shipping silent visuals", production_id)
+        return portrait, False
+
+    tts_model = cfg.get("tts_model")
+    if not tts_model:
+        return portrait, False
+
+    voiced = portrait
+    has_subtitles = False
+    try:
+        speech = fal.wait(fal.submit(tts_model, {"text": script[:4000]}))
+        audio_url = fal.audio_url(speech)
+        if not audio_url:
+            raise FalError(f"tts returned no audio: {speech}")
+        audio = fal.download(audio_url, tmp / "narration.mp3")
+        voiced = assemble.mux_narration(portrait, audio, tmp / "voiced.mp4")
+
+        if cfg.get("burn_captions", True):
+            words = fal.wait(fal.transcribe(audio_url))
+            srt = assemble.srt_from_transcription(words, tmp / "captions.srt")
+            if srt:
+                voiced = assemble.burn_subtitles(
+                    voiced, srt, tmp / "captioned.mp4", font_size=cfg.get("font_size", 60)
+                )
+                has_subtitles = True
+    except Exception as exc:  # noqa: BLE001
+        # Narration or captions failing does not justify throwing away paid
+        # visuals. The quality report records what is missing and the reviewer
+        # decides at Gate 2.
+        log.warning("fal narration/captions incomplete for %s: %s", production_id, exc)
+
+    return voiced, has_subtitles
 
 
 def _extract_poster(video: Path, dest: Path) -> Path:

@@ -154,6 +154,56 @@ class MptClient:
                         fh.write(chunk)
         return dest
 
+    def generate_script(self, subject: str, language: str = "", paragraphs: int = 1) -> str:
+        """Write a narration script.
+
+        A synchronous LLM call. Reused by the end-to-end fal path, which has no
+        narration text of its own -- fal generates pictures and speech, not a
+        script, and standing up a second script generator when this one is
+        already deployed and already tuned for short-form would be waste.
+        """
+        data = self._request(
+            "POST",
+            "scripts",
+            json={
+                "video_subject": subject,
+                "video_language": language,
+                "paragraph_number": paragraphs,
+            },
+        )
+        script = data.get("video_script") or data.get("script") or ""
+        if not script:
+            raise MptError(f"script generation returned nothing usable: {data}")
+        return str(script)
+
+    # -- supplied materials ------------------------------------------------
+
+    def upload_material(self, local: Path) -> str:
+        """Upload a clip for MoneyPrinterTurbo to assemble, and return its name.
+
+        This is what makes a second visual backend possible without a second
+        assembly path. `video_source="local"` resolves each material through
+        `resolve_path_within_directory` against `storage/local_videos` and
+        rejects anything outside it, so a remote URL cannot be handed over --
+        the bytes have to be uploaded first.
+        """
+        with local.open("rb") as fh:
+            with httpx.Client(timeout=None) as client:
+                resp = client.post(
+                    self._url("video_materials"),
+                    headers=self._headers,
+                    files={"file": (local.name, fh, "video/mp4")},
+                )
+        if resp.status_code >= 400:
+            raise MptError(f"material upload -> {resp.status_code}: {resp.text[:300]}")
+        data = resp.json().get("data") or {}
+        name = data.get("file") or data.get("name") or data.get("path")
+        if not name:
+            raise MptError(f"material upload returned no filename: {data}")
+        # MPT resolves materials relative to its own storage/local_videos, so
+        # hand back only the basename.
+        return str(name).rsplit("/", 1)[-1]
+
     # -- copy --------------------------------------------------------------
 
     def social_metadata(

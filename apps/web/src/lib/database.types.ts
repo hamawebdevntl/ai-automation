@@ -26,6 +26,28 @@ export type VelocityLabel = 'breakout' | 'rising' | 'steady' | 'declining';
 
 export type StyleLane = 'stock' | 'generative' | 'presenter';
 
+/**
+ * Which backend renders a preset.
+ *
+ * Separate from `lane` on purpose: a lane is what the video looks like, which
+ * is what the owner is choosing between at Gate 1, while this is which engine
+ * produces that look. Two presets can share a lane and differ here.
+ *
+ *  - `mpt`         MoneyPrinterTurbo does everything.
+ *  - `fal_visuals` fal generates the footage; MoneyPrinterTurbo voices,
+ *                  captions and assembles it as usual.
+ *  - `fal_full`    fal generates footage and narration; the pipeline assembles
+ *                  and captions. A separate output path, so its results are
+ *                  not directly comparable with the other two.
+ */
+export type RenderMode = 'mpt' | 'fal_visuals' | 'fal_full';
+
+export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
+  mpt: 'Standard render',
+  fal_visuals: 'fal footage, standard assembly',
+  fal_full: 'fal end to end',
+};
+
 export type ProductionStatus =
   | 'queued'
   | 'running'
@@ -55,6 +77,7 @@ export type StylePresetRow = {
   description: string | null;
   lane: StyleLane;
   video_source: string;
+  render_mode: RenderMode;
   est_cost_min_usd: number;
   est_cost_max_usd: number;
   est_minutes: number;
@@ -91,6 +114,8 @@ export type ProductionRow = {
   status: ProductionStatus;
   stage: string | null;
   task_id: string | null;
+  /** The render_mode in force when this ran, kept even if the preset later changes. */
+  render_backend: RenderMode | null;
   execution_arn: string | null;
   script: string | null;
   video_url: string | null;
