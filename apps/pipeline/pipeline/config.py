@@ -6,6 +6,8 @@ service-role key should fail loudly at import, not silently write nowhere.
 
 from __future__ import annotations
 
+import json
+import os
 from functools import lru_cache
 
 from pydantic import Field
@@ -58,6 +60,33 @@ class Settings(BaseSettings):
     gate_bridge_secret: str | None = Field(default=None, alias="GATE_BRIDGE_SECRET")
 
 
+def _load_secrets_into_env() -> None:
+    """Resolve a Secrets Manager bundle into the environment.
+
+    Lambda cannot inject Secrets Manager values into environment variables, and
+    putting a service-role key or an API key in a plain Lambda env var leaves it
+    readable to anyone with GetFunctionConfiguration. So the ARN is the only
+    thing passed in, and the bundle is fetched once at cold start.
+
+    Existing environment variables win, which keeps local overrides and tests
+    working without touching AWS.
+    """
+    arn = os.environ.get("PIPELINE_SECRETS_ARN")
+    if not arn:
+        return
+    try:
+        import boto3
+
+        payload = boto3.client("secretsmanager").get_secret_value(SecretId=arn)["SecretString"]
+        for key, value in json.loads(payload).items():
+            os.environ.setdefault(key, str(value))
+    except Exception as exc:  # noqa: BLE001 - never log the payload
+        raise RuntimeError(
+            f"could not resolve PIPELINE_SECRETS_ARN: {type(exc).__name__}"
+        ) from exc
+
+
 @lru_cache(maxsize=1)
 def settings() -> Settings:
+    _load_secrets_into_env()
     return Settings()  # type: ignore[call-arg]

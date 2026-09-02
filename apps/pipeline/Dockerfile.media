@@ -1,0 +1,24 @@
+# Lambda image for fetch_and_qc: the one activity that handles the video.
+#
+# Needs ffmpeg and ffprobe for the quality checks (duration, streams, audio
+# level, freeze detection, scene changes) and for the poster frame. A static
+# build is used because Amazon Linux 2023 ships no ffmpeg package.
+FROM public.ecr.aws/lambda/python:3.12 AS ffmpeg
+RUN dnf install -y tar xz && dnf clean all
+WORKDIR /tmp/ff
+RUN curl -fsSL -o ff.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+ && tar -xJf ff.tar.xz --strip-components=1 \
+ && test -x ./ffmpeg && test -x ./ffprobe
+
+FROM public.ecr.aws/lambda/python:3.12
+COPY --from=ffmpeg /tmp/ff/ffmpeg /tmp/ff/ffprobe /usr/local/bin/
+
+COPY pyproject.toml ${LAMBDA_TASK_ROOT}/
+COPY pipeline ${LAMBDA_TASK_ROOT}/pipeline
+
+RUN python -m pip install --no-cache-dir --upgrade pip \
+ && python -m pip install --no-cache-dir "${LAMBDA_TASK_ROOT}" \
+ && python -m compileall -q "${LAMBDA_TASK_ROOT}/pipeline" \
+ && ffmpeg -version | head -1 && ffprobe -version | head -1
+
+CMD ["pipeline.handler.lambda_handler"]
