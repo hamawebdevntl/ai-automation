@@ -17,7 +17,7 @@ import logging
 import os
 from typing import Any, Callable
 
-from pipeline.activities import gates, publish, render
+from pipeline.activities import analytics, gates, publish, render
 from pipeline.activities import reconcile as recon
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -42,6 +42,7 @@ DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
     "reconcile_publishes": lambda event: recon.reconcile_publishes(),
     "reap_mpt_tasks": lambda event: recon.reap_mpt_tasks(),
     "expire_ideas": lambda event: recon.expire_ideas(),
+    "collect_analytics": lambda event: analytics.collect_analytics(),
 }
 
 

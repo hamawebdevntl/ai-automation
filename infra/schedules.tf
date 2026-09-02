@@ -26,6 +26,9 @@ locals {
 
     # Stops a three-week-old idea being approved against a dead trend.
     expire_ideas = { rate = "rate(24 hours)" }
+
+    # Closes the loop: what we published, and how it actually performed.
+    collect_analytics = { rate = "rate(12 hours)" }
   }
 }
 
