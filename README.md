@@ -136,16 +136,19 @@ must be re-examined before it does.
 
 ## Status
 
-**Decided:** the repo set, the production core, the publishing layer, the
-orchestration model, both approval gates, the style lanes, and the licensing
-position.
+**Built and deployed to code:** the two-gate approval app, the full pipeline
+(trend research, render, quality check, per-platform copy, publish, analytics),
+seven scheduled reconcilers, and the AWS infrastructure for all of it.
+Five migrations are applied to the live database.
 
-**Being built:** the quality-check service, the Gate 1 cost estimator, the
-style presets, the approval web app, and the AI presenter lane.
+**Needs your credentials to run:** the two Secrets Manager bundles, a
+certificate for the Postiz endpoint, and the platform channels connected by
+hand. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
-**Open and blocking:** the niche itself. Trend scouting and idea generation
-cannot be configured until we define what we publish about, who it is for, and
-which claims we are regulated on or will not make.
+**Open and outside our control:** the niche brief, without which trend research
+refuses to start; YouTube's quota extension; and TikTok's app audit. Until the
+last two clear, the pipeline publishes to Instagram and LinkedIn only, which is
+encoded in `platform_targets` rather than in code.
 
 ### Constraints worth knowing before you plan around this
 
@@ -153,13 +156,13 @@ which claims we are regulated on or will not make.
   extension requires a compliance audit and takes weeks.
 - **TikTok will not publish automatically without an audited app.** Without the
   audit, posts land in an inbox for someone to finish by hand.
-- Both of the above are multi-week, external, and on the critical path.
-- Trend research genuinely covers YouTube and Google Trends today. TikTok and
-  Instagram coverage is thin and should not be assumed.
+- Trend research genuinely covers TikTok hashtag feeds and Google Trends.
+  Instagram has no trend source at all and should not be assumed.
+- **Postiz must be publicly reachable.** Connecting a channel is an OAuth flow
+  completed in a browser, and the platforms require an HTTPS redirect URI on a
+  registered domain. Its own login is the boundary.
 
-Full detail in [GAPS.md](docs/GAPS.md).
-
----
+Full detail in [docs/GAPS.md](docs/GAPS.md).
 
 ## Documents
 
