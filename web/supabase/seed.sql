@@ -1,8 +1,15 @@
 -- =============================================================================
--- OPTIONAL demo rows — enough to exercise both gates before the pipeline that
--- writes them exists. Safe to skip, and safe to delete once real data flows:
+-- Seed — demo rows, enough to exercise both gates before the pipeline that
+-- writes them for real exists.
 --
---   delete from public.productions where id in (select id from public.productions where task_id like 'demo-%');
+-- This is a seed, not a migration: it runs only when asked for explicitly
+--
+--   supabase db push --include-seed
+--
+-- so an ordinary `db push` on a fresh environment does not carry demo content
+-- into it. Safe to delete once real data flows:
+--
+--   delete from public.productions where task_id like 'demo-%';
 --   delete from public.ideas where source = 'demo';
 -- =============================================================================
 

@@ -25,12 +25,14 @@ small — it is the only place a person is required.
 
 ```bash
 bun install
-cp .env.example .env      # fill in your Supabase project
 bun run dev               # http://localhost:3000
 
 bun run check             # lint, typecheck and test
 bun run build             # static bundle in dist/
 ```
+
+`.env` is already populated for the live project. `.env.local` holds the
+secrets and is gitignored; the app never reads it.
 
 ---
 
@@ -65,30 +67,73 @@ may sign up belongs in Supabase, not in a switch the browser can flip.
 
 ---
 
-## Database
+## The project
 
-`supabase/migrations/` holds the schema. Apply it through the Supabase dashboard
-SQL editor or `supabase db push`, in order:
+Live and linked. `supabase/config.toml` is the source of truth for the
+project's settings — edit it and run `supabase config push`.
+
+| | |
+|---|---|
+| Name | `reels-approvals` |
+| Ref | `uerpeuidrxjzxqfxqzic` |
+| Region | eu-west-1 (Ireland) |
+| Dashboard | https://supabase.com/dashboard/project/uerpeuidrxjzxqfxqzic |
+
+```bash
+bunx supabase db push                  # apply new migrations
+bunx supabase db push --include-seed    # ... and re-apply the demo rows
+bunx supabase config push               # apply auth/API settings from config.toml
+bunx supabase migration new <name>      # start a new migration
+```
+
+### Schema
 
 | File | What it does |
 |---|---|
-| `0001_approval_queue.sql` | Tables, RLS policies, and the three gate functions |
-| `0002_style_presets_seed.sql` | The three production lanes with their cost and ETA |
-| `0003_demo_data.sql` | Optional sample rows, enough to exercise both gates |
+| `migrations/…_approval_queue.sql` | Tables, RLS policies, and the three gate functions |
+| `migrations/…_style_presets.sql` | The three production lanes with their cost and ETA |
+| `migrations/…_fix_role_guard_bootstrap.sql` | Lets a service-role caller set roles — without it no first owner could exist |
+| `seed.sql` | Demo rows. Opt-in: only `--include-seed` applies them |
+
+### Accounts
 
 New accounts land as **viewers** — they can read the queue but pass neither
-gate. Promote deliberately:
+gate. Promote deliberately, with the secret key (a signed-in viewer cannot
+promote themselves; the `guard_profile_role` trigger refuses):
 
 ```sql
 update public.profiles set role = 'owner' where email = 'you@example.com';
 ```
 
-The types in `src/lib/database.types.ts` are hand-written to match the
-migration. Once a project exists they can be regenerated instead:
+**Signup is open.** Anyone who registers becomes a viewer, and a viewer can read
+every idea and every cut — the read policies are `to authenticated using
+(true)`. For an internal tool that is a data leak waiting to happen. Once the
+people who need accounts have them, close it:
+
+```toml
+# supabase/config.toml
+[auth]
+enable_signup = false
+```
 
 ```bash
-bunx supabase gen types typescript --project-id <ref> > src/lib/database.types.ts
+bunx supabase config push
 ```
+
+Email confirmation is on, so an unverified address cannot sign in. Note the
+built-in mailer is rate-limited to a handful of messages an hour — configure
+`[auth.email.smtp]` before relying on password resets.
+
+The types in `src/lib/database.types.ts` are hand-written to match the
+migrations. They can now be regenerated from the live project instead:
+
+```bash
+bunx supabase gen types typescript --linked > src/lib/database.types.ts
+```
+
+If you do, keep the note at the top of that file about `type` aliases versus
+`interface` — the generator gets it right, but hand edits after the fact can
+silently collapse every query result to `never`.
 
 Keep them in step. They are the only thing standing between a typo in a column
 name and a runtime error.
