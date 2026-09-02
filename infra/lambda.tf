@@ -5,10 +5,17 @@ locals {
   # set, so the ARN is deterministic.
   state_machine_arn = "arn:aws:states:${data.aws_region.here.name}:${data.aws_caller_identity.me.account_id}:stateMachine:${var.name}-production"
 
+  # Both endpoints are ours, so they are derived rather than supplied. MPT sits
+  # on the internal load balancer and is never publicly reachable; Postiz is
+  # addressed by its private DNS from inside the VPC even though its own ALB is
+  # public for the OAuth flow.
+  mpt_base_url    = "http://${aws_lb.internal.dns_name}"
+  postiz_base_url = "http://${aws_instance.postiz.private_ip}:4007"
+
   common_env = {
     SUPABASE_URL         = var.supabase_url
-    MPT_BASE_URL         = var.mpt_base_url
-    POSTIZ_BASE_URL      = var.postiz_base_url
+    MPT_BASE_URL         = local.mpt_base_url
+    POSTIZ_BASE_URL      = local.postiz_base_url
     RENDERS_BUCKET       = "renders"
     STATE_MACHINE_ARN    = local.state_machine_arn
     PIPELINE_SECRETS_ARN = data.aws_secretsmanager_secret.bundle.arn
@@ -29,6 +36,13 @@ resource "aws_lambda_function" "activities" {
   memory_size = 1024
 
   environment { variables = local.common_env }
+
+  # In the VPC because MoneyPrinterTurbo and Postiz are private. Egress to
+  # Supabase, the platform APIs and the Anthropic API goes out via the NAT.
+  vpc_config {
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
 
 resource "aws_lambda_function" "media" {
@@ -46,6 +60,11 @@ resource "aws_lambda_function" "media" {
   ephemeral_storage { size = 4096 }
 
   environment { variables = local.common_env }
+
+  vpc_config {
+    subnet_ids         = aws_subnet.private[*].id
+    security_group_ids = [aws_security_group.lambda.id]
+  }
 }
 
 resource "aws_cloudwatch_log_group" "activities" {

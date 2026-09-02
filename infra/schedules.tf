@@ -66,9 +66,9 @@ resource "aws_scheduler_schedule" "trends" {
       task_definition_arn = aws_ecs_task_definition.trends.arn
       launch_type         = "FARGATE"
       network_configuration {
-        subnets          = var.vpc_subnet_ids
-        security_groups  = var.vpc_security_group_ids
-        assign_public_ip = true # needs egress to TikTok and the LLM
+        subnets          = aws_subnet.private[*].id
+        security_groups  = [aws_security_group.tasks.id]
+        assign_public_ip = false # egress goes out through the NAT gateway
       }
     }
     retry_policy { maximum_retry_attempts = 1 }

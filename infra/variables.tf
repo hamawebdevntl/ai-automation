@@ -13,15 +13,6 @@ variable "image_tag" {
   type        = string
 }
 
-variable "mpt_base_url" {
-  description = "Internal URL of the MoneyPrinterTurbo service. Never public: its artifacts sit behind its own API key, and Postiz could not reach it anyway."
-  type        = string
-}
-
-variable "postiz_base_url" {
-  type = string
-}
-
 variable "supabase_url" {
   type = string
 }
@@ -34,13 +25,38 @@ variable "secrets_bundle_name" {
   default = "reels/pipeline"
 }
 
-variable "vpc_subnet_ids" {
-  description = "Private subnets for the trends task."
-  type        = list(string)
-  default     = []
+variable "postiz_secrets_name" {
+  description = <<-EOT
+    Secrets Manager secret holding Postiz's own environment: JWT_SECRET,
+    POSTIZ_DB_PASSWORD, TEMPORAL_DB_PASSWORD, MAIN_URL, FRONTEND_URL,
+    NEXT_PUBLIC_BACKEND_URL and the per-platform OAuth client ids/secrets.
+
+    Kept separate from the pipeline bundle on purpose: the Postiz host has no
+    business holding the Supabase service-role key, and the pipeline has no
+    business holding platform OAuth secrets.
+  EOT
+  type        = string
+  default     = "reels/postiz"
 }
 
-variable "vpc_security_group_ids" {
-  type    = list(string)
-  default = []
+variable "postiz_certificate_arn" {
+  description = <<-EOT
+    ACM certificate for the Postiz endpoint. Optional, but OAuth does not work
+    without it.
+
+    Postiz is the one service that must be reachable from a browser: connecting
+    an Instagram, TikTok, YouTube or LinkedIn channel is an OAuth flow the owner
+    completes by hand, and those platforms require an HTTPS redirect URI on a
+    real registered domain. Leave this empty and the listener is HTTP-only --
+    enough to reach the UI and prove the deployment, not enough to connect a
+    single channel.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "postiz_instance_type" {
+  description = "Postiz brings Temporal and Elasticsearch; Elasticsearch alone wants around 2GB, so 8GB is the floor."
+  type        = string
+  default     = "t3.large"
 }

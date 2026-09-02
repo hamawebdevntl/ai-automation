@@ -1,0 +1,91 @@
+#!/bin/bash
+# Postiz host bootstrap. Idempotent: safe to re-run.
+set -euo pipefail
+exec > >(tee /var/log/postiz-bootstrap.log) 2>&1
+
+echo "== packages =="
+dnf install -y docker jq
+systemctl enable --now docker
+
+# The compose plugin is not in the AL2023 repos.
+mkdir -p /usr/local/lib/docker/cli-plugins
+if [ ! -x /usr/local/lib/docker/cli-plugins/docker-compose ]; then
+  curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+    https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64
+  chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+fi
+
+echo "== data volume =="
+# Databases and uploads live on a separate volume so the instance can be
+# replaced without losing the connected channels and their OAuth tokens.
+DEV=""
+for candidate in /dev/xvdf /dev/nvme1n1; do
+  [ -b "$candidate" ] && DEV="$candidate" && break
+done
+if [ -z "$DEV" ]; then
+  echo "FATAL: data volume not attached yet; retrying on next boot" >&2
+  exit 1
+fi
+# Only format when there is no filesystem: formatting an existing one would
+# destroy every connected channel.
+if ! blkid "$DEV" >/dev/null 2>&1; then
+  echo "no filesystem on $DEV; creating one"
+  mkfs -t xfs "$DEV"
+fi
+mkdir -p /data
+grep -q "^$DEV" /etc/fstab || echo "$DEV /data xfs defaults,nofail 0 2" >> /etc/fstab
+mountpoint -q /data || mount /data
+mkdir -p /data/postiz/{config,uploads,postgres,redis,elasticsearch,temporal-postgres}
+# Elasticsearch runs as uid 1000 and will not start if it cannot write.
+chown -R 1000:1000 /data/postiz/elasticsearch
+
+echo "== elasticsearch kernel requirement =="
+# Elasticsearch refuses to start below this; without it the whole publish path
+# is down and the cause is buried in a container log.
+sysctl -w vm.max_map_count=262144
+grep -q vm.max_map_count /etc/sysctl.d/99-postiz.conf 2>/dev/null \
+  || echo "vm.max_map_count=262144" > /etc/sysctl.d/99-postiz.conf
+
+echo "== configuration =="
+install -d -m 0700 /opt/postiz
+cat > /opt/postiz/compose.yaml <<'COMPOSE_EOF'
+${compose_file}
+COMPOSE_EOF
+
+# Secrets are fetched at boot rather than baked into the image or the
+# user-data, so rotating one is a restart and nothing is stored in Terraform
+# state.
+aws secretsmanager get-secret-value \
+  --secret-id "${secret_arn}" \
+  --region "${region}" \
+  --query SecretString --output text \
+  | jq -r 'to_entries[] | "\(.key)=\(.value)"' > /opt/postiz/.env
+chmod 0600 /opt/postiz/.env
+
+echo "== up =="
+cd /opt/postiz
+docker compose pull --quiet
+docker compose up -d
+
+# Restart on reboot without needing user-data to run again.
+cat > /etc/systemd/system/postiz.service <<'UNIT_EOF'
+[Unit]
+Description=Postiz
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/postiz
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+systemctl daemon-reload
+systemctl enable postiz.service
+
+echo "== bootstrap complete =="
+docker compose ps

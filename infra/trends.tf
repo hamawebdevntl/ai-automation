@@ -65,8 +65,8 @@ resource "aws_ecs_task_definition" "trends" {
     essential = true
     environment = [
       { name = "SUPABASE_URL", value = var.supabase_url },
-      { name = "MPT_BASE_URL", value = var.mpt_base_url },
-      { name = "POSTIZ_BASE_URL", value = var.postiz_base_url },
+      { name = "MPT_BASE_URL", value = local.mpt_base_url },
+      { name = "POSTIZ_BASE_URL", value = local.postiz_base_url },
       { name = "PIPELINE_SECRETS_ARN", value = data.aws_secretsmanager_secret.bundle.arn },
       { name = "LOG_LEVEL", value = "INFO" },
     ]

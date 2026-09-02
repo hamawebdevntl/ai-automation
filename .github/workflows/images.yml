@@ -10,6 +10,8 @@ on:
     branches: [main]
     paths:
       - "apps/pipeline/**"
+      - "docker/**"
+      - "services/mpt"
       - ".github/workflows/images.yml"
   workflow_dispatch:
 
@@ -21,10 +23,30 @@ jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        image: [activities, media, trends]
+        include:
+          - image: activities
+            context: apps/pipeline
+            file: apps/pipeline/Dockerfile.activities
+          - image: media
+            context: apps/pipeline
+            file: apps/pipeline/Dockerfile.media
+          - image: trends
+            context: apps/pipeline
+            file: apps/pipeline/Dockerfile.trends
+          # Our MoneyPrinterTurbo fork. The context is the submodule, and the
+          # Dockerfile lives here because it is specific to our fork -- upstream's
+          # own image launches the Streamlit WebUI, not the REST API.
+          - image: mpt
+            context: services/mpt
+            file: docker/mpt.Dockerfile
     steps:
       - uses: actions/checkout@v4
+        with:
+          # services/mpt is a submodule of our private fork; without this the
+          # MPT build context would be an empty directory.
+          submodules: recursive
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -39,8 +61,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: apps/pipeline
-          file: apps/pipeline/Dockerfile.${{ matrix.image }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           # Lambda runs x86_64 here; the runner is the same, so no emulation.
           platforms: linux/amd64
           push: true

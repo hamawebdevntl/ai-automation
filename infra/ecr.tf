@@ -1,5 +1,6 @@
 locals {
-  images = ["activities", "media", "trends"]
+  # "mpt" is our fork of MoneyPrinterTurbo, built from the submodule.
+  images = ["activities", "media", "trends", "mpt"]
 }
 
 resource "aws_ecr_repository" "img" {
