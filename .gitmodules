@@ -1,0 +1,3 @@
+[submodule "services/mpt"]
+	path = services/mpt
+	url = https://github.com/hamawebdevntl/moneyprinterturbo.git

@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# Secrets. Never commit anything here.
+# web/.env.local currently holds SUPABASE_SECRET_KEY, SUPABASE_SERVICE_ROLE_KEY,
+# SUPABASE_DB_PASSWORD and OWNER_PASSWORD. .env.example is the only env file
+# that belongs in the repo.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Read-only upstream references.
+#
+# OpenMontage, ViralMint and postiz-app are AGPL-3.0. STACK.md commits us to
+# treating them as read-only references whose ideas we reimplement and whose
+# code we never import. Keeping their source inside our tracked history
+# undercuts exactly that boundary, so they live here untracked.
+# ---------------------------------------------------------------------------
+/reference/
+
+# ---------------------------------------------------------------------------
+# Node
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+build/
+.vite/
+.tanstack/
+*.tsbuildinfo
+.eslintcache
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# ---------------------------------------------------------------------------
+# MoneyPrinterTurbo runtime output.
+#
+# MPT has no object-storage support and writes renders, cached stock clips and
+# task state to local disk. config.toml is generated at container start from
+# environment variables and Secrets Manager, so it is never a source file.
+# ---------------------------------------------------------------------------
+/services/mpt/storage/
+/services/mpt/config.toml
+/services/mpt/.venv/
+
+# ---------------------------------------------------------------------------
+# Supabase CLI local state
+# ---------------------------------------------------------------------------
+supabase/.branches/
+supabase/.temp/
+
+# ---------------------------------------------------------------------------
+# Infrastructure state. Never commit state files: they contain resolved secrets.
+# ---------------------------------------------------------------------------
+*.tfstate
+*.tfstate.*
+.terraform/
+cdk.out/
+
+# ---------------------------------------------------------------------------
+# Editors and OS
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json

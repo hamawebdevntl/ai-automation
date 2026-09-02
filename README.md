@@ -117,7 +117,7 @@ in cost, which is why the cost estimate is shown at the moment of choosing:
 | `OpenMontage` | AGPL-3.0 | **Read-only reference** for quality-check design. Never imported. |
 | `ViralMint` | AGPL-3.0 | **Read-only reference** for trend velocity scoring. Reimplemented, not imported. |
 
-See [VERDICTS.md](VERDICTS.md) for how these were chosen — every claim there was
+See [VERDICTS.md](docs/VERDICTS.md) for how these were chosen — every claim there was
 verified by reading the code and the real commit history, not the READMEs. Two
 widely-recommended projects were rejected on inspection.
 
@@ -157,7 +157,7 @@ which claims we are regulated on or will not make.
 - Trend research genuinely covers YouTube and Google Trends today. TikTok and
   Instagram coverage is thin and should not be assumed.
 
-Full detail in [GAPS.md](GAPS.md).
+Full detail in [GAPS.md](docs/GAPS.md).
 
 ---
 
@@ -165,6 +165,6 @@ Full detail in [GAPS.md](GAPS.md).
 
 | File | What it is |
 |---|---|
-| [STACK.md](STACK.md) | The stack, every decision made, and why |
-| [GAPS.md](GAPS.md) | What the stack does not cover, and what it costs to close |
-| [VERDICTS.md](VERDICTS.md) | Repo evaluation evidence — measured, not claimed |
+| [STACK.md](docs/STACK.md) | The stack, every decision made, and why |
+| [GAPS.md](docs/GAPS.md) | What the stack does not cover, and what it costs to close |
+| [VERDICTS.md](docs/VERDICTS.md) | Repo evaluation evidence — measured, not claimed |
