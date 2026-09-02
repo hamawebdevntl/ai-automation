@@ -31,9 +31,13 @@ MPT_SOCIAL_PLATFORM: dict[str, str] = {
     "tiktok": "tiktok",
     "youtube": "youtube_shorts",
     "instagram": "instagram_reels",
-    # "linkedin" is deliberately absent: upstream has no LinkedIn spec at all
-    # (`grep -cin linkedin app/services/llm.py` -> 0). Until our fork adds one,
-    # asking MPT for LinkedIn copy yields TikTok copy. See copy.py.
+    # LinkedIn works only because our fork added a spec for it. Upstream has
+    # none (`grep -cin linkedin app/services/llm.py` -> 0 before the change)
+    # and silently returned TikTok copy instead. If this package is ever
+    # pointed at an unforked MoneyPrinterTurbo, this entry must come out --
+    # the fork also makes an unknown platform raise, so a mismatch fails loudly
+    # rather than producing plausible-looking wrong copy.
+    "linkedin": "linkedin",
 }
 
 
