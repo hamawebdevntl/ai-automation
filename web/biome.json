@@ -1,0 +1,99 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.11/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": ["**", "!**/dist", "!**/node_modules", "!src/routeTree.gen.ts"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 120
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "a11y": {
+        "useSemanticElements": "off",
+        "noSvgWithoutTitle": "off"
+      },
+      "correctness": {
+        "noUnusedImports": "error",
+        "useExhaustiveDependencies": "warn"
+      },
+      "suspicious": {
+        "noExplicitAny": "warn",
+        "noArrayIndexKey": "warn"
+      },
+      "style": {
+        "useConst": "error",
+        "noNonNullAssertion": "warn"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "jsxQuoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all",
+      "arrowParentheses": "always"
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
+  "overrides": [
+    {
+      "includes": [
+        "src/components/ui/**",
+        "src/components/animate-ui/**",
+        "src/components/kokonutui/**",
+        "src/components/mvpblocks/**",
+        "src/components/app-layouts/**",
+        "src/hooks/**",
+        "src/components/pricing-card.tsx",
+        "src/components/freewritecms-block-renderer.tsx",
+        "src/components/breadcrumb-nav.tsx",
+        "src/components/theme-provider.tsx",
+        "src/components/mode-toggle.tsx"
+      ],
+      "linter": {
+        "rules": {
+          "a11y": {
+            "recommended": false
+          },
+          "security": {
+            "noDangerouslySetInnerHtml": "warn"
+          },
+          "suspicious": {
+            "noDocumentCookie": "warn",
+            "noExplicitAny": "warn",
+            "noArrayIndexKey": "warn"
+          },
+          "style": {
+            "noNonNullAssertion": "warn"
+          },
+          "correctness": {
+            "useExhaustiveDependencies": "warn"
+          }
+        }
+      }
+    }
+  ]
+}

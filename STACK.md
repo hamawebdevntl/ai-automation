@@ -63,7 +63,10 @@ signals too; my earlier "no valid data" reading came from a shallow clone.
 
 ## Requirements check after the swap
 - R1 trend research — unchanged (still the weakest area, see GAPS.md).
-- R2 human approval — unchanged, custom Next.js app, both gates.
+- R2 human approval — unchanged, custom web app, both gates. Now a Vite +
+  TanStack Router SPA on Supabase (`web/`), replacing the Next.js template it
+  was scaffolded from; see `web/README.md` for why the no-server shape changes
+  where access control lives.
 - R3 scripted / voiced / visual / captioned / **quality-checked** — first four
   native to MPT; QC is the one genuine rebuild.
 - R4 publish to IG / TikTok / YT Shorts / LinkedIn — unchanged, Postiz.
