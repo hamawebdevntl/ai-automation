@@ -1,0 +1,220 @@
+{
+  "Comment": "Reels production: render -> quality check -> Gate 2 -> publish. Standard workflow, because Express does not support the waitForTaskToken callback pattern and caps at five minutes, while a Gate 2 wait can last days.",
+  "StartAt": "SubmitRender",
+  "TimeoutSeconds": 2592000,
+  "States": {
+    "SubmitRender": {
+      "Type": "Task",
+      "Resource": "${activities_lambda_arn}",
+      "Parameters": {
+        "activity": "submit_render",
+        "production_id.$": "$.production_id"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "Comment": "MPT returns 429 when its queue is saturated. It writes its state row before scheduling and deletes it again on rejection, so a 429 provably leaves no orphan render and is the one error here that is safe to retry.",
+          "ErrorEquals": ["MptQueueFull"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.Unknown"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Parked" }],
+      "Next": "WaitForRender"
+    },
+
+    "WaitForRender": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "PollRender"
+    },
+
+    "PollRender": {
+      "Type": "Task",
+      "Resource": "${activities_lambda_arn}",
+      "Parameters": {
+        "activity": "poll_render",
+        "production_id.$": "$.production_id",
+        "task_id.$": "$.task_id",
+        "polls.$": "$.polls",
+        "started_at.$": "$.started_at"
+      },
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Parked" }],
+      "Next": "RenderOutcome"
+    },
+
+    "RenderOutcome": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.state", "StringEquals": "complete", "Next": "FetchAndCheck" },
+        { "Variable": "$.state", "StringEquals": "failed", "Next": "Parked" },
+        {
+          "Comment": "A guard against looping forever. The poller has its own wall-clock budget, so reaching this means the budget was never applied.",
+          "Variable": "$.polls",
+          "NumericGreaterThan": 400,
+          "Next": "Parked"
+        }
+      ],
+      "Default": "WaitForRender"
+    },
+
+    "FetchAndCheck": {
+      "Type": "Task",
+      "Comment": "Fetch and quality-check are one state because both need the actual bytes, and a render can be hundreds of megabytes.",
+      "Resource": "${media_lambda_arn}",
+      "Parameters": {
+        "activity": "fetch_and_qc",
+        "production_id.$": "$.production_id",
+        "video_ref.$": "$.video_ref",
+        "subtitle_path.$": "$.subtitle_path",
+        "script.$": "$.script"
+      },
+      "ResultPath": "$.media",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+          "IntervalSeconds": 20,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Parked" }],
+      "Next": "GenerateCopy"
+    },
+
+    "GenerateCopy": {
+      "Type": "Task",
+      "Resource": "${activities_lambda_arn}",
+      "Parameters": {
+        "activity": "generate_copy",
+        "production_id.$": "$.production_id",
+        "script.$": "$.script"
+      },
+      "ResultPath": "$.copy",
+      "Retry": [
+        {
+          "Comment": "Four synchronous LLM calls. The activity writes conditionally and skips when copy already exists, so a retry cannot produce a second, different version of the text.",
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 15,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "Comment": "Missing copy is not worth parking a finished video for. Let the reviewer see it; the publish step skips any platform with no copy.",
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.copyError",
+          "Next": "OpenGate2"
+        }
+      ],
+      "Next": "OpenGate2"
+    },
+
+    "OpenGate2": {
+      "Type": "Task",
+      "Comment": "Registers the callback token BEFORE the row becomes decidable, then waits. Reversed, a decision made in that window would find no token and the execution would hang until timeout while the interface reported success.",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "TimeoutSeconds": 604800,
+      "Parameters": {
+        "FunctionName": "${activities_lambda_arn}",
+        "Payload": {
+          "activity": "register_gate2",
+          "production_id.$": "$.production_id",
+          "qc_passed.$": "$.media.qc_passed",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.gate2",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Parked" }],
+      "Next": "Gate2Outcome"
+    },
+
+    "Gate2Outcome": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.gate2.decision", "StringEquals": "approved", "Next": "Publish" }
+      ],
+      "Default": "Rejected"
+    },
+
+    "Publish": {
+      "Type": "Task",
+      "Comment": "NEVER retried. Postiz starts its publish workflow with TERMINATE_EXISTING, so a retry landing after the provider call succeeded but before the row is marked published posts to the real platform twice. On any unknown outcome we poll instead.",
+      "Resource": "${activities_lambda_arn}",
+      "Parameters": {
+        "activity": "publish",
+        "production_id.$": "$.production_id",
+        "storage_key.$": "$.media.storage_key"
+      },
+      "ResultPath": "$.publish",
+      "Retry": [],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "WaitForPublish" }],
+      "Next": "WaitForPublish"
+    },
+
+    "WaitForPublish": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "PollPublish"
+    },
+
+    "PollPublish": {
+      "Type": "Task",
+      "Comment": "The only publish-failure detector there is: Postiz webhooks fire on success only, are unsigned and never retried, and createPost swallows a workflow-start failure.",
+      "Resource": "${activities_lambda_arn}",
+      "Parameters": {
+        "activity": "poll_publish",
+        "production_id.$": "$.production_id"
+      },
+      "ResultPath": "$.publishState",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 5,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Parked" }],
+      "Next": "PublishOutcome"
+    },
+
+    "PublishOutcome": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.publishState.state", "StringEquals": "published", "Next": "Published" },
+        { "Variable": "$.publishState.state", "StringEquals": "parked", "Next": "Parked" }
+      ],
+      "Default": "WaitForPublish"
+    },
+
+    "Published": { "Type": "Succeed" },
+
+    "Rejected": {
+      "Type": "Succeed",
+      "Comment": "A rejection is a business outcome, not a failure. Modelled as success on purpose: if it ended as a FAILED execution it would pollute the one alarm that should mean something is actually broken."
+    },
+
+    "Parked": {
+      "Type": "Succeed",
+      "Comment": "The pipeline stopped deliberately and a human must decide. The row carries the reason; the reconcilers and the review queue surface it."
+    }
+  }
+}
