@@ -19,9 +19,9 @@ import re
 from pipeline.clients.supa import Supa
 from pipeline.config import Settings, settings
 from pipeline.trends import controls as controls_mod
+from pipeline.trends import gtrends, tiktok
 from pipeline.trends import ideas as ideas_mod
 from pipeline.trends import report as report_mod
-from pipeline.trends import tiktok
 from pipeline.trends.controls import ScoutControls
 
 log = logging.getLogger(__name__)
@@ -73,8 +73,19 @@ def _inputs(supa: Supa, cfg: Settings) -> tuple[str, list[str], ScoutControls]:
         log.warning("could not read trend_settings, falling back to env: %s", exc)
 
     brief = (row.get("niche_brief") or "").strip() or cfg.niche_brief
+    controls = controls_mod.from_row(row)
+
+    # Each source has its own vocabulary, and they are not interchangeable.
+    # `#exceltips` is how a video is filed; "bookkeeping software" is what
+    # somebody types when they have had enough of doing it by hand. Handing
+    # either list to the other source produces a run that looks like it worked
+    # and finds nothing.
+    if controls.trend_source == "google_trends":
+        terms = [k.strip() for k in (row.get("trend_keywords") or []) if k and k.strip()]
+        return brief, (terms or cfg.keyword_list), controls
+
     tags = [t.strip().lstrip("#") for t in (row.get("hashtags") or []) if t and t.strip()]
-    return brief, (tags or cfg.hashtag_list), controls_mod.from_row(row)
+    return brief, (tags or cfg.hashtag_list), controls
 
 
 def run(supa: Supa | None = None, run_id: str = "") -> dict:
@@ -88,7 +99,7 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     supa = supa or Supa()
     cfg = settings()
 
-    niche_brief, hashtags, controls = _inputs(supa, cfg)
+    niche_brief, terms, controls = _inputs(supa, cfg)
 
     # A run started from the button may carry its own length. Merged here
     # rather than inside `_inputs` because it belongs to this run, not to the
@@ -107,9 +118,12 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
             "refusing to fill the approval queue with generic ideas."
         )
 
-    if not hashtags:
+    if not terms:
         raise RuntimeError(
-            "No hashtags are set; there is nothing to scout. Add some under "
+            "No search terms are set; there is nothing to scout. Add some under "
+            "Settings in the app."
+            if controls.trend_source == "google_trends"
+            else "No hashtags are set; there is nothing to scout. Add some under "
             "Settings in the app, or set TREND_HASHTAGS."
         )
 
@@ -117,12 +131,12 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     # what qualifies as a signal, and the cursor is advanced before scouting
     # rather than after so that a run which dies mid-session does not make the
     # next one repeat the same tags.
-    selected, next_cursor = controls_mod.rotate(hashtags, controls.hashtag_cursor, controls.hashtags_per_run)
-    if len(selected) < len(hashtags):
+    selected, next_cursor = controls_mod.rotate(terms, controls.hashtag_cursor, controls.hashtags_per_run)
+    if len(selected) < len(terms):
         log.info(
-            "rotating: scouting %d of %d hashtags this run (%s)",
+            "rotating: scouting %d of %d terms this run (%s)",
             len(selected),
-            len(hashtags),
+            len(terms),
             ", ".join(selected),
         )
         supa.save_hashtag_cursor(next_cursor)
@@ -135,16 +149,31 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     )
     log.info("drafting ideas with %s", provider)
 
-    outcome = tiktok.scout(
-        tiktok.ScoutConfig(
-            hashtags=selected,
-            ms_token=cfg.tiktok_ms_token,
-            controls=controls,
-            # Only when there is a row to be stopped. A container started by
-            # hand has nothing watching it and nothing to ask.
-            should_stop=(lambda: supa.trend_run_is_cancelled(run_id)) if run_id else None,
+    # Only when there is a row to be stopped. A container started by hand has
+    # nothing watching it and nothing to ask.
+    should_stop = (lambda: supa.trend_run_is_cancelled(run_id)) if run_id else None
+
+    # Both sources return the same `ScoutOutcome`, which is what lets
+    # everything below this line -- spreading, drafting, duplicate suppression,
+    # the rejection report -- stay ignorant of where signals came from.
+    if controls.trend_source == "google_trends":
+        outcome = gtrends.scout(
+            gtrends.GTrendsConfig(
+                keywords=selected,
+                controls=controls,
+                geo=controls.trend_geo,
+                should_stop=should_stop,
+            )
         )
-    )
+    else:
+        outcome = tiktok.scout(
+            tiktok.ScoutConfig(
+                hashtags=selected,
+                ms_token=cfg.tiktok_ms_token,
+                controls=controls,
+                should_stop=should_stop,
+            )
+        )
     signals, report = outcome.signals, outcome.report
     log.info(
         "scouted %d signals worth surfacing from %d videos across %d hashtags",
@@ -189,7 +218,7 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
         surfaced=len(signals),
         drafted=len(drafted),
         inserted=len(inserted),
-        hashtags_configured=len(hashtags),
+        hashtags_configured=len(terms),
     )
     log.info("trend run funnel: %s", report_mod.summarise(rejections))
 

@@ -41,6 +41,9 @@ export function trendSettings(over: Partial<TrendSettingsRow> = {}): TrendSettin
     dedup_window_days: 14,
     idea_expiry_days: 7,
     idea_provider: 'claude',
+    trend_source: 'google_trends',
+    trend_keywords: ['invoice software', 'crm software', 'bookkeeping software'],
+    trend_geo: '',
     ...over,
   };
 }
