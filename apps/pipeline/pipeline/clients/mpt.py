@@ -52,6 +52,16 @@ class MptClient:
         cfg = settings()
         self._base = (base_url or cfg.mpt_base_url).rstrip("/")
         self._key = api_key or cfg.mpt_api_key
+        # Loud here rather than at import, which is what lets a deployment that
+        # never renders -- the trend scout on its own, for instance -- run
+        # without inventing MoneyPrinterTurbo credentials it will never use.
+        # The failure still cannot be silent: nothing reaches this constructor
+        # unless a render is actually about to be submitted.
+        if not self._base:
+            raise MptError(
+                "MPT_BASE_URL is not set, so no render can be submitted. Set it, "
+                "or use a style preset whose render_mode is not 'mpt'."
+            )
         # MPT reads `x-api-key` with `headers.getlist()` and rejects the request
         # when there is more than one value, because proxies disagree on
         # ordering. Never let a caller add a second one.

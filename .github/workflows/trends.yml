@@ -1,0 +1,84 @@
+# Trend research, run by GitHub rather than by AWS.
+#
+# The scout is a Python program that drives a browser for a while and writes
+# rows to Supabase. On AWS that needed a Lambda to decide, a Fargate task to
+# run, a NAT gateway for egress and an EventBridge schedule to start it -- most
+# of a €140/month bill for a job that runs once a day. A runner does the same
+# work for nothing, because a workflow *is* a machine that boots, does one
+# thing and exits.
+#
+# What this does NOT replace: rendering. MoneyPrinterTurbo is a service that
+# has to sit there waiting for jobs, which is not a shape a workflow can take.
+# This covers trend research and idea generation -- everything up to the Gate 1
+# queue.
+name: trends
+
+on:
+  # Hourly rather than every minute, which is what the AWS dispatcher managed.
+  # Each wake-up costs a billed minute on a private repo, so a minute-by-minute
+  # poll would spend the whole free tier doing nothing: 43,200 minutes a month
+  # against an allowance of 2,000. Hourly costs ~730 and leaves room for the
+  # scouting itself.
+  #
+  # The consequence is granularity, not correctness. The owner's schedule still
+  # lives in `trend_settings`; a slot due at 06:00 starts at the top of the next
+  # hour, and `schedule.due_slot` refuses anything more than an hour late so it
+  # cannot fire at some unrelated time of day.
+  schedule:
+    - cron: "5 * * * *"
+
+  # The button in the app queues a row; this is how it gets picked up sooner
+  # than the next hour. Also how you run one by hand from the Actions tab.
+  workflow_dispatch:
+
+# One at a time, matching the single in-flight lock in Postgres. Without this a
+# scheduled run and a manual dispatch could overlap, and the second would waste
+# a runner discovering it had lost the claim.
+concurrency:
+  group: trends
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    # The same image the Fargate task used, so the browser and its system
+    # libraries are already present. Downloading Chromium on every run would
+    # cost more minutes than the scouting does.
+    container: mcr.microsoft.com/playwright/python:v1.49.0-jammy
+
+    # Generous, because the run budget is enforced inside the scout where it
+    # can stop cleanly and still draft from what it found. This is only the
+    # backstop for a process that has stopped responding entirely -- reaching
+    # it means something is wrong, and the run is written off on the next wake.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pipeline
+        working-directory: apps/pipeline
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[trends]"
+
+      - name: Scout
+        working-directory: apps/pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TIKTOK_MS_TOKEN: ${{ secrets.TIKTOK_MS_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The brief and the hashtags live in `trend_settings` and are edited
+          # in the app. These are the fallback for a database that cannot be
+          # read, and are deliberately not secrets.
+          NICHE_BRIEF: ${{ vars.NICHE_BRIEF }}
+          TREND_HASHTAGS: ${{ vars.TREND_HASHTAGS }}
+          # Which model drafts is also a setting now. This answers only when
+          # the column is empty.
+          IDEA_LLM_PROVIDER: ${{ vars.IDEA_LLM_PROVIDER }}
+          LOG_LEVEL: INFO
+        run: python -m pipeline.trends.worker

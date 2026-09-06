@@ -39,13 +39,17 @@ export type StyleLane = 'stock' | 'generative' | 'presenter';
  *  - `fal_full`    fal generates footage and narration; the pipeline assembles
  *                  and captions. A separate output path, so its results are
  *                  not directly comparable with the other two.
+ *  - `heygen`      HeyGen returns a finished presenter reel -- voiced,
+ *                  captioned and already 9:16. MoneyPrinterTurbo never touches
+ *                  the output; only the script generator is shared.
  */
-export type RenderMode = 'mpt' | 'fal_visuals' | 'fal_full';
+export type RenderMode = 'mpt' | 'fal_visuals' | 'fal_full' | 'heygen';
 
 export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
   mpt: 'Standard render',
   fal_visuals: 'fal footage, standard assembly',
   fal_full: 'fal end to end',
+  heygen: 'HeyGen presenter',
 };
 
 export type ProductionStatus =
@@ -86,6 +90,170 @@ export type StylePresetRow = {
   sort_order: number;
   created_at: string;
 };
+
+/**
+ * Everything the trend scout is told to do.
+ *
+ * The brief and the hashtags were the first two out of the environment; the
+ * rest arrived in 20260906150000, having previously been constants in the
+ * pipeline or a cron expression in Terraform. Every default is the value the
+ * code used before it was tunable, with one exception -- `max_video_age_days`,
+ * which had no previous value at all because there was no age filter.
+ *
+ * Every numeric field is bounded by a CHECK constraint in Postgres. The bounds
+ * are mirrored in `features/trends/controls.ts` for the form's own feedback,
+ * but this app ships as a static bundle: the constraint is what actually holds.
+ */
+export type TrendSettingsRow = {
+  /** Always `true`. The table is a singleton by constraint, not by convention. */
+  id: boolean;
+  niche_brief: string;
+  /** Without the leading `#`. */
+  hashtags: string[];
+  updated_at: string;
+  updated_by: string | null;
+
+  // --- Timing. UTC throughout; there is deliberately no timezone setting. ---
+  /** Whether the daily run happens on its own. Pausing does not touch the button. */
+  schedule_enabled: boolean;
+  schedule_hour_utc: number;
+  schedule_minute_utc: number;
+  /** 0 = Sunday .. 6 = Saturday, as Postgres `extract(dow)` counts. */
+  schedule_days: number[];
+
+  // --- Filters, in the order the scout applies them. ---
+  /** Reject a video older than this before it is scored. */
+  max_video_age_days: number;
+  min_plays: number;
+  /** Interactions per view, as a fraction: 0.04 is 4%. */
+  min_engagement_rate: number;
+  /** How far above its own author's median a video must perform. */
+  min_outlier_ratio: number;
+  /** Matched as whole words, case-insensitively. Stored lowercase. */
+  caption_blocklist: string[];
+  videos_per_hashtag: number;
+  ideas_per_run: number;
+
+  // --- Run cost. ---
+  /** Tags to scout per run, rotating through the list. Null scouts all of them. */
+  hashtags_per_run: number | null;
+  /** Rotation position. Written by the pipeline, never by this app. */
+  hashtag_cursor: number;
+  /** Stop scouting after this long and draft from what was found. Null = no ceiling. */
+  run_budget_minutes: number | null;
+  baseline_sample_size: number;
+  pacing_min_seconds: number;
+  pacing_max_seconds: number;
+  dedup_window_days: number;
+  idea_expiry_days: number;
+  idea_provider: IdeaProvider;
+};
+
+/** Which model drafts the queue. Both are wired; the key must be in the bundle. */
+export type IdeaProvider = 'claude' | 'gemini';
+
+/**
+ * One stage of a run's rejection breakdown.
+ *
+ * `level` is what stops the app adding these together: video-level stages
+ * count videos and sum to `seen`, while `duplicate` counts drafted ideas and
+ * cannot be added to them.
+ */
+export type TrendRejectionStage = {
+  key: string;
+  /** Travels with the payload so an older build can still render a new stage. */
+  label: string;
+  level: 'video' | 'idea';
+  dropped: number;
+  /** The setting responsible, or null where no setting could change it. */
+  setting: string | null;
+  /** Its value at the time of the run, not now. */
+  value: number | string[] | null;
+};
+
+/**
+ * Why a run produced what it produced.
+ *
+ * The point of the whole document is `seen`: filters can only ever reduce it,
+ * so `seen === 0` is never a filter and always the scrape. That is the line
+ * between an empty queue and a broken scraper.
+ */
+export type TrendRejections = {
+  seen: number;
+  stages: TrendRejectionStage[];
+  surfaced: number;
+  drafted: number;
+  inserted: number;
+  failed_hashtags: Array<{ hashtag: string; error: string }>;
+  budget_exhausted: boolean;
+  /** The scout noticed it had been stopped and gave up the remaining hashtags. */
+  cancelled: boolean;
+  hashtags_skipped: number;
+  hashtags_scouted: string[];
+  hashtags_configured: number | null;
+};
+
+/**
+ * A trend run is in flight while it is one of these. At most one row can be.
+ *
+ * `cancelled` is its own status rather than a flavour of `failed` because the
+ * two need different banners: a run you stopped on purpose showing as a red
+ * failure teaches you to ignore the alarm that reports a real breakage.
+ */
+export type TrendRunStatus = 'requested' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export const TREND_RUN_IN_FLIGHT = ['requested', 'running'] as const satisfies readonly TrendRunStatus[];
+
+export function isTrendRunInFlight(run: TrendRunRow | null | undefined): boolean {
+  return run !== null && run !== undefined && (TREND_RUN_IN_FLIGHT as readonly string[]).includes(run.status);
+}
+
+export type TrendRunRow = {
+  id: string;
+  status: TrendRunStatus;
+  requested_by: string | null;
+  requested_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  /** The ECS task, for finding a misbehaving run in the console. */
+  task_arn: string | null;
+  /** Null until the run ends. Mirrors what `runner.run` returns. */
+  signals: number | null;
+  drafted: number | null;
+  inserted: number | null;
+  suppressed: number | null;
+  error: string | null;
+
+  /** Videos the feeds returned before any filter. Zero means the scrape found nothing. */
+  scouted: number | null;
+  /** Which tags this run looked at — a subset of the list when rotation is on. */
+  hashtags_scouted: string[] | null;
+  /** The per-stage breakdown. Null on a run that predates it, or one that failed early. */
+  rejections: TrendRejections | null;
+  /** How the run came to exist. */
+  trigger: TrendRunTrigger;
+  /** The schedule slot this run is for. Null on a manual run. */
+  scheduled_for: string | null;
+
+  /** When an owner stopped this run. The lock is freed at the same instant. */
+  cancelled_at: string | null;
+  cancelled_by: string | null;
+  /** When the dispatcher last tried `ecs:StopTask`. An attempt, not a confirmation. */
+  task_stopped_at: string | null;
+
+  /**
+   * The length asked for when this run was started, for this run only.
+   *
+   * Null uses the saved setting, which is what every scheduled run inserts.
+   * Only the two costs are overridable — neither changes what qualifies as a
+   * signal, so runs of different lengths stay comparable.
+   */
+  override_run_budget_minutes: number | null;
+  override_hashtags_per_run: number | null;
+};
+
+/** The button, or the dispatcher acting on the owner's schedule. */
+export type TrendRunTrigger = 'manual' | 'schedule';
 
 export type IdeaRow = {
   id: string;
@@ -162,6 +330,23 @@ export interface Database {
         Update: Writable<StylePresetRow>;
         Relationships: [];
       };
+      trend_settings: {
+        Row: TrendSettingsRow;
+        Insert: never;
+        // `hashtag_cursor` is deliberately absent: the pipeline advances it,
+        // and an update from here would also be an update the touch trigger
+        // counts as the owner having edited their settings.
+        Update: Partial<Omit<TrendSettingsRow, 'id' | 'updated_at' | 'hashtag_cursor'>>;
+        Relationships: [];
+      };
+      trend_runs: {
+        Row: TrendRunRow;
+        // Requested through `request_trend_run`, written by the pipeline with
+        // the service role. Neither path goes through this client.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
       ideas: {
         Row: IdeaRow;
         Insert: Omit<IdeaRow, 'id' | 'created_at' | 'target_platforms' | 'status'> & {
@@ -197,6 +382,15 @@ export interface Database {
       is_owner: {
         Args: Record<never, never>;
         Returns: boolean;
+      };
+      request_trend_run: {
+        // Both optional. Null, or omitted, uses the saved settings.
+        Args: { p_budget_minutes?: number | null; p_hashtags_per_run?: number | null };
+        Returns: TrendRunRow;
+      };
+      cancel_trend_run: {
+        Args: { p_run_id: string };
+        Returns: TrendRunRow;
       };
       approve_idea: {
         Args: { p_idea_id: string; p_style_id: string; p_note?: string | null };

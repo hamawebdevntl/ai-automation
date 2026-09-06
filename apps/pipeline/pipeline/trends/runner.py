@@ -1,8 +1,14 @@
-"""The scheduled trend-research run.
+"""The trend-research run.
 
 Scouts, scores, drafts ideas, and writes them to the Gate 1 queue. Runs as a
 Fargate task rather than a Lambda because TikTok-Api drives a real Playwright
 browser per session, which is far too heavy for the activities image.
+
+Every decision this makes is read from `trend_settings` rather than compiled
+in. The precedence is the same one the brief and the hashtags have always had:
+the row wins when it has a value, and the constants this code used before the
+row existed answer when it does not. That is what lets the task run against a
+database that has not been migrated, and what keeps the tests from needing one.
 """
 
 from __future__ import annotations
@@ -11,25 +17,31 @@ import logging
 import re
 
 from pipeline.clients.supa import Supa
-from pipeline.config import settings
+from pipeline.config import Settings, settings
+from pipeline.trends import controls as controls_mod
 from pipeline.trends import ideas as ideas_mod
+from pipeline.trends import report as report_mod
 from pipeline.trends import tiktok
-from pipeline.trends.velocity import Signal
+from pipeline.trends.controls import ScoutControls
 
 log = logging.getLogger(__name__)
-
-# How far back to look when suppressing near-duplicate ideas.
-DEDUP_WINDOW_DAYS = 14
 
 
 def _normalise(title: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", title.lower()).strip()
 
 
-def _existing_titles(supa: Supa) -> set[str]:
+def _existing_titles(supa: Supa, window_days: int) -> set[str]:
+    """Titles recently added, for suppressing near-duplicates.
+
+    The window is a setting because it decides which of two sentences the app
+    gets to say about an empty run. Too short and the same idea is re-drafted
+    every few days; too long and a format still worth using is suppressed
+    because it was tried a month ago and never approved.
+    """
     from datetime import datetime, timedelta, timezone
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=DEDUP_WINDOW_DAYS)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
     rows = (
         supa.raw.table("ideas")
         .select("title")
@@ -39,62 +51,225 @@ def _existing_titles(supa: Supa) -> set[str]:
     return {_normalise(r["title"]) for r in rows if r.get("title")}
 
 
-def run(supa: Supa | None = None) -> dict:
-    """Scout, score, draft, insert."""
+def _inputs(supa: Supa, cfg: Settings) -> tuple[str, list[str], ScoutControls]:
+    """The brief, the hashtags and the controls, database first.
+
+    All of these used to come only from the environment or from constants,
+    which made them deploy-time decisions. They are now edited in the app, so
+    `trend_settings` wins -- but the environment and the old constants still
+    answer when the row is absent or a field is blank. That fallback is what
+    lets a headless run work against a database that has not been migrated,
+    and what keeps the tests from needing one at all.
+
+    Each field falls back independently: a brief set in the app and hashtags
+    left to the environment is a coherent state, not a half-configured one.
+    """
+    row: dict = {}
+    try:
+        row = supa.trend_settings() or {}
+    except Exception as exc:  # noqa: BLE001 - the environment is a real answer
+        # Never fatal. A settings table that is missing or unreadable should
+        # degrade to the previous behaviour, not stop the run outright.
+        log.warning("could not read trend_settings, falling back to env: %s", exc)
+
+    brief = (row.get("niche_brief") or "").strip() or cfg.niche_brief
+    tags = [t.strip().lstrip("#") for t in (row.get("hashtags") or []) if t and t.strip()]
+    return brief, (tags or cfg.hashtag_list), controls_mod.from_row(row)
+
+
+def run(supa: Supa | None = None, run_id: str = "") -> dict:
+    """Scout, score, draft, insert.
+
+    `run_id` is the row this run reports into, when there is one. It is passed
+    down rather than only used for bookkeeping because it is also how the scout
+    learns it has been stopped: cancelling frees the in-flight lock in Postgres
+    immediately, and this task is the thing that lock was protecting.
+    """
     supa = supa or Supa()
     cfg = settings()
 
-    if not cfg.niche_brief.strip():
+    niche_brief, hashtags, controls = _inputs(supa, cfg)
+
+    # A run started from the button may carry its own length. Merged here
+    # rather than inside `_inputs` because it belongs to this run, not to the
+    # configuration -- and because a scheduled run has no row-level overrides
+    # to merge, so the two paths stay visibly different.
+    if run_id:
+        controls = controls_mod.with_run_overrides(controls, supa.trend_run(run_id))
+
+    if not niche_brief.strip():
         # Deliberately a hard stop. A trend run without a brief fills the
         # owner's queue with plausible, irrelevant ideas -- which is worse than
         # an empty queue, because each one costs a review.
         raise RuntimeError(
-            "NICHE_BRIEF is not set. Trend research cannot judge relevance without it; "
+            "No niche brief is set. Set one under Settings in the app, or via "
+            "NICHE_BRIEF. Trend research cannot judge relevance without it; "
             "refusing to fill the approval queue with generic ideas."
         )
 
-    hashtags = cfg.hashtag_list
     if not hashtags:
-        raise RuntimeError("TREND_HASHTAGS is empty; there is nothing to scout.")
+        raise RuntimeError(
+            "No hashtags are set; there is nothing to scout. Add some under "
+            "Settings in the app, or set TREND_HASHTAGS."
+        )
 
-    signals: list[Signal] = tiktok.scout(
+    # Rotation. Scouting a slice of the list keeps a run short without changing
+    # what qualifies as a signal, and the cursor is advanced before scouting
+    # rather than after so that a run which dies mid-session does not make the
+    # next one repeat the same tags.
+    selected, next_cursor = controls_mod.rotate(hashtags, controls.hashtag_cursor, controls.hashtags_per_run)
+    if len(selected) < len(hashtags):
+        log.info(
+            "rotating: scouting %d of %d hashtags this run (%s)",
+            len(selected),
+            len(hashtags),
+            ", ".join(selected),
+        )
+        supa.save_hashtag_cursor(next_cursor)
+
+    # Resolved here, before the scout, and not where the drafting happens: the
+    # scout below drives a real browser for minutes, and a missing key for the
+    # selected provider would throw all of that away at the last step.
+    provider = ideas_mod.resolve_provider(
+        controls.idea_provider or cfg.idea_provider, gemini_api_key=cfg.gemini_api_key
+    )
+    log.info("drafting ideas with %s", provider)
+
+    outcome = tiktok.scout(
         tiktok.ScoutConfig(
-            hashtags=hashtags,
+            hashtags=selected,
             ms_token=cfg.tiktok_ms_token,
-            videos_per_hashtag=30,
+            controls=controls,
+            # Only when there is a row to be stopped. A container started by
+            # hand has nothing watching it and nothing to ask.
+            should_stop=(lambda: supa.trend_run_is_cancelled(run_id)) if run_id else None,
         )
     )
-    log.info("scouted %d signals worth surfacing across %d hashtags", len(signals), len(hashtags))
-    if not signals:
-        return {"signals": 0, "inserted": 0, "reason": "no signal cleared its source's baseline"}
-
-    drafted = ideas_mod.generate_ideas(
-        signals, cfg.niche_brief, count=cfg.ideas_per_run
+    signals, report = outcome.signals, outcome.report
+    log.info(
+        "scouted %d signals worth surfacing from %d videos across %d hashtags",
+        len(signals),
+        report.seen,
+        len(report.hashtags_scouted),
     )
-    platforms = supa.enabled_platforms()
-    rows = ideas_mod.to_rows(drafted, signals, platforms)
 
-    # EventBridge schedules are at-least-once, so a retried run must not double
-    # the queue. This is application-level rather than a unique constraint,
-    # because two near-identical titles are not exactly equal.
-    seen = _existing_titles(supa)
-    fresh = [r for r in rows if _normalise(r["title"]) not in seen]
-    suppressed = len(rows) - len(fresh)
+    drafted: list = []
+    inserted: list = []
+    suppressed = 0
 
-    inserted = supa.insert_ideas(fresh)
-    log.info("inserted %d ideas (%d suppressed as duplicates)", len(inserted), suppressed)
+    # A stopped run drafts nothing and inserts nothing, even when it had
+    # already found something worth drafting. Stop has to mean stop: filling
+    # the queue a minute after the owner was told the run was cancelled is a
+    # surprise, and it spends an LLM call on a batch nobody asked to finish.
+    if signals and not report.cancelled:
+        drafted = ideas_mod.generate_ideas(
+            signals, niche_brief, count=controls.ideas_per_run, provider=provider
+        )
+        platforms = supa.enabled_platforms()
+        rows = ideas_mod.to_rows(drafted, signals, platforms)
+
+        # EventBridge schedules are at-least-once, so a retried run must not
+        # double the queue. This is application-level rather than a unique
+        # constraint, because two near-identical titles are not exactly equal.
+        seen_titles = _existing_titles(supa, controls.dedup_window_days)
+        fresh = [r for r in rows if _normalise(r["title"]) not in seen_titles]
+        suppressed = len(rows) - len(fresh)
+        report.drop("duplicate", suppressed)
+
+        inserted = supa.insert_ideas(fresh)
+        log.info("inserted %d ideas (%d suppressed as duplicates)", len(inserted), suppressed)
+
+    # Built on every path, including the empty one. The empty path is the one
+    # that needed it: "no signal cleared its baseline" was the whole
+    # explanation a run had for an untouched queue, and it named neither which
+    # bar nor how many videos had been looked at.
+    rejections = report_mod.payload(
+        report,
+        controls,
+        surfaced=len(signals),
+        drafted=len(drafted),
+        inserted=len(inserted),
+        hashtags_configured=len(hashtags),
+    )
+    log.info("trend run funnel: %s", report_mod.summarise(rejections))
+
     return {
+        "cancelled": report.cancelled,
         "signals": len(signals),
         "drafted": len(drafted),
         "inserted": len(inserted),
         "suppressed": suppressed,
+        "scouted": report.seen,
+        "hashtags_scouted": report.hashtags_scouted,
+        "rejections": rejections,
+        "provider": provider,
+        "hashtags": selected,
     }
 
 
 def main() -> None:
+    """Entry point for the container, scheduled or on-demand.
+
+    The bookkeeping lives here rather than in `run` so that `run` stays a
+    function that scouts and returns counts, callable from a test without a
+    row to report into.
+
+    `TREND_RUN_ID` is set as a container override by the dispatcher, which now
+    starts the scheduled run as well as the on-demand one -- so unlike before,
+    every run has a row to report into. Its absence means someone started this
+    container by hand.
+
+    The failure path matters as much as the success one. At most one run may be
+    in flight, so a task that dies without writing back holds the button shut
+    until a sweeper writes the row off minutes later. Recording the failure
+    here turns that into an error the owner can read immediately.
+    """
     logging.basicConfig(level=logging.INFO)
-    result = run()
-    log.info("trend run complete: %s", result)
+    run_id = settings().trend_run_id.strip()
+    supa = Supa()
+
+    try:
+        result = run(supa, run_id=run_id)
+    except Exception as exc:
+        if run_id:
+            supa.finish_trend_run(run_id, status="failed", error=str(exc)[:2000])
+        raise
+
+    if result.get("cancelled"):
+        # The row is already `cancelled`, written by the owner, and its status
+        # is theirs -- reporting an outcome into it would be reporting on a run
+        # they were told had stopped, and `finish_trend_run` refuses it anyway.
+        #
+        # What it had already seen is a different matter, and worth keeping:
+        # it is what separates "I stopped it too early" from "it was getting
+        # nowhere". Diagnostics only; nothing that changes how the run ended.
+        if run_id:
+            supa.record_cancelled_progress(
+                run_id,
+                scouted=result.get("scouted"),
+                hashtags_scouted=result.get("hashtags_scouted"),
+                rejections=result.get("rejections"),
+            )
+        log.info(
+            "trend run %s was stopped from the app after %s videos",
+            run_id or "(headless)",
+            result.get("scouted"),
+        )
+        return
+
+    if run_id:
+        supa.finish_trend_run(
+            run_id,
+            status="succeeded",
+            signals=result.get("signals"),
+            drafted=result.get("drafted"),
+            inserted=result.get("inserted"),
+            suppressed=result.get("suppressed"),
+            scouted=result.get("scouted"),
+            hashtags_scouted=result.get("hashtags_scouted"),
+            rejections=result.get("rejections"),
+        )
+    log.info("trend run complete: %s", {k: v for k, v in result.items() if k != "rejections"})
 
 
 if __name__ == "__main__":
