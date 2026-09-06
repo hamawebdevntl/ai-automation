@@ -125,7 +125,7 @@ def _f(value: Any) -> float | None:
 
 
 def _ts(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
+    ms = round(seconds * 1000)
     h, ms = divmod(ms, 3_600_000)
     m, ms = divmod(ms, 60_000)
     s, ms = divmod(ms, 1000)
@@ -166,8 +166,8 @@ def to_portrait(video: Path, dest: Path) -> Path:
     _run([
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-i", str(video),
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
-               "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
+        "-vf", ("scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-c:a", "copy", "-y", str(dest),
     ])

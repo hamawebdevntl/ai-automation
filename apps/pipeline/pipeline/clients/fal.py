@@ -60,7 +60,11 @@ class FalClient:
     def __init__(
         self, api_key: str | None = None, timeout: float = 60.0
     ) -> None:
-        key = api_key or settings().fal_api_key
+        # `api_key=""` means "explicitly absent" and is honoured without
+        # reaching for settings. Falling through to settings() here would raise
+        # about whatever else is unconfigured -- Supabase, usually -- instead of
+        # the key actually in question.
+        key = settings().fal_api_key if api_key is None else api_key
         if not key:
             raise FalError("FAL_API_KEY is not configured")
         # Note the scheme: fal expects the literal word "Key", not "Bearer".
@@ -183,16 +187,18 @@ class FalClient:
         expire.
         """
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.Client(timeout=None, follow_redirects=True) as client:
-            with client.stream("GET", url) as resp:
-                if resp.status_code >= 400:
-                    raise FalError(
-                        f"fal asset fetch -> {resp.status_code}. These URLs expire, "
-                        f"so a 403 here usually means we polled too slowly."
-                    )
-                with dest.open("wb") as fh:
-                    for chunk in resp.iter_bytes(chunk_size=1 << 20):
-                        fh.write(chunk)
+        with (
+            httpx.Client(timeout=None, follow_redirects=True) as client,
+            client.stream("GET", url) as resp,
+        ):
+            if resp.status_code >= 400:
+                raise FalError(
+                    f"fal asset fetch -> {resp.status_code}. These URLs expire, "
+                    f"so a 403 here usually means we polled too slowly."
+                )
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1 << 20):
+                    fh.write(chunk)
         return dest
 
     # -- bounded wait ------------------------------------------------------

@@ -52,6 +52,16 @@ class MptClient:
         cfg = settings()
         self._base = (base_url or cfg.mpt_base_url).rstrip("/")
         self._key = api_key or cfg.mpt_api_key
+        # Loud here rather than at import, which is what lets a deployment that
+        # never renders -- the trend scout on its own, for instance -- run
+        # without inventing MoneyPrinterTurbo credentials it will never use.
+        # The failure still cannot be silent: nothing reaches this constructor
+        # unless a render is actually about to be submitted.
+        if not self._base:
+            raise MptError(
+                "MPT_BASE_URL is not set, so no render can be submitted. Set it, "
+                "or use a style preset whose render_mode is not 'mpt'."
+            )
         # MPT reads `x-api-key` with `headers.getlist()` and rejects the request
         # when there is more than one value, because proxies disagree on
         # ordering. Never let a caller add a second one.
@@ -145,13 +155,15 @@ class MptClient:
         """
         url = self.resolve_artifact_url(ref)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.Client(timeout=None, follow_redirects=True) as client:
-            with client.stream("GET", url, headers=self._headers) as resp:
-                if resp.status_code >= 400:
-                    raise MptError(f"artifact fetch {url} -> {resp.status_code}")
-                with dest.open("wb") as fh:
-                    for chunk in resp.iter_bytes(chunk_size=1 << 20):
-                        fh.write(chunk)
+        with (
+            httpx.Client(timeout=None, follow_redirects=True) as client,
+            client.stream("GET", url, headers=self._headers) as resp,
+        ):
+            if resp.status_code >= 400:
+                raise MptError(f"artifact fetch {url} -> {resp.status_code}")
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1 << 20):
+                    fh.write(chunk)
         return dest
 
     def generate_script(self, subject: str, language: str = "", paragraphs: int = 1) -> str:
@@ -187,13 +199,12 @@ class MptClient:
         rejects anything outside it, so a remote URL cannot be handed over --
         the bytes have to be uploaded first.
         """
-        with local.open("rb") as fh:
-            with httpx.Client(timeout=None) as client:
-                resp = client.post(
-                    self._url("video_materials"),
-                    headers=self._headers,
-                    files={"file": (local.name, fh, "video/mp4")},
-                )
+        with local.open("rb") as fh, httpx.Client(timeout=None) as client:
+            resp = client.post(
+                self._url("video_materials"),
+                headers=self._headers,
+                files={"file": (local.name, fh, "video/mp4")},
+            )
         if resp.status_code >= 400:
             raise MptError(f"material upload -> {resp.status_code}: {resp.text[:300]}")
         data = resp.json().get("data") or {}

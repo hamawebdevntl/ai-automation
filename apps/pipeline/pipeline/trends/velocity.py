@@ -23,8 +23,15 @@ from datetime import datetime, timezone
 # against a baseline of mature videos understates it. Below this age we
 # extrapolate; above it we take the count at face value.
 YOUNG_DAYS = 7.0
-# Guards against a single freak result dominating a batch.
+# Guards against a single freak result dominating a batch. Also the ceiling on
+# `min_outlier_ratio` in the settings: ratios are clamped here, so a threshold
+# above this could never be met by anything.
 MAX_RATIO = 50.0
+# The bar when nobody has set one. Below 1.5x its own author's norm a video is
+# not outperforming anything. This was the only bar there was until it became
+# `trend_settings.min_outlier_ratio`; it survives as the default that keeps a
+# run behaving the same way on a database that has no such column.
+DEFAULT_MIN_RATIO = 1.5
 
 
 @dataclass(frozen=True)
@@ -42,8 +49,30 @@ class Signal:
 
     @property
     def is_worth_surfacing(self) -> bool:
-        # Below 1.5x the source's own norm it is not outperforming anything.
-        return self.ratio >= 1.5
+        """Whether this clears the default bar.
+
+        Kept for callers with no settings to hand -- a script, a notebook, a
+        test that cares about scoring rather than about configuration. The
+        scheduled run does not use it: it calls `clears` with the owner's own
+        threshold, which is the whole point of the setting existing.
+        """
+        return self.clears(min_ratio=DEFAULT_MIN_RATIO)
+
+    def clears(self, *, min_ratio: float, min_engagement: float = 0.0) -> bool:
+        """Whether this signal is worth a place in the batch.
+
+        Both bars in one method because they are one decision and because
+        reading them apart invites checking one and forgetting the other.
+
+        A ratio at or below zero never clears, whatever the threshold: it means
+        the author's own median could not be established, so the number is an
+        absence rather than a low score. `min_ratio` is floored at 1.0 by both
+        the column constraint and `controls`, so this only matters for a caller
+        that built a Signal by hand.
+        """
+        if self.ratio <= 0:
+            return False
+        return self.ratio >= min_ratio and self.engagement >= min_engagement
 
 
 def baseline(play_counts: list[int]) -> float:

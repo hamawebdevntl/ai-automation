@@ -21,7 +21,7 @@ class FakeSfn:
         self.sent: list[tuple[str, dict[str, Any]]] = []
         self.started: list[dict[str, Any]] = []
 
-    def send_task_success(self, taskToken: str, output: str) -> None:  # noqa: N803
+    def send_task_success(self, taskToken: str, output: str) -> None:
         if self.fail_code:
             from botocore.exceptions import ClientError
 
@@ -83,7 +83,7 @@ class FakeSupa:
 @pytest.fixture
 def sfn(monkeypatch):
     """Patch the module's Step Functions accessor and hand back the fake."""
-    import pipeline.activities.gates as gates
+    from pipeline.activities import gates
 
     fake = FakeSfn()
     monkeypatch.setattr(gates, "_sfn", lambda: fake)
@@ -92,7 +92,7 @@ def sfn(monkeypatch):
 
 @pytest.fixture
 def failing_sfn(monkeypatch):
-    import pipeline.activities.gates as gates
+    from pipeline.activities import gates
 
     def _make(code: str) -> FakeSfn:
         fake = FakeSfn(fail_code=code)

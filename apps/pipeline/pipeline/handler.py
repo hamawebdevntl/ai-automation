@@ -15,7 +15,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from pipeline.activities import analytics, gates, publish, render
 from pipeline.activities import reconcile as recon
@@ -42,6 +43,7 @@ DISPATCH: dict[str, Callable[..., dict[str, Any]]] = {
     "reconcile_publishes": lambda event: recon.reconcile_publishes(),
     "reap_mpt_tasks": lambda event: recon.reap_mpt_tasks(),
     "expire_ideas": lambda event: recon.expire_ideas(),
+    "dispatch_trend_runs": lambda event: recon.dispatch_trend_runs(),
     "collect_analytics": lambda event: analytics.collect_analytics(),
 }
 

@@ -9,6 +9,10 @@ import { Separator } from '@/components/ui/separator';
 import { useAuth } from '@/features/auth/auth-context';
 import { useOwner } from '@/features/auth/use-owner';
 import { PageHeader } from '@/features/queue/components/page-header';
+import { TrendFiltersCard } from '@/features/trends/components/trend-filters-card';
+import { TrendRunCostCard } from '@/features/trends/components/trend-run-cost-card';
+import { TrendScheduleCard } from '@/features/trends/components/trend-schedule-card';
+import { TrendSettingsCard } from '@/features/trends/components/trend-settings-card';
 
 export const Route = createFileRoute('/_app/settings')({
   component: SettingsPage,
@@ -57,6 +61,11 @@ function SettingsPage() {
           </AlertDescription>
         </Alert>
       )}
+
+      <TrendSettingsCard />
+      <TrendScheduleCard />
+      <TrendFiltersCard />
+      <TrendRunCostCard />
 
       <Card>
         <CardHeader>
