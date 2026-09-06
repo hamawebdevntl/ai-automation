@@ -20,13 +20,20 @@ from pipeline.trends.runner import _inputs
 
 
 class FakeCfg:
-    def __init__(self, brief: str = "", tags: list[str] | None = None) -> None:
+    def __init__(
+        self, brief: str = "", tags: list[str] | None = None, keywords: list[str] | None = None
+    ) -> None:
         self.niche_brief = brief
         self._tags = tags or []
+        self._keywords = keywords or []
 
     @property
     def hashtag_list(self) -> list[str]:
         return self._tags
+
+    @property
+    def keyword_list(self) -> list[str]:
+        return self._keywords
 
 
 class FakeSupa:
@@ -40,32 +47,39 @@ class FakeSupa:
         return self._row
 
 
-ENV = FakeCfg("env brief", ["envtag"])
+ENV = FakeCfg("env brief", ["envtag"], ["envterm"])
+
+# Every row that is about hashtags has to say so now. The default source is
+# Google Trends, which reads `trend_keywords` -- handing it a hashtag list
+# produces a run that looks like it worked and finds nothing.
+TIKTOK = {"trend_source": "tiktok"}
 
 
 class TestTheRowWins:
     def test_both_fields_come_from_the_database_when_set(self):
-        row = {"niche_brief": "db brief", "hashtags": ["dbtag", "other"]}
+        row = {**TIKTOK, "niche_brief": "db brief", "hashtags": ["dbtag", "other"]}
         assert _inputs(FakeSupa(row), ENV)[:2] == ("db brief", ["dbtag", "other"])
 
     def test_a_hash_someone_typed_in_the_app_is_stripped(self):
         # The UI normalises on save, but a row written by hand or by an older
         # build should not silently scout a feed called "#saas".
-        row = {"niche_brief": "db brief", "hashtags": ["#saas", " nocode "]}
+        row = {**TIKTOK, "niche_brief": "db brief", "hashtags": ["#saas", " nocode "]}
         assert _inputs(FakeSupa(row), ENV)[1] == ["saas", "nocode"]
 
 
 class TestTheEnvironmentIsTheFallback:
     def test_a_missing_row_falls_back_entirely(self):
-        assert _inputs(FakeSupa(None), ENV)[:2] == ("env brief", ["envtag"])
+        # No row means no source either, so this takes the default: Google
+        # Trends, and therefore the environment's keywords rather than its tags.
+        assert _inputs(FakeSupa(None), ENV)[:2] == ("env brief", ["envterm"])
 
     def test_each_field_falls_back_on_its_own(self):
         # A brief set in the app with hashtags left to the environment is a
         # coherent state; it must not blank one because the other is set.
-        row = {"niche_brief": "db brief", "hashtags": []}
+        row = {**TIKTOK, "niche_brief": "db brief", "hashtags": []}
         assert _inputs(FakeSupa(row), ENV)[:2] == ("db brief", ["envtag"])
 
-        row = {"niche_brief": "   ", "hashtags": ["dbtag"]}
+        row = {**TIKTOK, "niche_brief": "   ", "hashtags": ["dbtag"]}
         assert _inputs(FakeSupa(row), ENV)[:2] == ("env brief", ["dbtag"])
 
     def test_an_unreadable_table_degrades_instead_of_failing(self, caplog):
@@ -73,7 +87,7 @@ class TestTheEnvironmentIsTheFallback:
         # came before it, not stop the run.
         supa = FakeSupa(raises=RuntimeError("relation does not exist"))
         with caplog.at_level("WARNING"):
-            assert _inputs(supa, ENV)[:2] == ("env brief", ["envtag"])
+            assert _inputs(supa, ENV)[:2] == ("env brief", ["envterm"])
         assert "falling back to env" in caplog.text
 
 
@@ -90,6 +104,7 @@ class TestTheControlsComeAlong:
 
     def test_the_row_decides_when_it_has_values(self):
         row = {
+            **TIKTOK,
             "niche_brief": "db brief",
             "hashtags": ["dbtag"],
             "min_plays": 50000,
@@ -127,3 +142,46 @@ class TestTheControlsComeAlong:
         # Empty rather than "claude", so that IDEA_LLM_PROVIDER still decides
         # on a database whose column has never been written.
         assert _inputs(FakeSupa(None), ENV)[2].idea_provider == ""
+
+
+class TestEachSourceReadsItsOwnVocabulary:
+    """A hashtag is not a search term.
+
+    `#exceltips` is how a video is filed. "bookkeeping software" is what
+    somebody types when they have had enough of doing it by hand. Handing
+    either list to the other source produces a run that completes, reports
+    success, and finds nothing -- which is the worst kind of wrong here,
+    because it looks exactly like a quiet week.
+    """
+
+    @staticmethod
+    def row(**extra: object) -> dict:
+        return {
+            "niche_brief": "db brief",
+            "hashtags": ["exceltips", "crm"],
+            "trend_keywords": ["bookkeeping software", "invoice software"],
+            **extra,
+        }
+
+    def test_google_trends_reads_the_keywords(self):
+        row = self.row(trend_source="google_trends")
+        assert _inputs(FakeSupa(row), ENV)[1] == ["bookkeeping software", "invoice software"]
+
+    def test_tiktok_reads_the_hashtags(self):
+        row = self.row(trend_source="tiktok")
+        assert _inputs(FakeSupa(row), ENV)[1] == ["exceltips", "crm"]
+
+    def test_the_default_source_is_google_trends(self):
+        # TikTok-Api is pinned at its own latest release and refuses every
+        # feed, so it is kept as a setting rather than a default.
+        row = self.row()
+        assert _inputs(FakeSupa(row), ENV)[2].trend_source == "google_trends"
+        assert _inputs(FakeSupa(row), ENV)[1] == ["bookkeeping software", "invoice software"]
+
+    def test_an_empty_keyword_list_falls_back_to_the_environment(self):
+        row = {"niche_brief": "db brief", "trend_source": "google_trends", "trend_keywords": []}
+        assert _inputs(FakeSupa(row), ENV)[1] == ["envterm"]
+
+    def test_the_region_comes_through_uppercased(self):
+        row = self.row(trend_geo="gb")
+        assert _inputs(FakeSupa(row), ENV)[2].trend_geo == "GB"

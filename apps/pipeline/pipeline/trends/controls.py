@@ -112,6 +112,13 @@ BLOCKLIST_MAX_WORD_LENGTH = 60
 
 PROVIDERS = ("claude", "gemini")
 
+# Where signals come from. `tiktok` is kept rather than deleted: the code is
+# sound and the scoring is better than anything here, so if the library ever
+# catches up it is a setting away. It is not the default because it currently
+# does not work at all.
+SOURCES = ("google_trends", "tiktok")
+DEFAULT_TREND_SOURCE = "google_trends"
+
 
 @dataclass(frozen=True)
 class ScoutControls:
@@ -139,6 +146,11 @@ class ScoutControls:
     dedup_window_days: int = DEFAULT_DEDUP_WINDOW_DAYS
     idea_expiry_days: int = DEFAULT_IDEA_EXPIRY_DAYS
     idea_provider: str = DEFAULT_IDEA_PROVIDER
+
+    trend_source: str = DEFAULT_TREND_SOURCE
+    # Google Trends only. Empty means worldwide, which is the honest default:
+    # nothing in the pipeline knows where this business sells.
+    trend_geo: str = ""
 
     @property
     def run_budget_seconds(self) -> float | None:
@@ -177,6 +189,8 @@ def from_row(row: dict[str, Any] | None) -> ScoutControls:
         dedup_window_days=_int(row, "dedup_window_days", DEFAULT_DEDUP_WINDOW_DAYS),
         idea_expiry_days=_int(row, "idea_expiry_days", DEFAULT_IDEA_EXPIRY_DAYS),
         idea_provider=_provider(row.get("idea_provider")),
+        trend_source=_source(row.get("trend_source")),
+        trend_geo=str(row.get("trend_geo") or "").strip().upper(),
     )
 
     # Cross-field, so it cannot be done per-column above. Jitter needs a range
@@ -287,6 +301,22 @@ def _provider(raw: Any) -> str:
     if name not in PROVIDERS:
         log.warning("idea_provider=%r is not a provider; deferring to the environment", raw)
         return DEFAULT_IDEA_PROVIDER
+    return name
+
+
+def _source(raw: Any) -> str:
+    """Where signals come from, falling back rather than guessing.
+
+    An unknown value takes the default instead of raising. A row written by a
+    build newer than this one -- naming a source this code has never heard of
+    -- should degrade to scouting something, not to refusing to run.
+    """
+    name = str(raw or "").strip().lower()
+    if not name:
+        return DEFAULT_TREND_SOURCE
+    if name not in SOURCES:
+        log.warning("trend_source=%r is not a known source; using %s", raw, DEFAULT_TREND_SOURCE)
+        return DEFAULT_TREND_SOURCE
     return name
 
 

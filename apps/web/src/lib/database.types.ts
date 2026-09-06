@@ -147,7 +147,24 @@ export type TrendSettingsRow = {
   dedup_window_days: number;
   idea_expiry_days: number;
   idea_provider: IdeaProvider;
+
+  /** Where signals come from. TikTok is kept as a setting but currently refuses every feed. */
+  trend_source: TrendSource;
+  /** Search terms in buyer language, for Google Trends. Not hashtags. */
+  trend_keywords: string[];
+  /** ISO-3166 region for Google Trends, or empty for worldwide. */
+  trend_geo: string;
 };
+
+/**
+ * Where the scout looks.
+ *
+ * `google_trends` measures search demand — what people type when a manual
+ * process has finally cost them an afternoon. `tiktok` measured which video
+ * format was working, which is the better signal for a hook, but TikTok-Api is
+ * pinned at its own latest release and currently refuses every feed.
+ */
+export type TrendSource = 'google_trends' | 'tiktok';
 
 /** Which model drafts the queue. Both are wired; the key must be in the bundle. */
 export type IdeaProvider = 'claude' | 'gemini';

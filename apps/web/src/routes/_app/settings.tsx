@@ -13,6 +13,7 @@ import { TrendFiltersCard } from '@/features/trends/components/trend-filters-car
 import { TrendRunCostCard } from '@/features/trends/components/trend-run-cost-card';
 import { TrendScheduleCard } from '@/features/trends/components/trend-schedule-card';
 import { TrendSettingsCard } from '@/features/trends/components/trend-settings-card';
+import { TrendSourceCard } from '@/features/trends/components/trend-source-card';
 
 export const Route = createFileRoute('/_app/settings')({
   component: SettingsPage,
@@ -63,6 +64,7 @@ function SettingsPage() {
       )}
 
       <TrendSettingsCard />
+      <TrendSourceCard />
       <TrendScheduleCard />
       <TrendFiltersCard />
       <TrendRunCostCard />

@@ -529,3 +529,43 @@ export function estimateSearchLength(
 export function budgetForEstimate(minutes: number): number {
   return clampToBounds('run_budget_minutes', Math.ceil(minutes));
 }
+
+// ---------------------------------------------------------------------------
+// Google Trends
+// ---------------------------------------------------------------------------
+
+/** Mirrors the `trend_settings_keywords` constraint. */
+export const MAX_TREND_KEYWORDS = 50;
+
+/**
+ * Clean a search term for storage.
+ *
+ * Lowercased and space-collapsed, and that is all. Unlike a hashtag, a search
+ * term is a phrase — stripping punctuation or joining words would change what
+ * is being measured, and "excel alternative" is two words on purpose.
+ */
+export function normaliseKeyword(raw: string): string {
+  return raw.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * Regions offered for Google Trends.
+ *
+ * A short list rather than every ISO code: interest is normalised within a
+ * region, so the useful choice is the market you actually sell to, and a
+ * two-hundred-entry dropdown makes that choice harder rather than easier.
+ * Worldwide is first because it is the honest default — nothing in the
+ * pipeline knows where this business sells.
+ */
+export const GEO_OPTIONS: ReadonlyArray<{ code: string; label: string }> = [
+  { code: '', label: 'Worldwide' },
+  { code: 'GB', label: 'United Kingdom' },
+  { code: 'US', label: 'United States' },
+  { code: 'IE', label: 'Ireland' },
+  { code: 'CA', label: 'Canada' },
+  { code: 'AU', label: 'Australia' },
+  { code: 'DE', label: 'Germany' },
+  { code: 'FR', label: 'France' },
+  { code: 'NL', label: 'Netherlands' },
+  { code: 'AE', label: 'United Arab Emirates' },
+];

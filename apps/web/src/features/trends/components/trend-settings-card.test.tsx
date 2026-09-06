@@ -41,51 +41,39 @@ beforeEach(() => {
   mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
 });
 
-describe('defaults are editable, not fixed', () => {
-  it('shows the seeded hashtags as removable', async () => {
+describe('the brief', () => {
+  it('shows what is stored', async () => {
     render(<TrendSettingsCard />, { wrapper });
-    expect(await screen.findByText('#aiautomation')).toBeInTheDocument();
-    expect(screen.getByLabelText('Remove #webdesign')).toBeInTheDocument();
+    expect(await screen.findByLabelText(/what you do, who you speak to/i)).toHaveValue(row.niche_brief);
   });
 
-  it('removes a tag and saves the list without it', async () => {
+  it('saves only the brief, leaving the source lists to their own card', async () => {
+    // Two cards editing one field is how a tab left open on one silently
+    // reverts the other, and there is no server tier to arbitrate.
     const user = userEvent.setup();
     render(<TrendSettingsCard />, { wrapper });
 
-    await user.click(await screen.findByLabelText('Remove #webdesign'));
-    expect(screen.queryByText('#webdesign')).not.toBeInTheDocument();
-
+    await user.type(await screen.findByLabelText(/what you do, who you speak to/i), ' We also do integrations.');
     await user.click(screen.getByRole('button', { name: 'Save' }));
+
     expect(mutate).toHaveBeenCalledWith({
-      niche_brief: row.niche_brief,
-      hashtags: ['aiautomation', 'devops'],
+      niche_brief: `${row.niche_brief} We also do integrations.`,
     });
   });
 
-  it('adds a typed tag, normalising it on the way in', async () => {
-    const user = userEvent.setup();
+  it('says why the brief matters more now', async () => {
+    // Google Trends says a subject is live and nothing about how to open a
+    // video, so the hook comes from here or from nowhere.
     render(<TrendSettingsCard />, { wrapper });
-
-    await user.type(await screen.findByPlaceholderText('Add a hashtag'), '#No Code{enter}');
-    expect(screen.getByText('#nocode')).toBeInTheDocument();
+    expect(await screen.findByText(/the hook comes from what you write here/i)).toBeInTheDocument();
   });
 
-  it('refuses a duplicate rather than scouting the same feed twice', async () => {
-    const user = userEvent.setup();
-    render(<TrendSettingsCard />, { wrapper });
-
-    await user.type(await screen.findByPlaceholderText('Add a hashtag'), 'AIAutomation{enter}');
-    expect(screen.getAllByText('#aiautomation')).toHaveLength(1);
-  });
-});
-
-describe('save is only offered when there is something to save', () => {
   it('disables save until something changes', async () => {
     const user = userEvent.setup();
     render(<TrendSettingsCard />, { wrapper });
 
     expect(await screen.findByRole('button', { name: 'Save' })).toBeDisabled();
-    await user.click(screen.getByLabelText('Remove #devops'));
+    await user.type(screen.getByLabelText(/what you do, who you speak to/i), 'x');
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
   });
 });
@@ -95,12 +83,10 @@ describe('a viewer cannot edit', () => {
     mockOwner.mockReturnValue({ isOwner: false, isLoading: false, role: 'viewer', displayName: null });
   });
 
-  it('shows the tags but offers no way to change them', async () => {
+  it('shows the brief but offers no way to change it', async () => {
     render(<TrendSettingsCard />, { wrapper });
 
-    expect(await screen.findByText('#aiautomation')).toBeInTheDocument();
-    expect(screen.queryByLabelText('Remove #aiautomation')).not.toBeInTheDocument();
-    expect(screen.queryByPlaceholderText('Add a hashtag')).not.toBeInTheDocument();
+    expect(await screen.findByLabelText(/what you do, who you speak to/i)).toBeDisabled();
     expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
   });
 
