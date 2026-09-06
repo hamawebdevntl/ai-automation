@@ -47,7 +47,7 @@ jobs:
     # The same image the Fargate task used, so the browser and its system
     # libraries are already present. Downloading Chromium on every run would
     # cost more minutes than the scouting does.
-    container: mcr.microsoft.com/playwright/python:v1.49.0-jammy
+    container: mcr.microsoft.com/playwright/python:v1.62.0-jammy
 
     # Generous, because the run budget is enforced inside the scout where it
     # can stop cleanly and still draft from what it found. This is only the
@@ -63,6 +63,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install ".[trends]"
+          # The image ships a browser built for the Playwright version it was
+          # cut with, and `pyproject.toml` pins a range rather than a version,
+          # so pip is free to install a newer one. When they disagree the
+          # mismatch surfaces only when a session is created -- after the run
+          # has been claimed, which is how it turns into a failed run rather
+          # than a failed install.
+          #
+          # This fetches the browser matching whatever pip actually resolved.
+          # It is a no-op while the image above is in step, and it is what
+          # stops a Playwright release breaking scouting the next morning.
+          # System libraries come from the image, so no --with-deps.
+          python -m playwright install chromium
 
       - name: Scout
         working-directory: apps/pipeline
