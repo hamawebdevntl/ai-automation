@@ -12,7 +12,7 @@ import json
 import pytest
 from botocore.exceptions import ClientError
 
-import pipeline.activities.gates as gates
+from pipeline.activities import gates
 from tests.conftest import FakeSupa
 
 

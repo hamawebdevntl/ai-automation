@@ -169,7 +169,7 @@ def _load_secrets_into_env() -> None:
         payload = boto3.client("secretsmanager").get_secret_value(SecretId=arn)["SecretString"]
         for key, value in json.loads(payload).items():
             os.environ.setdefault(key, str(value))
-    except Exception as exc:  # noqa: BLE001 - never log the payload
+    except Exception as exc:
         raise RuntimeError(
             f"could not resolve PIPELINE_SECRETS_ARN: {type(exc).__name__}"
         ) from exc
