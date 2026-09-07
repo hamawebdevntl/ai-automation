@@ -36,7 +36,6 @@ import sys
 from typing import Any
 
 from pipeline.activities.reconcile import (
-    REQUEST_STALE_MINUTES,
     RUN_STALE_HOURS,
     open_due_scheduled_run,
 )
@@ -47,7 +46,7 @@ log = logging.getLogger(__name__)
 
 
 def _write_off_stale(supa: Supa) -> list[str]:
-    """Clear runs that will never finish, so they stop holding the lock.
+    """Clear *claimed* runs that will never finish, so they stop holding the lock.
 
     The same job the AWS sweeper does, and needed for the same reason: at most
     one run may be in flight, so a job cancelled mid-scout -- which on a CI
@@ -56,10 +55,31 @@ def _write_off_stale(supa: Supa) -> list[str]:
 
     A CI runner makes this more likely than Fargate did, not less: workflows
     get cancelled, time out, and lose their machine to spot reclamation.
+
+    Unclaimed requests are deliberately left alone here, and that is the whole
+    difference between this and the AWS sweeper.
+
+    `REQUEST_STALE_MINUTES` is ten, and its comment says why that is safe: "the
+    dispatcher runs every minute, so ten of them missing it means it is not
+    running". True there. This dispatcher runs *hourly*, so ten minutes of
+    silence is the normal state rather than evidence of anything -- and because
+    this function ran before `claim_trend_run`, every request made more than
+    ten minutes before a workflow fired was written off a few lines before the
+    same process would have claimed and run it.
+
+    The effect was a button that worked only if the hourly cron happened to
+    fire within ten minutes of the press, and failed the other fifty minutes of
+    every hour with "gave up on a run left requested with nothing running it" --
+    a sweeper reporting a stall it had caused.
+
+    Nothing needs to reap a request on this path: the next thing this process
+    does is claim it, whatever its age. A request only strands if the workflow
+    itself has stopped running, and then no sweeper of ours is running either --
+    which is what Stop in the app is for.
     """
     expired: list[str] = []
     for row in supa.stale_trend_runs(
-        running_hours=RUN_STALE_HOURS, requested_minutes=REQUEST_STALE_MINUTES
+        running_hours=RUN_STALE_HOURS, requested_minutes=None
     ):
         supa.finish_trend_run(
             row["id"],
