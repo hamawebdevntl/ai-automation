@@ -470,7 +470,9 @@ class Supa:
         except Exception as exc:  # noqa: BLE001
             log.warning("could not record the task stop for run %s: %s", run_id, exc)
 
-    def stale_trend_runs(self, *, running_hours: int, requested_minutes: int) -> list[dict[str, Any]]:
+    def stale_trend_runs(
+        self, *, running_hours: int, requested_minutes: int | None
+    ) -> list[dict[str, Any]]:
         """Runs that will never finish on their own.
 
         A task killed by Fargate, an image that will not start, or a reconciler
@@ -478,10 +480,24 @@ class Supa:
         because at most one row may be in flight, that disables the button
         permanently. This is what makes that state recoverable without a
         console.
+
+        `requested_minutes=None` means "do not sweep unclaimed requests at
+        all", and it is not a convenience -- it is the difference between a
+        dispatcher that polls faster than this threshold and one that does not.
+
+        A `requested` row is only stranded if nothing is coming to claim it. On
+        a dispatcher that runs every minute, ten minutes of silence really does
+        mean that. On one that runs hourly it means nothing at all, and reaping
+        the row anyway destroys the request a few lines before the same process
+        would have claimed and run it. So the caller states which world it is
+        in rather than inheriting an assumption from a comment.
         """
         now = datetime.now(timezone.utc)
         running_cutoff = (now - timedelta(hours=running_hours)).isoformat()
-        requested_cutoff = (now - timedelta(minutes=requested_minutes)).isoformat()
+        requested_cutoff = (
+            None if requested_minutes is None
+            else (now - timedelta(minutes=requested_minutes)).isoformat()
+        )
         res = (
             self._c.table("trend_runs")
             .select("id,status,requested_at,started_at")
@@ -493,7 +509,12 @@ class Supa:
             # A claimed row is judged from when it started, an unclaimed one
             # from when it was asked for. `started_at` is null on the second,
             # and on a row claimed by a reconciler that died before setting it.
-            cutoff = running_cutoff if row["status"] == "running" else requested_cutoff
+            if row["status"] == "running":
+                cutoff = running_cutoff
+            elif requested_cutoff is None:
+                continue
+            else:
+                cutoff = requested_cutoff
             since = row.get("started_at") or row["requested_at"]
             if since < cutoff:
                 stale.append(row)
