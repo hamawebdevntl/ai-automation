@@ -53,6 +53,10 @@ DEFAULT_SCHEDULE_DAYS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6)
 DEFAULT_MAX_VIDEO_AGE_DAYS = 30
 
 DEFAULT_MIN_PLAYS = 0
+# Google Trends reports interest as 0-100 against a term's own peak, so no
+# floor is the right default: the *rise* is what this source measures, and the
+# ratio check already covers it.
+DEFAULT_MIN_INTEREST = 0
 DEFAULT_MIN_ENGAGEMENT_RATE = 0.0
 # Was `Signal.is_worth_surfacing`, a hardcoded `ratio >= 1.5`.
 DEFAULT_MIN_OUTLIER_RATIO = 1.5
@@ -93,6 +97,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "schedule_minute_utc": (0, 59),
     "max_video_age_days": (1, 365),
     "min_plays": (0, 100_000_000),
+    "min_interest": (0, 100),
     "min_engagement_rate": (0.0, 0.5),
     "min_outlier_ratio": (1.0, 50.0),
     "videos_per_hashtag": (5, 100),
@@ -131,6 +136,7 @@ class ScoutControls:
 
     max_video_age_days: int = DEFAULT_MAX_VIDEO_AGE_DAYS
     min_plays: int = DEFAULT_MIN_PLAYS
+    min_interest: int = DEFAULT_MIN_INTEREST
     min_engagement_rate: float = DEFAULT_MIN_ENGAGEMENT_RATE
     min_outlier_ratio: float = DEFAULT_MIN_OUTLIER_RATIO
     caption_blocklist: tuple[str, ...] = DEFAULT_CAPTION_BLOCKLIST
@@ -175,6 +181,7 @@ def from_row(row: dict[str, Any] | None) -> ScoutControls:
         schedule_days=_days(row.get("schedule_days")),
         max_video_age_days=_int(row, "max_video_age_days", DEFAULT_MAX_VIDEO_AGE_DAYS),
         min_plays=_int(row, "min_plays", DEFAULT_MIN_PLAYS),
+        min_interest=_int(row, "min_interest", DEFAULT_MIN_INTEREST),
         min_engagement_rate=_float(row, "min_engagement_rate", DEFAULT_MIN_ENGAGEMENT_RATE),
         min_outlier_ratio=_float(row, "min_outlier_ratio", DEFAULT_MIN_OUTLIER_RATIO),
         caption_blocklist=normalise_blocklist(row.get("caption_blocklist")),

@@ -227,16 +227,18 @@ def scout(config: GTrendsConfig) -> ScoutOutcome:
             ratio = vel.window_velocity(series, recent_fraction=RECENT_FRACTION)
             latest = round(series[-1])
 
-            if latest < controls.min_plays:
-                # `min_plays` is a view count on a video source. Here it is the
-                # term's current interest as a percentage of its own three-month
-                # peak, because a solo request is normalised against that peak
-                # and nothing else.
+            if latest < controls.min_interest:
+                # `min_interest`, not `min_plays`. The two answer the same
+                # question on incompatible scales: a view count is unbounded,
+                # and this is 0-100 against the term's own three-month peak,
+                # because a solo request is normalised against that peak and
+                # nothing else. Sharing one column meant a sensible video floor
+                # of 198000 rejected every term that will ever exist.
                 #
-                # Worth being explicit about what that cannot do: Google Trends
-                # never reports absolute volume, so this cannot reject a term
-                # nobody searches. It rejects a term that is currently far below
-                # its own best, which is a different and still useful question.
+                # Worth being explicit about what this cannot do either way:
+                # Google Trends never reports absolute volume, so it cannot
+                # reject a term nobody searches. It rejects a term far below its
+                # own best, which is a different and still useful question.
                 report.drop("too_few_plays")
                 continue
 
