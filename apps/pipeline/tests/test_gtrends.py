@@ -153,15 +153,25 @@ class TestAbsenceIsNotALowScore:
 
 
 class TestFiltersThatStillApply:
-    def test_minimum_interest_uses_the_view_count_setting(self):
-        # `min_plays` is a view count on a video source and a search-interest
-        # score here. Both answer "is anyone actually looking at this".
+    def test_the_interest_floor_is_its_own_setting(self):
         client = FakeTrends({"a": [1.0] * 15 + [5.0] * 5})
 
-        outcome = scout(client, ["a"], ScoutControls(min_plays=50, min_outlier_ratio=1.0))
+        outcome = scout(client, ["a"], ScoutControls(min_interest=50, min_outlier_ratio=1.0))
 
         assert outcome.signals == []
         assert outcome.report.dropped == {"too_few_plays": 1}
+
+    def test_a_view_count_floor_cannot_reject_a_search_term(self):
+        # The bug this replaced. A view count is unbounded and a sensible video
+        # floor is six figures; Trends interest is 0-100 against the term's own
+        # peak. Sharing one column meant min_plays=198000 rejected every term
+        # that will ever exist -- and the first live run dropped twelve of
+        # fifteen that way, with Google having answered all fifteen.
+        client = FakeTrends({"a": rising()})
+
+        outcome = scout(client, ["a"], ScoutControls(min_plays=198_000))
+
+        assert len(outcome.signals) == 1
 
     def test_a_blocked_word_rejects_the_term(self):
         client = FakeTrends({"free course": rising()})
@@ -272,3 +282,62 @@ class TestStoppingEarly:
 
         assert outcome.signals == []
         assert client.payloads == []
+
+
+class TestTheReportNamesTheRightSetting:
+    """A breakdown that blames the wrong filter is worse than none.
+
+    The stage keys are shared because the funnel has the same shape whatever is
+    scouted. What a stage is called, and which setting caused it, is not --
+    telling the owner "under your minimum view count: 198000" about a search
+    trend sends them to a filter that had nothing to do with it.
+    """
+
+    def make(self, dropped: dict[str, int], controls: ScoutControls):
+        from pipeline.trends.report import ScoutReport, payload
+
+        report = ScoutReport(seen=sum(dropped.values()))
+        for stage, count in dropped.items():
+            report.drop(stage, count)
+        return payload(
+            report, controls, surfaced=0, drafted=0, inserted=0, hashtags_configured=1,
+            source="google_trends",
+        )
+
+    def stage(self, doc, key):
+        return next(s for s in doc["stages"] if s["key"] == key)
+
+    def test_the_interest_stage_names_min_interest(self):
+        doc = self.make({"too_few_plays": 3}, ScoutControls(min_interest=20, min_plays=198_000))
+        stage = self.stage(doc, "too_few_plays")
+
+        assert stage["setting"] == "min_interest"
+        assert stage["value"] == 20
+        assert "search interest" in stage["label"].lower()
+
+    def test_filters_this_source_cannot_apply_name_no_setting(self):
+        # Engagement and recency are not reported by Google Trends. Showing the
+        # owner's video-era values next to them would imply they are in force.
+        doc = self.make({}, ScoutControls(min_engagement_rate=0.05, max_video_age_days=14))
+
+        for key in ("below_engagement", "too_old"):
+            stage = self.stage(doc, key)
+            assert stage["setting"] is None
+            assert stage["value"] is None
+
+    def test_a_video_source_keeps_the_original_wording(self):
+        from pipeline.trends.report import ScoutReport, payload
+
+        report = ScoutReport(seen=1)
+        report.drop("too_few_plays")
+        doc = payload(
+            report, ScoutControls(min_plays=50_000), surfaced=0, drafted=0, inserted=0,
+            hashtags_configured=1, source="tiktok",
+        )
+        stage = next(s for s in doc["stages"] if s["key"] == "too_few_plays")
+
+        assert stage["setting"] == "min_plays"
+        assert stage["value"] == 50_000
+
+    def test_the_document_records_which_source_ran(self):
+        assert self.make({}, ScoutControls())["source"] == "google_trends"

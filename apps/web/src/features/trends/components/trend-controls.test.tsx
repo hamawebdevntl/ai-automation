@@ -112,24 +112,42 @@ describe('the filters', () => {
     const user = userEvent.setup();
     render(<TrendFiltersCard />, { wrapper });
 
-    const views = await screen.findByLabelText('Minimum views');
-    await user.clear(views);
-    await user.type(views, '50000');
+    const interest = await screen.findByLabelText('Minimum search interest');
+    await user.clear(interest);
+    await user.type(interest, '20');
     await user.click(screen.getByRole('button', { name: 'Save' }));
 
-    expect(mutate).toHaveBeenCalledWith({
-      min_plays: 50000,
-      min_engagement_rate: 0,
-      min_outlier_ratio: 1.5,
-      caption_blocklist: [],
-      videos_per_hashtag: 30,
-      ideas_per_run: 10,
-    });
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({ min_interest: 20, min_outlier_ratio: 1.5, ideas_per_run: 10 }),
+    );
   });
 
-  it('shows the engagement rate as a percentage and stores it as a fraction', async () => {
+  it('offers the interest floor for Google Trends and the view floor for video', async () => {
+    // Two floors on incompatible scales. Offering both at once is how a
+    // sensible video floor of 198,000 came to reject every search term that
+    // will ever exist.
+    render(<TrendFiltersCard />, { wrapper });
+
+    expect(await screen.findByLabelText('Minimum search interest')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Minimum views')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Minimum engagement rate')).not.toBeInTheDocument();
+  });
+
+  it('holds the interest floor to the only scale Google reports on', async () => {
     const user = userEvent.setup();
-    row = trendSettings({ min_engagement_rate: 0.04 });
+    render(<TrendFiltersCard />, { wrapper });
+
+    const interest = await screen.findByLabelText('Minimum search interest');
+    await user.clear(interest);
+    await user.type(interest, '500');
+
+    expect(interest).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+  });
+
+  it('shows the engagement rate as a percentage on a video source', async () => {
+    const user = userEvent.setup();
+    row = trendSettings({ trend_source: 'tiktok', min_engagement_rate: 0.04 });
     render(<TrendFiltersCard />, { wrapper });
 
     const field = await screen.findByLabelText('Minimum engagement rate');
@@ -140,6 +158,20 @@ describe('the filters', () => {
     await user.click(screen.getByRole('button', { name: 'Save' }));
 
     expect(mutate).toHaveBeenCalledWith(expect.objectContaining({ min_engagement_rate: 0.06 }));
+  });
+
+  it('keeps a video view floor stored even while Google Trends is selected', async () => {
+    // The value is not wrong, it is just for a different source. Clearing it
+    // on switch would lose a setting the owner chose.
+    row = trendSettings({ min_plays: 198000 });
+    const user = userEvent.setup();
+    render(<TrendFiltersCard />, { wrapper });
+
+    await user.clear(await screen.findByLabelText('Minimum search interest'));
+    await user.type(screen.getByLabelText('Minimum search interest'), '10');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(mutate).toHaveBeenCalledWith(expect.objectContaining({ min_plays: 198000 }));
   });
 
   it('lowercases a blocked word, because matching is case-insensitive', async () => {
@@ -227,7 +259,7 @@ describe('a viewer', () => {
     mockOwner.mockReturnValue({ isOwner: false, isLoading: false, role: 'viewer', displayName: null });
     render(<TrendFiltersCard />, { wrapper });
 
-    expect(await screen.findByLabelText('Minimum views')).toBeDisabled();
+    expect(await screen.findByLabelText('Minimum search interest')).toBeDisabled();
     expect(screen.queryByRole('button', { name: 'Save' })).not.toBeInTheDocument();
     expect(screen.getByText(/only an owner can change them/i)).toBeInTheDocument();
   });

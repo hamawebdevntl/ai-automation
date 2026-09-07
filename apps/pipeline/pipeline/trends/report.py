@@ -65,6 +65,27 @@ STAGES: tuple[tuple[str, str, str | None, str], ...] = (
 
 VIDEO_STAGES = tuple(key for key, _, _, level in STAGES if level == "video")
 
+# Where a stage means something different depending on the source.
+#
+# The stage keys are shared because the funnel is the same shape whatever is
+# being scouted -- something is seen, something is dropped, something survives.
+# What a stage is *called*, and which setting caused it, is not shared, and
+# saying "under your minimum view count: 198000" about a Google Trends run
+# points the owner at a filter that had nothing to do with it. That is not a
+# cosmetic problem: the breakdown's whole job is to name the thing to change.
+STAGE_OVERRIDES: dict[str, dict[str, tuple[str, str | None]]] = {
+    "google_trends": {
+        "too_few_plays": ("Below your minimum search interest", "min_interest"),
+        "no_baseline": ("Too little search volume for Google to report", None),
+        "below_ratio": ("Not rising against its own recent history", "min_outlier_ratio"),
+        # Google Trends reports no interaction and no publication date, so
+        # these two can never fire here. Named rather than hidden, so a filter
+        # set for a video source does not look like it is silently applying.
+        "below_engagement": ("Engagement — not reported by Google Trends", None),
+        "too_old": ("Recency — not applicable to a search trend", None),
+    }
+}
+
 _SETTING_OF = {key: setting for key, _, setting, _level in STAGES}
 
 
@@ -107,6 +128,7 @@ def payload(
     drafted: int,
     inserted: int,
     hashtags_configured: int,
+    source: str = "tiktok",
 ) -> dict[str, Any]:
     """The `trend_runs.rejections` document.
 
@@ -115,17 +137,20 @@ def payload(
     the zeroes are how the owner sees that a filter they were about to loosen
     was not the problem.
     """
-    stages = [
-        {
-            "key": key,
-            "label": label,
-            "level": level,
-            "dropped": report.dropped.get(key, 0),
-            "setting": setting,
-            "value": _setting_value(controls, setting),
-        }
-        for key, label, setting, level in STAGES
-    ]
+    overrides = STAGE_OVERRIDES.get(source, {})
+    stages = []
+    for key, label, setting, level in STAGES:
+        shown_label, shown_setting = overrides.get(key, (label, setting))
+        stages.append(
+            {
+                "key": key,
+                "label": shown_label,
+                "level": level,
+                "dropped": report.dropped.get(key, 0),
+                "setting": shown_setting,
+                "value": _setting_value(controls, shown_setting),
+            }
+        )
 
     return {
         "seen": report.seen,
@@ -141,6 +166,7 @@ def payload(
         # tags were looked at, and whether the list is being rotated at all.
         "hashtags_scouted": list(report.hashtags_scouted),
         "hashtags_configured": hashtags_configured,
+        "source": source,
     }
 
 

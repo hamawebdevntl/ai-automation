@@ -219,6 +219,7 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
         drafted=len(drafted),
         inserted=len(inserted),
         hashtags_configured=len(terms),
+        source=controls.trend_source,
     )
     log.info("trend run funnel: %s", report_mod.summarise(rejections))
 

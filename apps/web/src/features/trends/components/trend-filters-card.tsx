@@ -18,7 +18,9 @@ import {
 import { useTrendDraft } from '@/features/trends/use-trend-draft';
 
 const FIELDS = [
+  'trend_source',
   'min_plays',
+  'min_interest',
   'min_engagement_rate',
   'min_outlier_ratio',
   'caption_blocklist',
@@ -39,6 +41,7 @@ export function TrendFiltersCard() {
   const { isOwner } = useOwner();
   const { draft, set, dirty, isPending, error, isSaving, blockedReason, onSave } = useTrendDraft(FIELDS);
   const [word, setWord] = useState('');
+  const usingTrends = draft?.trend_source === 'google_trends';
 
   function addWord() {
     if (!draft) return;
@@ -66,8 +69,8 @@ export function TrendFiltersCard() {
       <CardHeader>
         <CardTitle className="text-base">Filters</CardTitle>
         <CardDescription>
-          What a video has to clear to reach your queue, in the order the scout checks it. The first three cost nothing
-          to check; the fourth costs a lookup per author, so tightening the cheap ones shortens a run.
+          What a signal has to clear to reach your queue, in the order the scout checks it. Only the filters the chosen
+          source can actually measure are shown — the rest would look like they were applying when they were not.
         </CardDescription>
       </CardHeader>
 
@@ -77,24 +80,42 @@ export function TrendFiltersCard() {
 
         {draft && (
           <>
-            <NumberSetting
-              field="min_plays"
-              label="Minimum views"
-              value={draft.min_plays}
-              disabled={!isOwner || isSaving}
-              onChange={(v) => set({ min_plays: v })}
-              help="Reject anything below this outright. Zero means no floor, which is how it has always run."
-            />
+            {/* Two floors on incompatible scales, so only the one that
+                applies is shown. A view count is unbounded; Google Trends
+                interest is 0-100 against a term's own peak, and offering both
+                at once is how a sensible video floor of 198,000 came to reject
+                every search term that will ever exist. */}
+            {usingTrends ? (
+              <NumberSetting
+                field="min_interest"
+                label="Minimum search interest"
+                value={draft.min_interest}
+                disabled={!isOwner || isSaving}
+                onChange={(v) => set({ min_interest: v })}
+                help="How close a term must currently be to its own three-month peak. Zero means no floor — the rise is what this source measures, and the outlier ratio below already checks that."
+              />
+            ) : (
+              <NumberSetting
+                field="min_plays"
+                label="Minimum views"
+                value={draft.min_plays}
+                disabled={!isOwner || isSaving}
+                onChange={(v) => set({ min_plays: v })}
+                help="Reject anything below this outright. Zero means no floor, which is how it has always run."
+              />
+            )}
 
-            <NumberSetting
-              field="min_engagement_rate"
-              label="Minimum engagement rate"
-              suffix="%"
-              value={toPercent(draft.min_engagement_rate)}
-              disabled={!isOwner || isSaving}
-              onChange={(v) => set({ min_engagement_rate: fromPercent(v) })}
-              help="Likes, comments and shares as a share of views. A high view count with almost no interaction usually means paid promotion or an inflated count, and is not something to imitate."
-            />
+            {!usingTrends && (
+              <NumberSetting
+                field="min_engagement_rate"
+                label="Minimum engagement rate"
+                suffix="%"
+                value={toPercent(draft.min_engagement_rate)}
+                disabled={!isOwner || isSaving}
+                onChange={(v) => set({ min_engagement_rate: fromPercent(v) })}
+                help="Likes, comments and shares as a share of views. A high view count with almost no interaction usually means paid promotion or an inflated count, and is not something to imitate."
+              />
+            )}
 
             <NumberSetting
               field="min_outlier_ratio"
@@ -102,7 +123,11 @@ export function TrendFiltersCard() {
               value={draft.min_outlier_ratio}
               disabled={!isOwner || isSaving}
               onChange={(v) => set({ min_outlier_ratio: v })}
-              help="How far a video must beat its own author's median — not an absolute view count, so a big account posting a normal video does not read as a trend. 1.5× was the fixed bar until now; raising it is the strongest quality lever here."
+              help={
+                usingTrends
+                  ? 'How far a term must be rising against its own recent history. The strongest quality lever this source has — it is measured per term, so a big topic that is merely steady does not read as a trend.'
+                  : "How far a video must beat its own author's median — not an absolute view count, so a big account posting a normal video does not read as a trend. 1.5× was the fixed bar until now; raising it is the strongest quality lever here."
+              }
             />
 
             <div className="space-y-2">
@@ -155,14 +180,16 @@ export function TrendFiltersCard() {
               </p>
             </div>
 
-            <NumberSetting
-              field="videos_per_hashtag"
-              label="Videos to look at per hashtag"
-              value={draft.videos_per_hashtag}
-              disabled={!isOwner || isSaving}
-              onChange={(v) => set({ videos_per_hashtag: v })}
-              help="How deep into each feed to go. This is the main thing deciding how long a run takes, alongside the number of hashtags."
-            />
+            {!usingTrends && (
+              <NumberSetting
+                field="videos_per_hashtag"
+                label="Videos to look at per hashtag"
+                value={draft.videos_per_hashtag}
+                disabled={!isOwner || isSaving}
+                onChange={(v) => set({ videos_per_hashtag: v })}
+                help="How deep into each feed to go. This is the main thing deciding how long a run takes, alongside the number of hashtags."
+              />
+            )}
 
             <NumberSetting
               field="ideas_per_run"

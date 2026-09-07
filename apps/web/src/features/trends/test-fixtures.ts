@@ -26,6 +26,7 @@ export function trendSettings(over: Partial<TrendSettingsRow> = {}): TrendSettin
 
     max_video_age_days: 30,
     min_plays: 0,
+    min_interest: 0,
     min_engagement_rate: 0,
     min_outlier_ratio: 1.5,
     caption_blocklist: [],

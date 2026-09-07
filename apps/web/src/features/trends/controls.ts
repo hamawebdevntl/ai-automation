@@ -29,6 +29,10 @@ export const TREND_BOUNDS = {
   schedule_minute_utc: { min: 0, max: 59, step: 5 },
   max_video_age_days: { min: 1, max: 365, step: 1, unit: 'days' },
   min_plays: { min: 0, max: 100_000_000, step: 1000, unit: 'views' },
+  // A different scale entirely, which is the whole reason it is a different
+  // column. Google Trends reports 0-100 against a term's own peak, so a
+  // sensible view-count floor here rejects every term that can exist.
+  min_interest: { min: 0, max: 100, step: 1, unit: '/ 100' },
   // Stored as a fraction; the form shows and takes a percentage. Half is
   // already far past any real reel, so a value above it is a typo for a
   // fraction -- and the cost of accepting one is a run that rejects
@@ -114,6 +118,7 @@ const FIELD_LABELS: Record<BoundedField, string> = {
   schedule_minute_utc: 'The minute',
   max_video_age_days: 'The recency limit',
   min_plays: 'The minimum view count',
+  min_interest: 'The minimum search interest',
   min_engagement_rate: 'The engagement rate',
   min_outlier_ratio: 'The outlier ratio',
   videos_per_hashtag: 'Videos per hashtag',
@@ -391,6 +396,7 @@ export function settingLabel(setting: string): string {
 const SETTING_LABELS: Record<string, string> = {
   max_video_age_days: 'your recency limit',
   min_plays: 'your minimum view count',
+  min_interest: 'your minimum search interest',
   caption_blocklist: 'your blocked caption words',
   min_outlier_ratio: 'your minimum outlier ratio',
   min_engagement_rate: 'your minimum engagement rate',
@@ -413,6 +419,8 @@ export function formatStageValue(stage: TrendRejectionStage): string | null {
       return `${stage.value} days`;
     case 'min_plays':
       return `${stage.value.toLocaleString()} views`;
+    case 'min_interest':
+      return `${stage.value} / 100`;
     default:
       return String(stage.value);
   }

@@ -124,7 +124,10 @@ export type TrendSettingsRow = {
   // --- Filters, in the order the scout applies them. ---
   /** Reject a video older than this before it is scored. */
   max_video_age_days: number;
+  /** Video sources only. Absolute view count — unbounded, not comparable to min_interest. */
   min_plays: number;
+  /** Google Trends only. Interest as a percentage of the term's own 3-month peak, 0-100. */
+  min_interest: number;
   /** Interactions per view, as a fraction: 0.04 is 4%. */
   min_engagement_rate: number;
   /** How far above its own author's median a video must perform. */
