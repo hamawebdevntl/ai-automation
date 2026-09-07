@@ -1,11 +1,18 @@
 # Approval app
 
-The web app for the two human gates in the reels pipeline: **Gate 1**, where an
-owner approves an idea and picks how it gets made, and **Gate 2**, where an
-owner signs off the finished cut before anything publishes.
+The web app for the three human gates in the reels pipeline: **Gate 1**, where
+an owner approves an idea and picks how it gets made; the **script gate**, where
+an owner reads, edits and approves the narration before anything is rendered;
+and **Gate 2**, where an owner signs off the finished cut before anything
+publishes.
 
-Everything between those two decisions runs unattended. This app is deliberately
+Everything between those decisions runs unattended. This app is deliberately
 small — it is the only place a person is required.
+
+The script gate is the one that sits before any money is spent. Approving an
+idea is not the same as approving what it says, and until that gate existed the
+words were written inside the render — so the first sight of them was at Gate 2,
+with the video already paid for.
 
 ---
 
@@ -54,9 +61,15 @@ That has three consequences worth internalising before changing anything here:
    `42501` for anyone whose profile role is not `owner`, which is the real
    enforcement behind the read-only state the UI shows a viewer.
 3. **The pipeline writes, this app mostly reads.** Trend research, production,
-   the quality check and publishing all run on AWS and write to these tables
-   with a service-role key, which bypasses RLS. Step Functions task tokens never
-   reach the browser.
+   the quality check and publishing all run in the pipeline worker and write to
+   these tables with a service-role key, which bypasses RLS.
+
+   Gate 2 used to hold a Step Functions task token, which is why `private` is
+   not in the exposed schema list. That token is gone -- a decision is now just
+   a status change that the worker's claim query is watching for -- and the
+   `productions.run_state` the driver keeps in its place is deliberately
+   readable here: it holds no credential, and `select('*')` would fail outright
+   on a revoked column rather than returning a filtered row.
 
 Three things from the previous Next.js app did not come across, because a
 client-only bundle cannot hold them safely: Upstash rate limiting, the Resend
@@ -92,13 +105,15 @@ bunx supabase migration new <name>      # start a new migration
 |---|---|
 | `migrations/…_approval_queue.sql` | Tables, RLS policies, and the three gate functions |
 | `migrations/…_style_presets.sql` | The three production lanes with their cost and ETA |
+| `migrations/…_script_gate.sql` | The script gate: `awaiting_script`, the approval columns, and `save_script` / `approve_script` / `request_script_redraft`. Also the constraint that makes it real — a production cannot hold a `task_id` without an approved script, so no render can be paid for against words nobody read |
+| `migrations/…_script_gate_whitespace.sql` | `btrim(text)` strips spaces and nothing else, so a newline passed the empty check. Both places now name the whitespace explicitly |
 | `migrations/…_fix_role_guard_bootstrap.sql` | Lets a service-role caller set roles — without it no first owner could exist |
 | `seed.sql` | Demo rows. Opt-in: only `--include-seed` applies them |
 
 ### Accounts
 
-New accounts land as **viewers** — they can read the queue but pass neither
-gate. Promote deliberately, with the secret key (a signed-in viewer cannot
+New accounts land as **viewers** — they can read the queue and the scripts but
+pass no gate. Promote deliberately, with the secret key (a signed-in viewer cannot
 promote themselves; the `guard_profile_role` trigger refuses):
 
 ```sql
@@ -146,7 +161,9 @@ name and a runtime error.
 src/
   routes/            file-based routes; the tree in routeTree.gen.ts is generated
     _app.tsx           authenticated layout + route guard
-    _app/queue.*       Gate 1 — idea queue and the decision screen
+    _app/queue.*       Gate 1 — idea queue and the decision screen, and the
+                       script gate, which lives on the same idea page so a
+                       decision and the thing it set in motion stay together
     _app/review.*      Gate 2 — finished cuts and sign-off
   features/
     auth/              session context, profile/role, auth form pieces

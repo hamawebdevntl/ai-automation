@@ -13,13 +13,15 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
 import { useOwner } from '@/features/auth/use-owner';
-import { productionQueryOptions, useDecideProduction } from '@/features/queue/api';
+import { productionEventsQueryOptions, productionQueryOptions, useDecideProduction } from '@/features/queue/api';
 import { PlatformCopyPanel } from '@/features/queue/components/platform-copy-panel';
+import { ProductionTimeline } from '@/features/queue/components/production-timeline';
 import { QcReportCard } from '@/features/queue/components/qc-report-card';
 import { QueryError } from '@/features/queue/components/query-state';
+import { useProductionStream } from '@/features/queue/use-production-stream';
 import { formatDuration, formatRelative, formatUsd, parseQcReport } from '@/lib/format';
 
-export const Route = createFileRoute('/_app/review/$productionId')({
+export const Route = createFileRoute('/_app/review_/$productionId')({
   loader: ({ context, params }) => context.queryClient.ensureQueryData(productionQueryOptions(params.productionId)),
   component: ProductionReviewPage,
 });
@@ -29,7 +31,12 @@ function ProductionReviewPage() {
   const navigate = useNavigate();
   const { isOwner, isLoading: isRoleLoading } = useOwner();
   const { data, error } = useQuery(productionQueryOptions(productionId));
+  const eventsQuery = useQuery(productionEventsQueryOptions(productionId));
   const decide = useDecideProduction();
+
+  // A cut at Gate 2 can still move under the reviewer -- an owner elsewhere can
+  // rewind it, or the copy step can be redone -- so this page listens too.
+  useProductionStream(productionId);
 
   const [note, setNote] = useState('');
 
@@ -150,6 +157,30 @@ function ProductionReviewPage() {
 
         <div className="space-y-6">
           <QcReportCard report={qc} />
+
+          {/* How this cut came to exist. A reviewer deciding whether to publish
+              it benefits from knowing it was retried twice, or that two
+              platforms have no copy -- neither of which the cut itself shows. */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">How it was made</CardTitle>
+              <CardDescription>Every step from approval to this screen.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ProductionTimeline
+                production={production}
+                events={eventsQuery.data ?? []}
+                isLoadingEvents={eventsQuery.isPending}
+              />
+            </CardContent>
+            <CardContent className="pt-0">
+              <Button asChild variant="outline" size="sm">
+                <Link to="/productions/$productionId" params={{ productionId: production.id }}>
+                  Full record and controls
+                </Link>
+              </Button>
+            </CardContent>
+          </Card>
 
           {production.script && (
             <Card>

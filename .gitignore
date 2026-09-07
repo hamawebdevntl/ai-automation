@@ -32,6 +32,14 @@ build/
 .eslintcache
 
 # ---------------------------------------------------------------------------
+# Cached artifacts from the live HeyGen check (tests/test_heygen_live.py).
+# Real renders cost money, so the mp4 and its metadata are kept between runs
+# to stop a rerun paying for a second one. Never committed: they are account
+# output, and the presigned URLs inside go stale.
+# ---------------------------------------------------------------------------
+apps/pipeline/.heygen-live/
+
+# ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------
 __pycache__/
@@ -63,9 +71,6 @@ supabase/.temp/
 # ---------------------------------------------------------------------------
 # Infrastructure state. Never commit state files: they contain resolved secrets.
 # ---------------------------------------------------------------------------
-*.tfstate
-*.tfstate.*
-.terraform/
 cdk.out/
 
 # ---------------------------------------------------------------------------

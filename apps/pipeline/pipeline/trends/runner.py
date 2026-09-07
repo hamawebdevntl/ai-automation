@@ -1,8 +1,10 @@
 """The trend-research run.
 
-Scouts, scores, drafts ideas, and writes them to the Gate 1 queue. Runs as a
-Fargate task rather than a Lambda because TikTok-Api drives a real Playwright
-browser per session, which is far too heavy for the activities image.
+Scouts, scores, drafts ideas, and writes them to the Gate 1 queue.
+
+Which source it scouts is a setting, and this module deliberately names none of
+them: `sources.REGISTRY` says which vocabulary a source reads, which credential
+it needs and how to call it, so adding a source does not mean editing the run.
 
 Every decision this makes is read from `trend_settings` rather than compiled
 in. The precedence is the same one the brief and the hashtags have always had:
@@ -21,7 +23,7 @@ from pipeline.config import Settings, settings
 from pipeline.trends import controls as controls_mod
 from pipeline.trends import ideas as ideas_mod
 from pipeline.trends import report as report_mod
-from pipeline.trends import tiktok
+from pipeline.trends import sources as sources_mod
 from pipeline.trends.controls import ScoutControls
 
 log = logging.getLogger(__name__)
@@ -73,8 +75,20 @@ def _inputs(supa: Supa, cfg: Settings) -> tuple[str, list[str], ScoutControls]:
         log.warning("could not read trend_settings, falling back to env: %s", exc)
 
     brief = (row.get("niche_brief") or "").strip() or cfg.niche_brief
+    controls = controls_mod.from_row(row)
+
+    # Each source has its own vocabulary, and they are not interchangeable.
+    # `#exceltips` is how a video is filed; "bookkeeping software" is what
+    # somebody types when they have had enough of doing it by hand. Handing
+    # either list to the other source produces a run that looks like it worked
+    # and finds nothing. Which list a source reads is declared in
+    # `sources.REGISTRY` rather than decided here.
+    if sources_mod.spec(controls.trend_source).vocabulary == sources_mod.KEYWORDS:
+        terms = [k.strip() for k in (row.get("trend_keywords") or []) if k and k.strip()]
+        return brief, (terms or cfg.keyword_list), controls
+
     tags = [t.strip().lstrip("#") for t in (row.get("hashtags") or []) if t and t.strip()]
-    return brief, (tags or cfg.hashtag_list), controls_mod.from_row(row)
+    return brief, (tags or cfg.hashtag_list), controls
 
 
 def run(supa: Supa | None = None, run_id: str = "") -> dict:
@@ -88,7 +102,8 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     supa = supa or Supa()
     cfg = settings()
 
-    niche_brief, hashtags, controls = _inputs(supa, cfg)
+    niche_brief, terms, controls = _inputs(supa, cfg)
+    source = sources_mod.spec(controls.trend_source)
 
     # A run started from the button may carry its own length. Merged here
     # rather than inside `_inputs` because it belongs to this run, not to the
@@ -107,44 +122,45 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
             "refusing to fill the approval queue with generic ideas."
         )
 
-    if not hashtags:
-        raise RuntimeError(
-            "No hashtags are set; there is nothing to scout. Add some under "
-            "Settings in the app, or set TREND_HASHTAGS."
-        )
+    if not terms:
+        raise RuntimeError(source.nothing_to_scout)
 
     # Rotation. Scouting a slice of the list keeps a run short without changing
     # what qualifies as a signal, and the cursor is advanced before scouting
     # rather than after so that a run which dies mid-session does not make the
     # next one repeat the same tags.
-    selected, next_cursor = controls_mod.rotate(hashtags, controls.hashtag_cursor, controls.hashtags_per_run)
-    if len(selected) < len(hashtags):
+    selected, next_cursor = controls_mod.rotate(terms, controls.hashtag_cursor, controls.hashtags_per_run)
+    if len(selected) < len(terms):
         log.info(
-            "rotating: scouting %d of %d hashtags this run (%s)",
+            "rotating: scouting %d of %d terms this run (%s)",
             len(selected),
-            len(hashtags),
+            len(terms),
             ", ".join(selected),
         )
         supa.save_hashtag_cursor(next_cursor)
 
-    # Resolved here, before the scout, and not where the drafting happens: the
-    # scout below drives a real browser for minutes, and a missing key for the
-    # selected provider would throw all of that away at the last step.
+    # Both credential checks happen here, before the scout, and not where the
+    # credential is used: scouting takes minutes and, on Apify, bills per
+    # result. A missing key would otherwise throw all of that away at the last
+    # step -- or on Apify, spend money and then throw it away.
+    #
+    # The source goes first because it is the thing about to run.
+    source.preflight(cfg, controls)
+
     provider = ideas_mod.resolve_provider(
         controls.idea_provider or cfg.idea_provider, gemini_api_key=cfg.gemini_api_key
     )
-    log.info("drafting ideas with %s", provider)
+    log.info("scouting %s, drafting ideas with %s", source.name, provider)
 
-    outcome = tiktok.scout(
-        tiktok.ScoutConfig(
-            hashtags=selected,
-            ms_token=cfg.tiktok_ms_token,
-            controls=controls,
-            # Only when there is a row to be stopped. A container started by
-            # hand has nothing watching it and nothing to ask.
-            should_stop=(lambda: supa.trend_run_is_cancelled(run_id)) if run_id else None,
-        )
-    )
+    # Only when there is a row to be stopped. A container started by hand has
+    # nothing watching it and nothing to ask.
+    should_stop = (lambda: supa.trend_run_is_cancelled(run_id)) if run_id else None
+
+    # Every source returns the same `ScoutOutcome`, which is what lets
+    # everything below this line -- spreading, drafting, duplicate suppression,
+    # the rejection report -- stay ignorant of where signals came from. It is
+    # also why this is one call rather than a branch per source.
+    outcome = source.scout(selected, controls, cfg, should_stop)
     signals, report = outcome.signals, outcome.report
     log.info(
         "scouted %d signals worth surfacing from %d videos across %d hashtags",
@@ -189,7 +205,8 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
         surfaced=len(signals),
         drafted=len(drafted),
         inserted=len(inserted),
-        hashtags_configured=len(hashtags),
+        hashtags_configured=len(terms),
+        source=controls.trend_source,
     )
     log.info("trend run funnel: %s", report_mod.summarise(rejections))
 

@@ -44,6 +44,12 @@ MPT_SOCIAL_PLATFORM: dict[str, str] = {
 class ProductionStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
+    # Stopped at the script gate. The same kind of state as AWAITING_REVIEW --
+    # deliberately halted, waiting for a person -- and deliberately not PARKED,
+    # which means the machine stopped because something is wrong. Nothing is
+    # wrong: the pipeline is doing exactly what it should, which is refusing to
+    # spend money on words nobody has read.
+    AWAITING_SCRIPT = "awaiting_script"
     QC_FAILED = "qc_failed"
     AWAITING_REVIEW = "awaiting_review"
     APPROVED = "approved"
@@ -52,6 +58,26 @@ class ProductionStatus(str, Enum):
     PUBLISHED = "published"
     FAILED = "failed"
     PARKED = "parked"
+    # Set only by `cancel_production`. Distinct from PARKED, which means the
+    # machine stopped and wants a person, and from REJECTED, which means a
+    # person said no to a finished cut: this one means a person stopped the
+    # production before it got that far.
+    CANCELLED = "cancelled"
+
+
+# Statuses a production can hold while it is still the pipeline's problem.
+#
+# Lives here rather than in `reconcile.py` because both the sweepers and the
+# data layer need it, and `reconcile` imports `supa` -- putting it there and
+# importing it back would be a cycle.
+LIVE_STATUSES: tuple[str, ...] = (
+    ProductionStatus.QUEUED.value,
+    ProductionStatus.RUNNING.value,
+    ProductionStatus.AWAITING_SCRIPT.value,
+    ProductionStatus.AWAITING_REVIEW.value,
+    ProductionStatus.QC_FAILED.value,
+    ProductionStatus.PUBLISHING.value,
+)
 
 
 class VelocityLabel(str, Enum):
@@ -193,6 +219,87 @@ class TaskStatus(BaseModel):
         return self.state == TaskState.PROCESSING
 
 
+# ---------------------------------------------------------------------------
+# HeyGen wire types -- the presenter lane
+# ---------------------------------------------------------------------------
+
+
+class HeyGenStatus(str, Enum):
+    """`status` on `GET /v3/videos/{id}`.
+
+    `WAITING` is what `POST /v3/videos` actually returns on acceptance, and it
+    is absent from every documented list of these values. It is here because a
+    real submit produced it; `is_running` would have covered it regardless,
+    which is the reason that property is written as "not terminal" rather than
+    as a membership test.
+    """
+
+    WAITING = "waiting"
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class HeyGenVideo(BaseModel):
+    """`data` of `POST /v3/videos` and `GET /v3/videos/{id}`.
+
+    `extra="allow"` because the detail response carries a good deal we do not
+    drive -- gif_url, folder_id, video_page_url, timestamps -- and a new field
+    should not break a poll.
+    """
+
+    model_config = {"extra": "allow"}
+
+    id: str
+    status: str
+    video_url: str | None = None
+    captioned_video_url: str | None = None
+    subtitle_url: str | None = None
+    thumbnail_url: str | None = None
+    duration: float | None = None
+    failure_code: str | None = None
+    failure_message: str | None = None
+
+    @property
+    def is_complete(self) -> bool:
+        return self.status == HeyGenStatus.COMPLETED
+
+    @property
+    def is_failed(self) -> bool:
+        return self.status == HeyGenStatus.FAILED
+
+    @property
+    def is_running(self) -> bool:
+        # Deliberately not `not is_complete and not is_failed` on a closed set:
+        # an unrecognised status is likelier to be a new one than a broken one,
+        # so anything non-terminal reads as still running.
+        return not self.is_complete and not self.is_failed
+
+    def output_url(self, prefer_captioned: bool = True) -> str | None:
+        """The file we actually want.
+
+        This is the trap in HeyGen's response. Asking for burned-in captions
+        does not change `video_url` -- that stays the clean cut -- and puts the
+        captioned render on `captioned_video_url` instead. Taking `video_url`
+        would publish a reel with no captions and, worse, make our own quality
+        check report them missing on a render that has them.
+
+        Falls back to the clean cut, because a video with no captions is still
+        a video a reviewer can judge, and the quality report will say what is
+        missing.
+        """
+        if prefer_captioned and self.captioned_video_url:
+            return self.captioned_video_url
+        return self.video_url or self.captioned_video_url
+
+    @property
+    def failure(self) -> str:
+        """One readable line for the parked row."""
+        code = self.failure_code or "unknown"
+        return f"{code}: {self.failure_message or 'no detail returned'}"
+
+
 class SocialMetadata(BaseModel):
     """`data` of `POST /api/v1/social-metadata`."""
 
@@ -242,19 +349,3 @@ class PostizCreatedPost(BaseModel):
 
 # Postiz's own post states, from its Prisma schema.
 PostizState = Literal["QUEUE", "PUBLISHED", "ERROR", "DRAFT"]
-
-
-class ProductionContext(BaseModel):
-    """What a state machine activity is handed.
-
-    Deliberately tiny. Step Functions caps execution input/output and the
-    SendTaskSuccess payload at 256 KB, and a script plus four platforms of copy
-    plus a QC report would approach that. Activities receive an id and read the
-    rest from Postgres.
-    """
-
-    production_id: str
-    idea_id: str | None = None
-    style_preset_id: str | None = None
-    attempt: int = 0
-    extra: dict[str, Any] = Field(default_factory=dict)

@@ -8,18 +8,26 @@ dependencies = [
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.3,<3",
   "supabase>=2.6,<3",
-  "boto3>=1.34,<2",
   "tenacity>=8.3,<9",
   "anthropic>=1.0,<2",
+  # Pinned to the same major as the MoneyPrinterTurbo submodule uses, so one
+  # SDK version serves the whole repo. 3.x moves to a different call surface.
+  "google-genai>=2.11,<3",
+  # Google Trends is the default trend source, so the scout is part of the base
+  # install rather than an extra. It was in `[trends]` when the scout shipped as
+  # its own container image; there is one image now.
+  "pytrends>=4.9,<5",
 ]
 
 [project.optional-dependencies]
-# Playwright and TikTok-Api only ship in the trends image; they are far too
-# heavy for the Lambda image that runs the state machine activities.
-trends = [
+# The retired TikTok-Api scout. It signs every request inside a live Playwright
+# page, which is why it needed a browser image of its own -- and why it was
+# refused on every feed from every kind of address and is no longer selectable.
+# Nothing installs this; it is here so `trends/tiktok.py` still declares what it
+# would need if the source were ever revived.
+tiktok = [
   "TikTokApi==7.3.3",
   "playwright>=1.36,<2",
-  "pytrends>=4.9,<5",
 ]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21", "ruff>=0.5"]
 
@@ -28,3 +36,16 @@ line-length = 100
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# `live` marks a test that spends real money against a real account. CI runs a
+# bare `pytest -q`, so the marker is for selecting these deliberately
+# (`-m live`) and for excluding them from a local sweep (`-m "not live"`) --
+# the thing that actually keeps them out of an ordinary run is the environment
+# gate inside the module, not this.
+markers = [
+  "live: hits a real third-party account and costs money; opt in per that module's env gate",
+]
+# `tests/conftest.py` is imported as `tests.conftest` by test_gates.py, which
+# needs the project root importable. A legacy `pip install -e .` put it on
+# sys.path via easy-install.pth and this was free; PEP 660 editable installs
+# expose only the declared `pipeline` package, so it has to be asked for.
+pythonpath = ["."]

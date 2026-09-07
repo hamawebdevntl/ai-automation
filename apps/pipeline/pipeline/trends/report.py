@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from pipeline.trends.controls import ScoutControls
+from pipeline.trends.controls import DEFAULT_TREND_SOURCE, ScoutControls
 
 # The stages, in application order. The order is the diagnostic: the first
 # stage with a large count is the one to loosen, and a stage can only reject
@@ -47,6 +47,18 @@ from pipeline.trends.controls import ScoutControls
 # CloudWatch log line and a database row are both readable on their own, and so
 # that a web build older than a new stage can still render it.
 STAGES: tuple[tuple[str, str, str | None, str], ...] = (
+    # First, and not a setting. An item the platform published no numbers for
+    # cannot be judged by any bar below, so this is the one stage that is
+    # checked before everything -- including recency, which it would otherwise
+    # be reported as when a post is both old and unmeasurable.
+    #
+    # Instagram routinely reports no play count and never had one for images,
+    # and it publishes a hidden like count as -1. The alternative to counting
+    # that here is inventing a number, which would let a view floor of zero
+    # pass everything and any floor above it reject everything, for reasons the
+    # breakdown could not explain. A large count here means the platform is
+    # withholding metrics, not that a bar is too high, so it names no setting.
+    ("no_metrics", "The platform published no numbers to score it by", None, "video"),
     ("too_old", "Older than your recency limit", "max_video_age_days", "video"),
     ("too_few_plays", "Under your minimum view count", "min_plays", "video"),
     ("blocked_caption", "Caption contained a blocked word", "caption_blocklist", "video"),
@@ -64,6 +76,45 @@ STAGES: tuple[tuple[str, str, str | None, str], ...] = (
 )
 
 VIDEO_STAGES = tuple(key for key, _, _, level in STAGES if level == "video")
+
+# Where a stage means something different depending on the source.
+#
+# The stage keys are shared because the funnel is the same shape whatever is
+# being scouted -- something is seen, something is dropped, something survives.
+# What a stage is *called*, and which setting caused it, is not shared, and
+# saying "under your minimum view count: 198000" about a Google Trends run
+# points the owner at a filter that had nothing to do with it. That is not a
+# cosmetic problem: the breakdown's whole job is to name the thing to change.
+STAGE_OVERRIDES: dict[str, dict[str, tuple[str, str | None]]] = {
+    "google_trends": {
+        "too_few_plays": ("Below your minimum search interest", "min_interest"),
+        "no_baseline": ("Too little search volume for Google to report", None),
+        "below_ratio": ("Not rising against its own recent history", "min_outlier_ratio"),
+        # Google Trends reports no interaction and no publication date, so
+        # these two can never fire here. Named rather than hidden, so a filter
+        # set for a video source does not look like it is silently applying.
+        "below_engagement": ("Engagement — not reported by Google Trends", None),
+        "too_old": ("Recency — not applicable to a search trend", None),
+        # Interest is always reported, so there is nothing to withhold.
+        "no_metrics": ("Numbers to score by — not applicable to a search trend", None),
+    },
+    "apify": {
+        # The baseline is the author's own recent median on whichever platform
+        # the post came from, so the generic label is already right. What is
+        # worth saying differently is why it fails: a scraper that was refused,
+        # or a private account, reads as an unreadable history.
+        "no_baseline": ("Author's recent posts could not be scraped", None),
+    },
+    "youtube": {
+        # YouTube has channels, not authors, and the distinction matters when
+        # reading a breakdown: the median is over the channel's recent uploads.
+        "no_baseline": ("Channel's recent uploads could not be read", None),
+        "below_ratio": ("Did not outperform its channel's median enough", "min_outlier_ratio"),
+        # Statistics can be hidden per video by the uploader, and a channel can
+        # hide its subscriber and view counts wholesale.
+        "no_metrics": ("The uploader hid this video's statistics", None),
+    },
+}
 
 _SETTING_OF = {key: setting for key, _, setting, _level in STAGES}
 
@@ -87,6 +138,15 @@ class ScoutReport:
     # limit being reached, the other is a person deciding.
     cancelled: bool = False
     hashtags_skipped: int = 0
+    # Set when a source ran out of *allowance* rather than out of time.
+    #
+    # Distinct from `budget_exhausted` because the remedy is the opposite.
+    # YouTube's search quota is about a hundred calls a day and does not reset
+    # until midnight US/Pacific; sharing one flag would make "your run was too
+    # short" the advice for "you cannot search again until tomorrow", when
+    # lengthening the budget would change nothing and shortening the term list
+    # is the fix.
+    quota_exhausted: bool = False
 
     def drop(self, stage: str, count: int = 1) -> None:
         if stage not in _SETTING_OF:
@@ -107,6 +167,7 @@ def payload(
     drafted: int,
     inserted: int,
     hashtags_configured: int,
+    source: str = DEFAULT_TREND_SOURCE,
 ) -> dict[str, Any]:
     """The `trend_runs.rejections` document.
 
@@ -115,17 +176,20 @@ def payload(
     the zeroes are how the owner sees that a filter they were about to loosen
     was not the problem.
     """
-    stages = [
-        {
-            "key": key,
-            "label": label,
-            "level": level,
-            "dropped": report.dropped.get(key, 0),
-            "setting": setting,
-            "value": _setting_value(controls, setting),
-        }
-        for key, label, setting, level in STAGES
-    ]
+    overrides = STAGE_OVERRIDES.get(source, {})
+    stages = []
+    for key, label, setting, level in STAGES:
+        shown_label, shown_setting = overrides.get(key, (label, setting))
+        stages.append(
+            {
+                "key": key,
+                "label": shown_label,
+                "level": level,
+                "dropped": report.dropped.get(key, 0),
+                "setting": shown_setting,
+                "value": _setting_value(controls, shown_setting),
+            }
+        )
 
     return {
         "seen": report.seen,
@@ -135,12 +199,14 @@ def payload(
         "inserted": inserted,
         "failed_hashtags": report.failed_hashtags,
         "budget_exhausted": report.budget_exhausted,
+        "quota_exhausted": report.quota_exhausted,
         "cancelled": report.cancelled,
         "hashtags_skipped": report.hashtags_skipped,
         # Both are recorded because they answer different questions: how many
         # tags were looked at, and whether the list is being rotated at all.
         "hashtags_scouted": list(report.hashtags_scouted),
         "hashtags_configured": hashtags_configured,
+        "source": source,
     }
 
 

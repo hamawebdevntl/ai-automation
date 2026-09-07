@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router';
 import { Badge } from '@/components/ui/badge';
-import { diagnoseRun, formatStageValue, settingLabel } from '@/features/trends/controls';
+import { diagnoseRun, formatStageValue, settingLabel, usesHashtags } from '@/features/trends/controls';
 import type { TrendRejectionStage, TrendRunRow } from '@/lib/database.types';
 import { formatMinutes } from '@/lib/format';
 
@@ -23,6 +23,13 @@ export function RunBreakdown({ run }: { run: TrendRunRow }) {
   const videoStages = report.stages.filter((s) => s.level === 'video');
   const ideaStages = report.stages.filter((s) => s.level === 'idea');
   const diagnosis = diagnoseRun(run);
+  // `hashtags_scouted` holds hashtags on the scrapers and search terms
+  // everywhere else, so the `#` has to follow the source rather than the field
+  // name. Without this, a Google Trends run reported scouting
+  // "#bookkeeping software", which is not a thing anyone searched for.
+  const hashtagMode = usesHashtags(report.source);
+  const scoutedLabel = (term: string) => (hashtagMode ? `#${term}` : term);
+  const unit = hashtagMode ? 'hashtag' : 'search term';
 
   return (
     <div className="space-y-3 text-sm">
@@ -74,27 +81,52 @@ export function RunBreakdown({ run }: { run: TrendRunRow }) {
 
       <ul className="text-muted-foreground space-y-1 text-xs">
         <li>
-          Scouted {report.hashtags_scouted.length} hashtag
+          Scouted {report.hashtags_scouted.length} {unit}
           {report.hashtags_scouted.length === 1 ? '' : 's'}
           {report.hashtags_configured && report.hashtags_configured > report.hashtags_scouted.length ? (
             <> of {report.hashtags_configured}, rotating</>
           ) : null}
-          {report.hashtags_scouted.length > 0 && <>: {report.hashtags_scouted.map((t) => `#${t}`).join(', ')}</>}
+          {report.hashtags_scouted.length > 0 && <>: {report.hashtags_scouted.map(scoutedLabel).join(', ')}</>}
         </li>
 
         {report.budget_exhausted && (
           <li>
             The run hit its time budget and stopped early
-            {report.hashtags_skipped > 0 && <>, leaving {report.hashtags_skipped} hashtag(s) unscouted</>}. Ideas were
-            drafted from what it had found by then.
+            {report.hashtags_skipped > 0 && (
+              <>
+                , leaving {report.hashtags_skipped} {unit}(s) unscouted
+              </>
+            )}
+            . Ideas were drafted from what it had found by then.
+          </li>
+        )}
+
+        {/* Deliberately not folded into the message above. A longer budget
+            fixes one of these and cannot fix the other, so saying "it ran out
+            of time" about an exhausted quota would recommend the single change
+            that makes no difference. */}
+        {report.quota_exhausted && (
+          <li>
+            The source ran out of its daily search allowance
+            {report.hashtags_skipped > 0 && (
+              <>
+                , leaving {report.hashtags_skipped} {unit}(s) unscouted
+              </>
+            )}
+            . Ideas were drafted from what it had found. This does not reset until midnight US/Pacific, and a longer
+            time budget will not help — scout fewer terms per run under{' '}
+            <Link to="/settings" className="underline underline-offset-4">
+              Settings
+            </Link>
+            .
           </li>
         )}
 
         {report.failed_hashtags.length > 0 && (
           <li className="text-destructive">
             {report.failed_hashtags.length} feed{report.failed_hashtags.length === 1 ? '' : 's'} raised an error:{' '}
-            {report.failed_hashtags.map((f) => `#${f.hashtag}`).join(', ')}. That is usually the session being blocked
-            rather than a bad hashtag — the delay between requests is under{' '}
+            {report.failed_hashtags.map((f) => scoutedLabel(f.hashtag)).join(', ')}. That is usually the session being
+            blocked rather than a bad {unit} — the delay between requests is under{' '}
             <Link to="/settings" className="underline underline-offset-4">
               Run length and pacing
             </Link>

@@ -14,12 +14,13 @@ import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
 import { useOwner } from '@/features/auth/use-owner';
 import { ideaQueryOptions, stylePresetsQueryOptions, useApproveIdea, useRejectIdea } from '@/features/queue/api';
+import { IdeaProductionPanel } from '@/features/queue/components/idea-production-panel';
 import { QueryError } from '@/features/queue/components/query-state';
 import { StylePicker } from '@/features/queue/components/style-picker';
 import { VelocityBadge } from '@/features/queue/components/velocity-badge';
 import { formatCostRange, formatMinutes, formatRelative, titleCase } from '@/lib/format';
 
-export const Route = createFileRoute('/_app/queue/$ideaId')({
+export const Route = createFileRoute('/_app/queue_/$ideaId')({
   loader: ({ context, params }) =>
     Promise.all([
       context.queryClient.ensureQueryData(ideaQueryOptions(params.ideaId)),
@@ -74,8 +75,13 @@ function IdeaDecisionPage() {
     if (!styleId) return;
     try {
       await approve.mutateAsync({ ideaId, styleId, note });
-      toast.success('Approved', { description: `Queued as ${selectedPreset?.name ?? 'the chosen style'}.` });
-      await navigate({ to: '/queue' });
+      toast.success('Approved', {
+        description: `Queued as ${selectedPreset?.name ?? 'the chosen style'}. Production starts in a few seconds.`,
+      });
+      // Deliberately no navigation. This page becomes the live view of the
+      // production the approval just opened; bouncing back to the list of
+      // *pending* ideas is what made the whole post-approval pipeline
+      // invisible in the first place.
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Could not approve this idea');
     }
@@ -110,7 +116,7 @@ function IdeaDecisionPage() {
           )}
           <span className="text-xs text-muted-foreground">proposed {formatRelative(idea.created_at)}</span>
         </div>
-        <h1 className="text-2xl font-semibold tracking-tight">{idea.title}</h1>
+        <h1 className="text-2xl font-semibold tracking-tight break-words">{idea.title}</h1>
         {idea.hook && <p className="text-lg text-muted-foreground">{idea.hook}</p>}
       </div>
 
@@ -123,6 +129,8 @@ function IdeaDecisionPage() {
           </AlertDescription>
         </Alert>
       )}
+
+      {idea.status === 'approved' && <IdeaProductionPanel ideaId={idea.id} />}
 
       <Card>
         <CardHeader>
@@ -201,12 +209,21 @@ function IdeaDecisionPage() {
               </p>
             )}
 
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={handleApprove} disabled={!isOwner || !styleId || isDeciding}>
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+              <Button
+                onClick={handleApprove}
+                disabled={!isOwner || !styleId || isDeciding}
+                className="w-full sm:w-auto"
+              >
                 {approve.isPending ? <Spinner className="size-4" /> : <CheckIcon className="size-4" />}
                 Approve and produce
               </Button>
-              <Button variant="outline" onClick={handleReject} disabled={!isOwner || isDeciding}>
+              <Button
+                variant="outline"
+                onClick={handleReject}
+                disabled={!isOwner || isDeciding}
+                className="w-full sm:w-auto"
+              >
                 {reject.isPending ? <Spinner className="size-4" /> : <XIcon className="size-4" />}
                 Reject
               </Button>

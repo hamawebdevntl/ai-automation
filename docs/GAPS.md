@@ -81,7 +81,15 @@ approved voice. Remotion compositions need these as inputs and nothing holds the
 
 ### B6. No idempotency / dedup
 Nothing prevents regenerating the same idea, or double-posting on a retry.
-At 300 reels/month with retries in a state machine, this will bite.
+At 300 reels/month with retries, this will bite.
+
+**Largely closed since.** `productions_one_live_per_idea` refuses a second live
+production per idea; `claim_render_slot` and `claim_publish_slot` are
+conditional updates that make the two irreversible steps single-shot even when
+two workers hold the same row; HeyGen submits carry an `Idempotency-Key`; and
+publish is never retried, by design, because Postiz starts its workflow with
+`TERMINATE_EXISTING`. What is left is the fal lane, which has no idempotency key
+of its own -- an ambiguous fal failure parks rather than resubmitting.
 
 ### B7. Reviewer throughput is unmodelled
 Two gates times 10 reels a day is 20 review actions daily, every day. If the
@@ -91,7 +99,8 @@ auto-expiry, or a delegated second reviewer — a product decision, not a techni
 ---
 
 ## C. Deferred, but name them now
-Observability and alerting; S3 lifecycle for renders; fleet-level cost ceiling
+Observability and alerting; a retention policy for the Supabase Storage
+renders bucket; fleet-level cost ceiling
 (OpenMontage's cost_tracker is per-project, not per-month); voice-cloning
 consent if a real person's voice is used; music licensing for organizational
 use; analytics-to-idea-scoring loop (already known custom).

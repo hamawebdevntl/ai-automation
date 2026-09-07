@@ -10,6 +10,7 @@ import { useAuth } from '@/features/auth/auth-context';
 import { useOwner } from '@/features/auth/use-owner';
 import { PageHeader } from '@/features/queue/components/page-header';
 import { TrendFiltersCard } from '@/features/trends/components/trend-filters-card';
+import { TrendInputsCard } from '@/features/trends/components/trend-inputs-card';
 import { TrendRunCostCard } from '@/features/trends/components/trend-run-cost-card';
 import { TrendScheduleCard } from '@/features/trends/components/trend-schedule-card';
 import { TrendSettingsCard } from '@/features/trends/components/trend-settings-card';
@@ -63,6 +64,7 @@ function SettingsPage() {
       )}
 
       <TrendSettingsCard />
+      <TrendInputsCard />
       <TrendScheduleCard />
       <TrendFiltersCard />
       <TrendRunCostCard />
@@ -82,8 +84,8 @@ function SettingsPage() {
             coming apart, and what refuses a viewer trying to approve.
           </p>
           <p>
-            The pipeline itself — trend research, production, quality check, publishing — runs on AWS and writes to the
-            same tables with a service-role key.
+            The pipeline itself — trend research, production, quality check, publishing — runs in the worker and writes
+            to the same tables with a service-role key.
           </p>
         </CardContent>
       </Card>

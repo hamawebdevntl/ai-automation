@@ -1,4 +1,10 @@
-import type { TrendRejectionStage, TrendRunRow, TrendSettingsRow } from '@/lib/database.types';
+import type {
+  ApifyPlatform,
+  TrendRejectionStage,
+  TrendRunRow,
+  TrendSettingsRow,
+  TrendSource,
+} from '@/lib/database.types';
 
 /**
  * The bounds, the estimates and the wording for the scout settings.
@@ -29,6 +35,10 @@ export const TREND_BOUNDS = {
   schedule_minute_utc: { min: 0, max: 59, step: 5 },
   max_video_age_days: { min: 1, max: 365, step: 1, unit: 'days' },
   min_plays: { min: 0, max: 100_000_000, step: 1000, unit: 'views' },
+  // A different scale entirely, which is the whole reason it is a different
+  // column. Google Trends reports 0-100 against a term's own peak, so a
+  // sensible view-count floor here rejects every term that can exist.
+  min_interest: { min: 0, max: 100, step: 1, unit: '/ 100' },
   // Stored as a fraction; the form shows and takes a percentage. Half is
   // already far past any real reel, so a value above it is a typo for a
   // fraction -- and the cost of accepting one is a run that rejects
@@ -67,7 +77,7 @@ export const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as c
  * Mirrors `CATCHUP_MINUTES` in `pipeline/trends/schedule.py`, which is the
  * side that acts on it. Duplicated rather than derived because there is no
  * server tier to ask — the same arrangement, and the same hazard, as
- * `REQUEST_UNCLAIMED_WRITE_OFF_MINUTES` in this feature's api module.
+ * `SCOUT_CADENCE_MINUTES` in this feature's api module.
  */
 export const SCHEDULE_CATCHUP_MINUTES = 60;
 
@@ -114,6 +124,7 @@ const FIELD_LABELS: Record<BoundedField, string> = {
   schedule_minute_utc: 'The minute',
   max_video_age_days: 'The recency limit',
   min_plays: 'The minimum view count',
+  min_interest: 'The minimum search interest',
   min_engagement_rate: 'The engagement rate',
   min_outlier_ratio: 'The outlier ratio',
   videos_per_hashtag: 'Videos per hashtag',
@@ -391,6 +402,7 @@ export function settingLabel(setting: string): string {
 const SETTING_LABELS: Record<string, string> = {
   max_video_age_days: 'your recency limit',
   min_plays: 'your minimum view count',
+  min_interest: 'your minimum search interest',
   caption_blocklist: 'your blocked caption words',
   min_outlier_ratio: 'your minimum outlier ratio',
   min_engagement_rate: 'your minimum engagement rate',
@@ -413,6 +425,8 @@ export function formatStageValue(stage: TrendRejectionStage): string | null {
       return `${stage.value} days`;
     case 'min_plays':
       return `${stage.value.toLocaleString()} views`;
+    case 'min_interest':
+      return `${stage.value} / 100`;
     default:
       return String(stage.value);
   }
@@ -528,4 +542,135 @@ export function estimateSearchLength(
  */
 export function budgetForEstimate(minutes: number): number {
   return clampToBounds('run_budget_minutes', Math.ceil(minutes));
+}
+
+// ---------------------------------------------------------------------------
+// Google Trends
+// ---------------------------------------------------------------------------
+
+/** Mirrors the `trend_settings_keywords` constraint. */
+export const MAX_TREND_KEYWORDS = 50;
+
+/**
+ * Clean a search term for storage.
+ *
+ * Lowercased and space-collapsed, and that is all. Unlike a hashtag, a search
+ * term is a phrase — stripping punctuation or joining words would change what
+ * is being measured, and "excel alternative" is two words on purpose.
+ */
+export function normaliseKeyword(raw: string): string {
+  return raw.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/**
+ * Regions offered for Google Trends.
+ *
+ * A short list rather than every ISO code: interest is normalised within a
+ * region, so the useful choice is the market you actually sell to, and a
+ * two-hundred-entry dropdown makes that choice harder rather than easier.
+ * Worldwide is first because it is the honest default — nothing in the
+ * pipeline knows where this business sells.
+ */
+export const GEO_OPTIONS: ReadonlyArray<{ code: string; label: string }> = [
+  { code: '', label: 'Worldwide' },
+  { code: 'GB', label: 'United Kingdom' },
+  { code: 'US', label: 'United States' },
+  { code: 'IE', label: 'Ireland' },
+  { code: 'CA', label: 'Canada' },
+  { code: 'AU', label: 'Australia' },
+  { code: 'DE', label: 'Germany' },
+  { code: 'FR', label: 'France' },
+  { code: 'NL', label: 'Netherlands' },
+  { code: 'AE', label: 'United Arab Emirates' },
+];
+
+// ---------------------------------------------------------------------------
+// Sources
+// ---------------------------------------------------------------------------
+
+/**
+ * What each source is offered as, in the order the dropdown shows them.
+ *
+ * The descriptions are the point rather than decoration: the three sources
+ * measure genuinely different things, and picking the wrong one produces a run
+ * that completes, reports success and finds nothing useful. Google Trends
+ * cannot tell you a hook; the other two cannot tell you search demand.
+ *
+ * Mirrors `pipeline.trends.controls.SOURCES` and the `trend_settings_source`
+ * constraint. A source in one and not the others is either a dropdown entry
+ * that cannot run or a scout nobody can select.
+ */
+export const SOURCE_OPTIONS: ReadonlyArray<{
+  value: TrendSource;
+  label: string;
+  help: string;
+  /**
+   * Whether choosing this source requires a credential the pipeline holds.
+   *
+   * This app cannot check — it is a static bundle talking to Postgres, with no
+   * server and no sight of the pipeline's environment. So the flag drives an
+   * unconditional warning rather than a live status, which is the honest way
+   * round: telling someone a key is needed when it is already set costs a
+   * sentence, while staying quiet costs a run an hour until somebody notices.
+   */
+  needsCredential?: boolean;
+  credentialHint?: string;
+}> = [
+  {
+    value: 'google_trends',
+    label: 'Google Trends',
+    help: 'Measures what people are searching for, against each term’s own recent history. It says a subject is live; it cannot tell you which hook opens the video. Free, needs no key, and the default for both of those reasons.',
+  },
+  {
+    value: 'apify',
+    label: 'Apify (TikTok and Instagram)',
+    help: 'Hosted scrapers for short-form video, scored against each author’s own median — the better signal for a hook. Billed per result, so run length is also run cost.',
+    needsCredential: true,
+    credentialHint:
+      'APIFY_TOKEN must be in the pipeline secrets, from the Apify console under Settings → Integrations.',
+  },
+  {
+    value: 'youtube',
+    label: 'YouTube',
+    help: 'The official YouTube API, scored against each channel’s own median. Documented and stable, but capped by a daily search quota — roughly a hundred terms a day across every run.',
+    needsCredential: true,
+    credentialHint:
+      'YOUTUBE_API_KEY must be in the pipeline secrets, from a Google Cloud project with “YouTube Data API v3” enabled.',
+  },
+];
+
+/** The platforms Apify can be pointed at. Mirrors `trend_settings_apify_platforms`. */
+export const APIFY_PLATFORM_OPTIONS: ReadonlyArray<{ value: ApifyPlatform; label: string }> = [
+  { value: 'tiktok', label: 'TikTok' },
+  { value: 'instagram', label: 'Instagram' },
+];
+
+/**
+ * Whether a source measures videos rather than search demand.
+ *
+ * A named helper rather than `=== 'google_trends'` at each site, because the
+ * question is asked in several places and the negation stops being true the
+ * moment a second search-demand source arrives. Everything that separates a
+ * view count from an interest score keys off this: which filters apply, which
+ * vocabulary is edited, and which half of the source card is shown.
+ */
+export function isVideoSource(source: TrendSource): boolean {
+  return source === 'apify' || source === 'youtube';
+}
+
+/**
+ * Whether a source takes hashtags rather than search terms.
+ *
+ * Not the same question as `isVideoSource`, which is why it is its own
+ * function: YouTube measures videos but is searched with the words a buyer
+ * would type, so it reads the keyword list alongside Google Trends. Only the
+ * scrapers take hashtags.
+ *
+ * Accepts a loose string because it is also asked of a stored run's recorded
+ * source, which can be absent on an old row or name a source since retired.
+ * Either way the answer is "not hashtags", which is the safer way to be wrong:
+ * a missing `#` reads as a term, a spurious one reads as a hashtag nobody set.
+ */
+export function usesHashtags(source: TrendSource | string | null | undefined): boolean {
+  return source === 'apify';
 }

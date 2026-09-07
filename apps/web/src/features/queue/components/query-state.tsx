@@ -1,6 +1,6 @@
 import { CircleAlertIcon } from 'lucide-react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty';
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty';
 import { Skeleton } from '@/components/ui/skeleton';
 
 export function ListSkeleton({ rows = 3 }: { rows?: number }) {
@@ -33,13 +33,23 @@ export function QueryError({ error }: { error: unknown }) {
   );
 }
 
-export function EmptyQueue({ title, description }: { title: string; description: string }) {
+export function EmptyQueue({
+  title,
+  description,
+  action,
+}: {
+  title: string;
+  description: string;
+  /** A way out, when the empty state is one the reader can leave. */
+  action?: React.ReactNode;
+}) {
   return (
     <Empty className="rounded-lg border border-dashed">
       <EmptyHeader>
         <EmptyTitle>{title}</EmptyTitle>
         <EmptyDescription>{description}</EmptyDescription>
       </EmptyHeader>
+      {action && <EmptyContent>{action}</EmptyContent>}
     </Empty>
   );
 }

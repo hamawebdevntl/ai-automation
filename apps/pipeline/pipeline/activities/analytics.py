@@ -13,6 +13,7 @@ from typing import Any
 
 from pipeline.clients.postiz import PostizClient, PostizError
 from pipeline.clients.supa import Supa
+from pipeline.config import settings
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,12 @@ def collect_analytics(
     supa: Supa | None = None, postiz: PostizClient | None = None
 ) -> dict[str, Any]:
     """Sample metrics for recently published posts."""
+    # Nothing has been published if there is no publishing service, and the
+    # metrics only exist inside Postiz. Skipping is the honest answer; the
+    # schedule is not even created in that state.
+    if not settings().publishing_enabled:
+        return {"skipped": "publishing is disabled (PUBLISHING_ENABLED=false)"}
+
     supa = supa or Supa()
     postiz = postiz or PostizClient()
 

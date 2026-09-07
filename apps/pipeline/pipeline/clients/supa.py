@@ -11,19 +11,39 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from supabase import Client, create_client
 
 from pipeline.config import settings
-from pipeline.models import Platform, ProductionStatus, QcReport
+from pipeline.models import LIVE_STATUSES, Platform, ProductionStatus, QcReport
 
 log = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _jsonable(value: Any) -> Any:
+    """Coerce an activity payload into something PostgREST will accept.
+
+    Activity results are ordinary dicts, but they carry whatever the providers
+    returned -- enums, Paths, the occasional datetime. Anything json does not
+    know becomes its string form rather than raising, because this is going into
+    a display-only column and a failed event write is a hole in the log.
+    """
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 class SupaError(RuntimeError):
@@ -155,91 +175,253 @@ class Supa:
         parks rather than retrying, so no further spend happens without a human
         decision. `parked` is distinct from `failed`, which means the pipeline
         itself broke.
+
+        This used to also write an `approvals` row, which was the only durable
+        record a park left. It was the wrong record: `record_system_decision`
+        hardcodes `decision = 'rejected'`, so every automated park -- including
+        one caused by a network failure on a production that never reached Gate
+        2 -- was filed in the audit table as a Gate 2 rejection by nobody. The
+        park is now recorded in `production_events`, which is the table for it,
+        and `approvals` goes back to meaning what its own comment says: human
+        gate decisions.
         """
         row = self.update_production(
             production_id, status=ProductionStatus.PARKED, error=error[:2000]
         )
-        self.record_system_decision("production", production_id, gate=2, note=f"parked: {error}"[:500])
+        self.record_event(
+            production_id,
+            (row.get("run_state") or {}).get("step") or "unknown",
+            "parked",
+            detail="Stopped and waiting for a person.",
+            error=error[:2000],
+        )
         return row
 
-    # -- audit -------------------------------------------------------------
+    # -- the step log ------------------------------------------------------
 
-    def record_system_decision(
-        self, subject_type: str, subject_id: str, *, gate: int, note: str
+    def record_event(
+        self,
+        production_id: str,
+        step: str,
+        outcome: str,
+        *,
+        detail: str | None = None,
+        error: str | None = None,
+        attempt: int | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> None:
-        """Write an audit row for an automated transition.
+        """Append one row to the production's step log.
 
-        `approvals.actor_id` was NOT NULL against `profiles`, which made it
-        impossible for the system to record anything. It is now nullable with a
-        `source` discriminator, and a check constraint still requires an actor
-        whenever `source = 'human'`.
+        Swallows its own failures. A production must never park because the
+        record of it failed to write -- the log exists to explain the run, and
+        an explanation that can take the run down with it is worse than a gap.
+        The same reasoning as `save_hashtag_cursor` and `finish_trend_run`.
         """
-        self._c.table("approvals").insert(
-            {
-                "gate": gate,
-                "subject_type": subject_type,
-                "subject_id": subject_id,
-                "decision": "rejected",
-                "note": note,
-                "source": "system",
-                "actor_id": None,
-            }
-        ).execute()
+        try:
+            self._c.table("production_events").insert(
+                {
+                    "production_id": production_id,
+                    "step": step,
+                    "outcome": outcome,
+                    "detail": detail,
+                    "error": error[:2000] if error else None,
+                    "attempt": attempt,
+                    "payload": _jsonable(payload or {}),
+                }
+            ).execute()
+        except Exception as exc:  # noqa: BLE001 - never take a production down
+            log.warning("could not record %s/%s event on %s: %s", step, outcome, production_id, exc)
 
-    # -- gate tokens (private schema, via security-definer RPCs) -----------
+    # -- audit -------------------------------------------------------------
     #
-    # These wrap functions in `public` that reach into the `private` schema.
-    # `private` is not in the exposed schema list, so neither the browser nor
-    # even a service-role PostgREST call can touch those tables directly, and
-    # EXECUTE on the wrappers is granted to `service_role` alone.
+    # `record_system_decision` used to live here, and `park()` was its only
+    # caller. It hardcoded `decision = 'rejected'`, so every automated park --
+    # a HeyGen wallet running dry, a lease expiring five times, a render
+    # exceeding its budget -- was filed in `approvals` as a Gate 2 rejection
+    # made by nobody, against productions that had in some cases never reached
+    # Gate 2. Parks are recorded in `production_events` now, which is the table
+    # for them, and `approvals` is left meaning what its own comment says:
+    # one immutable row per *human* gate decision.
 
-    def set_gate_token(self, production_id: str, token: str) -> None:
-        self._c.rpc(
-            "set_gate_token", {"p_production_id": production_id, "p_token": token}
+    # -- the driver's claim and lease --------------------------------------
+    #
+    # These replaced the Step Functions execution. An execution was the thing
+    # that made progress on a production exclusive; a lease is that, expressed
+    # as two columns instead of a service.
+
+    def claim_production(self, worker: str, lease_seconds: int) -> dict[str, Any] | None:
+        """Take exclusive right to advance one production, or None if none is due.
+
+        An RPC rather than a chained update because PostgREST cannot express
+        `for update skip locked`, and that is the entire mechanism -- it is what
+        lets two workers each claim a different row without blocking on or
+        colliding with each other.
+
+        Note what this deliberately does NOT copy: `claim_trend_run` below
+        issues `.update(...).eq("status", "requested")` and takes `rows[0]`,
+        which updates *every* matching row and then runs one. That survives
+        there because a unique index refuses a second in-flight trend run. Here
+        it would hand the same production to every worker at once.
+        """
+        res = self._c.rpc(
+            "claim_production",
+            {"p_worker": worker, "p_lease_seconds": lease_seconds},
         ).execute()
+        data = res.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        # A function returning a table row answers with nulls rather than no row
+        # when nothing matched, so an id is what "we got one" actually means.
+        return data if data and data.get("id") else None
 
-    def take_gate_token(self, production_id: str) -> str | None:
-        """Lease the token for a resume attempt.
+    def save_run_state(
+        self, production_id: str, run_state: dict[str, Any], **fields: Any
+    ) -> dict[str, Any]:
+        """Persist the driver's position and release the lease in one write.
 
-        Returns None when there is no token, or when another caller leased it
-        within the last minute. The lease means a failed send can be retried
-        without two concurrent deliveries both resuming the execution.
+        One statement rather than two, for the same reason `open_gate2` writes
+        its marker and its status together: a row whose state advanced but whose
+        lease was never released is invisible until the lease expires, and a row
+        whose lease was released before its state was written is claimable at
+        the step it has already finished.
         """
-        res = self._c.rpc("take_gate_token", {"p_production_id": production_id}).execute()
-        return res.data or None
+        return self.update_production(
+            production_id,
+            run_state=run_state,
+            leased_by=None,
+            lease_expires_at=None,
+            **fields,
+        )
 
-    def release_gate_token(self, production_id: str) -> None:
-        """Call only once the resume is confirmed.
+    def release_lease(self, production_id: str) -> None:
+        """Give the row back without advancing it.
 
-        `TaskDoesNotExist` and `TaskTimedOut` both count as confirmed: they mean
-        the execution has already moved on.
+        Used on shutdown and after an infrastructure error, so the next worker
+        picks it up at once instead of waiting out the lease.
         """
-        self._c.rpc("release_gate_token", {"p_production_id": production_id}).execute()
+        self._c.table("productions").update(
+            {"leased_by": None, "lease_expires_at": None}
+        ).eq("id", production_id).execute()
 
-    def record_gate_decision(self, production_id: str, decision: str) -> None:
-        """Park a decision that arrived before the token was registered.
+    def start_approved_productions(self) -> list[dict[str, Any]]:
+        """Open a production for every approved idea that has none.
 
-        The callback state checks for this the moment it stores its token, which
-        is what closes the race in the other direction.
+        Replaces the Gate 1 webhook chain -- Supabase Database Webhook, API
+        Gateway, SQS, Lambda -- all of which was carrying a single insert. The
+        dedup guarantee is unchanged and is now stronger: the `not exists` and
+        the `productions_one_live_per_idea` unique index are the same statement
+        rather than a read followed by a write.
         """
-        self._c.rpc(
-            "record_gate_decision",
-            {"p_production_id": production_id, "p_decision": decision},
-        ).execute()
-
-    def peek_gate_decision(self, production_id: str) -> str | None:
-        res = self._c.rpc("peek_gate_decision", {"p_production_id": production_id}).execute()
-        return res.data or None
-
-    def pending_gate_resumes(self) -> list[dict[str, Any]]:
-        """Rows already decided but not yet resumed.
-
-        This is what makes the database webhook an optimisation rather than a
-        correctness dependency. Supabase webhooks are pg_net: at-most-once, no
-        retry, no dead-letter queue, and a default timeout of one second.
-        """
-        res = self._c.rpc("list_pending_gate_resumes", {}).execute()
+        res = self._c.rpc("start_approved_productions", {}).execute()
         return res.data or []
+
+    def claim_publish_slot(self, production_id: str) -> bool:
+        """Reserve the right to hand this cut to Postiz exactly once.
+
+        The same shape as `claim_render_slot`, and needed for the same reason:
+        the lease protects the *step*, but a lease can expire under a worker
+        that is wedged rather than dead, and at that moment two workers
+        legitimately hold the same row. `claim_render_slot` is what stops the
+        second one starting a second billed render; this is what stops it
+        posting to a real audience a second time, which Postiz would happily do
+        -- it starts its publish workflow with TERMINATE_EXISTING.
+
+        Returns True if we won.
+        """
+        res = (
+            self._c.table("productions")
+            .update(
+                {
+                    "status": ProductionStatus.PUBLISHING.value,
+                    "stage": "publishing",
+                }
+            )
+            .eq("id", production_id)
+            .eq("status", ProductionStatus.APPROVED.value)
+            .execute()
+        )
+        return bool(res.data)
+
+    def repeatedly_expired_leases(self, threshold: int) -> list[dict[str, Any]]:
+        """Rows a worker has died on more than `threshold` times.
+
+        The signature of an out-of-memory kill in `fetch_and_qc`: the lease
+        expires, the row is re-claimed, the worker dies again. Re-driving that
+        forever is a loop, so it parks instead.
+        """
+        res = (
+            self._c.table("productions")
+            .select("id,status,run_state")
+            .in_("status", list(LIVE_STATUSES))
+            .execute()
+        )
+        return [
+            row
+            for row in (res.data or [])
+            if int((row.get("run_state") or {}).get("lease_expiries") or 0) >= threshold
+        ]
+
+    def unstarted_productions(self) -> list[dict[str, Any]]:
+        """Queued rows the driver never picked up.
+
+        `reconcile_renders` cannot see these -- it only looks at rows that are
+        already `running`. This is what catches a production opened while the
+        driver was down.
+        """
+        res = (
+            self._c.table("productions")
+            .select("id,status,run_state,created_at,updated_at,lease_expires_at")
+            .eq("status", ProductionStatus.QUEUED.value)
+            # A paused row is deliberately not being picked up. Parking it for
+            # "the driver never started it" would punish the owner for pausing.
+            .is_("paused_at", "null")
+            .execute()
+        )
+        return [
+            row
+            for row in (res.data or [])
+            if not (row.get("run_state") or {}).get("step")
+        ]
+
+    def expired_runs(self, days: int) -> list[dict[str, Any]]:
+        """Productions still going long after they opened.
+
+        The state machine's top-level 30-day timeout, with one deliberate
+        exemption per gate: a row at `await_gate2` or `await_script` is not
+        counted. That timeout measured how long a *machine* had been working,
+        and the only reason a gate ever fell under it was that a task token
+        expires. Nothing expires now, so timing out an owner who took six weeks
+        to approve a cut -- or to approve the script for one -- would be
+        inventing a limit rather than preserving one.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        res = (
+            self._c.table("productions")
+            .select("id,status,run_state,created_at")
+            .in_("status", list(LIVE_STATUSES))
+            .lt("created_at", cutoff)
+            .is_("paused_at", "null")
+            .execute()
+        )
+        return [
+            row
+            for row in (res.data or [])
+            if (row.get("run_state") or {}).get("step") not in ("await_gate2", "await_script")
+        ]
+
+    def productions_at_step(self, step: str, *, status: str) -> list[dict[str, Any]]:
+        """Rows resting at one driver step, for the backlog flush."""
+        res = (
+            self._c.table("productions")
+            .select("id,run_state")
+            .eq("status", status)
+            .execute()
+        )
+        return [
+            row
+            for row in (res.data or [])
+            if (row.get("run_state") or {}).get("step") == step
+        ]
 
     # -- publications ------------------------------------------------------
 
@@ -470,18 +652,34 @@ class Supa:
         except Exception as exc:  # noqa: BLE001
             log.warning("could not record the task stop for run %s: %s", run_id, exc)
 
-    def stale_trend_runs(self, *, running_hours: int, requested_minutes: int) -> list[dict[str, Any]]:
+    def stale_trend_runs(
+        self, *, running_hours: int, requested_minutes: int | None
+    ) -> list[dict[str, Any]]:
         """Runs that will never finish on their own.
 
-        A task killed by Fargate, an image that will not start, or a reconciler
-        that claimed a row and then died leaves the row in flight forever -- and
-        because at most one row may be in flight, that disables the button
-        permanently. This is what makes that state recoverable without a
-        console.
+        A worker killed mid-scout, a container that will not start, or a
+        dispatcher that claimed a row and then died leaves the row in flight
+        forever -- and because at most one row may be in flight, that disables
+        the button permanently. This is what makes that state recoverable
+        without going into the database by hand.
+
+        `requested_minutes=None` means "do not sweep unclaimed requests at
+        all", and it is not a convenience -- it is the difference between a
+        dispatcher that polls faster than this threshold and one that does not.
+
+        A `requested` row is only stranded if nothing is coming to claim it. On
+        a dispatcher that runs every minute, ten minutes of silence really does
+        mean that. On one that runs hourly it means nothing at all, and reaping
+        the row anyway destroys the request a few lines before the same process
+        would have claimed and run it. So the caller states which world it is
+        in rather than inheriting an assumption from a comment.
         """
         now = datetime.now(timezone.utc)
         running_cutoff = (now - timedelta(hours=running_hours)).isoformat()
-        requested_cutoff = (now - timedelta(minutes=requested_minutes)).isoformat()
+        requested_cutoff = (
+            None if requested_minutes is None
+            else (now - timedelta(minutes=requested_minutes)).isoformat()
+        )
         res = (
             self._c.table("trend_runs")
             .select("id,status,requested_at,started_at")
@@ -493,7 +691,12 @@ class Supa:
             # A claimed row is judged from when it started, an unclaimed one
             # from when it was asked for. `started_at` is null on the second,
             # and on a row claimed by a reconciler that died before setting it.
-            cutoff = running_cutoff if row["status"] == "running" else requested_cutoff
+            if row["status"] == "running":
+                cutoff = running_cutoff
+            elif requested_cutoff is None:
+                continue
+            else:
+                cutoff = requested_cutoff
             since = row.get("started_at") or row["requested_at"]
             if since < cutoff:
                 stale.append(row)

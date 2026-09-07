@@ -1,334 +1,253 @@
-# Deploying
+# Running it
 
-Order matters in a couple of places, and those places are called out. Nothing
-here needs Docker on your machine: images are built by the `images` workflow.
+Two ways, and they are the same system: on your own machine for development and
+for the first end-to-end check, and on a VPS with Docker Compose for real.
 
-## 0. Decide whether publishing is on
+There is no cloud provider, nothing to provision and no infrastructure state to
+keep. This used to be seventeen Terraform files, four ECR repositories, an OIDC
+role and a `terraform apply` with an image tag from CI.
 
-`postiz_enabled` defaults to **false**, and the default path through this
-document assumes it stays that way. Publishing is the only part of the system
-that needs approved platform apps and connected channels, and it is also the
-most expensive: a t3.large carrying Temporal and Elasticsearch, a public ALB, a
-100GB volume and nightly snapshots.
+---
 
-With it off:
+## What you need before either
 
-- No Postiz resource is created, so the `reels/postiz` secret and the ACM
-  certificate are not needed and steps 4 and the Postiz half of step 1 do not
-  apply.
-- `POSTIZ_BASE_URL` is empty and `PUBLISHING_ENABLED=false` reaches the
-  pipeline. `PostizClient` refuses to be constructed and the publish, poll and
-  analytics activities return a skip instead of calling anything.
-- `reconcile_publishes` and `collect_analytics` are not scheduled at all.
-- Gate 2 approval ends the execution at `PublishingDisabled`, a `Succeed`. The
-  row keeps `status='approved'` with its finished cut and per-platform copy.
-
-Everything else is unchanged: trend research, Gate 1, render, quality check,
-copy generation, Gate 2 and the five remaining reconcilers all run. Nothing
-about how a video is *made* differs, which is the point — switching publishing
-on later does not invalidate anything produced before.
-
-## 1. Create the secrets
-
-They are separate on purpose. The Postiz host has no business holding the
-Supabase service-role key, and the pipeline has no business holding platform
-OAuth secrets.
-
-Only `reels/pipeline` is needed while publishing is off.
-
-### `reels/pipeline`
-
-Read at Lambda cold start and by the trend task. `NICHE_BRIEF` and
-`TREND_HASHTAGS` are not secret, but this bundle is the only injection path
-into the trend task, so they live here too.
-
-```json
-{
-  "SUPABASE_SERVICE_ROLE_KEY": "…",
-  "MPT_API_KEY":               "a long random string; MoneyPrinterTurbo compares it in constant time",
-  "POSTIZ_API_KEY":            "from Postiz Settings → Public API; omit while publishing is off",
-  "ANTHROPIC_API_KEY":         "idea generation, when IDEA_LLM_PROVIDER=claude (the default)",
-  "GEMINI_API_KEY":            "idea generation, when IDEA_LLM_PROVIDER=gemini; free from aistudio.google.com",
-  "FAL_API_KEY":               "only needed if a fal preset is active; sent as 'Authorization: Key …', not Bearer",
-  "HEYGEN_API_KEY":            "for the presenter lane; sent raw in the 'X-Api-Key' header, not as a bearer token",
-  "GATE_BRIDGE_SECRET":        "shared header for the webhook bridge",
-  "NICHE_BRIEF":               "what we do, who we speak to, and what we must NOT claim",
-  "TREND_HASHTAGS":            "comma,separated,hashtags",
-  "TIKTOK_MS_TOKEN":           "from your tiktok.com cookies; scouting mostly fails without it"
-}
-```
-
-`NICHE_BRIEF` and `TREND_HASHTAGS` are **fallbacks now**. Both live in the
-`trend_settings` table, seeded by migration and edited under Settings in the
-app -- they were the two values most likely to be tuned weekly, and routing
-that through a secret and a cold start was the wrong shape. Since
-20260906150000 that table also holds the schedule, the filters, the pacing and
-the drafting model; see **When trend research runs** below. The row wins whenever it
-has a value; the bundle answers only when it does not, which is what lets a
-headless run work against a database that has not been migrated. Keeping them
-here is therefore optional, and belt-and-braces rather than required.
-
-Either way, a run with **no** brief from either source is a **hard failure**.
-That is deliberate: a trend run without one produces plausible, irrelevant
-ideas, and each one costs the owner a review and possibly a render.
-
-Only the key for the selected provider is needed -- but if you intend to switch
-provider from the app, both keys have to be in the bundle, because that switch
-no longer involves a deploy. The provider is now `trend_settings.idea_provider`,
-edited under **Run length and pacing** in Settings. `IDEA_LLM_PROVIDER`, set on
-the trend task via the `idea_provider` Terraform variable, is the fallback for
-when that column is blank or the table cannot be read.
-
-The key is checked **before** scouting rather than at the point of drafting.
-Scouting drives a real browser for several minutes, and a run that discovers a
-missing key after that has thrown all of it away for a reason that was knowable
-at the start.
-
-Switching providers changes which model drafts and nothing else: the system
-prompt, the output schema and the row mapping are shared, which is what keeps
-the two lanes' ideas comparable. Gemini exists on this path because its free
-tier makes a demo possible without a billing account.
-
-`GEMINI_MODEL` defaults to `gemini-3.5-flash`. Two things decided that: the pro
-models have no free tier, and `gemini-3.8-flash` -- which does have one --
-returned 503 "high demand" on every schema-constrained request tried against a
-free key, while answering a one-word prompt fine. Free-tier traffic is shed
-first and the newest model is where the queue is. `gemini-2.5-flash` is not an
-option at all any more: it 404s with "no longer available to new users".
-
-### When trend research runs
-
-The schedule is a **setting, not a deployment**. It used to be
-`cron(0 6 * * ? *)` in `infra/schedules.tf`, pointed straight at the ECS
-cluster; it is now `schedule_hour_utc`, `schedule_minute_utc`, `schedule_days`
-and `schedule_enabled` on `trend_settings`, edited under **When runs happen**
-in the app. Times are UTC, matching the run rows and the logs.
-
-`dispatch_trend_runs` -- already running every minute for the button -- is what
-reads them. When a slot is due it opens a `trend_runs` row and starts it
-through exactly the path a manual run takes, which is why a scheduled run now
-has somewhere to report its progress, its results and its rejection breakdown.
-Under the old cron it had none of that: a scheduled run's outcome existed only
-in CloudWatch.
-
-A slot that is missed -- because a run was still going, or the dispatcher was
-down -- starts late if it can, up to an hour afterwards, and is abandoned past
-that rather than fired at an unrelated time of day. Pausing stops the schedule
-only; the button still works, which is how to test a settings change without
-waiting for tomorrow.
-
-Two consequences worth knowing before you apply this:
-
-- **The apply deletes `aws_scheduler_schedule.trends`.** Until the migration is
-  applied *and* the new activities image is deployed, nothing starts a
-  scheduled run. The button is unaffected throughout.
-- **The dispatcher reads `trend_settings` every minute.** If that table is
-  missing or unreadable it falls back to the defaults, which are the old daily
-  06:00 UTC run -- so a broken read degrades to the previous behaviour rather
-  than to silence.
-
-### Stopping a run
-
-**Stop this run** appears on the banner whenever a run is in flight, for an
-owner. It calls `cancel_trend_run`, and that function is the whole mechanism:
-it moves the row to `cancelled`, which is not one of the statuses
-`trend_runs_single_in_flight` indexes, so the lock frees itself.
-
-No Lambda, no sweep and no AWS call is involved in that taking effect, and that
-is deliberate rather than incidental. At most one run may be in flight, so a
-row nothing will ever finish does not hold up one run -- it holds up every
-future run. The only thing that could previously clear such a row was
-`dispatch_trend_runs`, which is useless in the case that produces stuck rows
-most often: **the dispatcher not running**. An unapplied `terraform apply`, a
-Lambda that will not start, a broken image -- each leaves a `requested` row
-that nothing claims and nothing expires, and the app correctly reports that
-nothing is coming to clear it. Stop is the way out of that without a console.
-
-If the run had already started, its Fargate task is stopped two ways, because
-neither alone covers the case the other does:
-
-- `dispatch_trend_runs` calls `ecs:StopTask` on its next sweep, within a
-  minute. Works against a task that has stopped responding; needs the
-  dispatcher.
-- the scout checks its own row between hashtags and exits. Works when the
-  dispatcher is the broken part; needs the task to still be running its loop.
-
-Worst case both miss and the session is orphaned until the three-hour
-write-off. It holds nothing up in the meantime -- the lock was freed the
-instant the row was cancelled.
-
-A stopped run **drafts and inserts nothing**, even if it had already found
-signals worth drafting. Stop means stop: filling the queue a minute after being
-told the run was cancelled is a surprise, and it spends an LLM call on a batch
-nobody asked to finish.
-
-`ecs:StopTask` is a new permission on the activities Lambda, scoped to tasks in
-the pipeline cluster. Cancelling works without it; only the task kill does not.
-
-### Trend runs on demand
-
-The **Generate more ideas** button on the Gate 1 queue starts a run
-immediately. The app cannot call AWS --
-there is no server tier -- so the chain is the same one every other write in
-this system uses:
-
-1. `request_trend_run()` inserts a row in `trend_runs`. Owner-only, and a
-   partial unique index permits **one** in-flight run at a time.
-2. `dispatch_trend_runs`, a sweeper running every minute, claims that row and
-   calls `ecs:RunTask` on the same task definition, subnets and security group
-   the nightly run uses.
-3. The task reports back into the row: counts on success, the error on failure.
-   It knows which row from `TREND_RUN_ID`, set as a container override -- which
-   is also how it tells an on-demand run from a scheduled one, since the
-   scheduled run has no row and needs none.
-
-This needs a `terraform apply` as well as the migration, and **both**: the
-sweeper's schedule, the Lambda's `TRENDS_*` environment, and `ecs:RunTask` plus
-a scoped `iam:PassRole` on the Lambda role are all new.
-
-Apply the two together, and in that order if they must be separate. The failure
-modes on either side of the pair are not symmetrical:
-
-- **Migration without the apply.** `request_trend_run` exists, so the button
-  inserts a row -- and nothing is scheduled to claim it. Note what that costs:
-  `dispatch_trend_runs` is also what *expires* an unclaimed request, so the row
-  is not written off either, and the one-in-flight index then holds the button
-  shut until the apply lands. The queue says so rather than spinning: a request
-  unclaimed for more than three minutes swaps the "scouting" banner for one that
-  names the dispatcher as the thing to check. The `the trend task is not
-  configured for on-demand runs` error is the *next* state along -- it means the
-  sweeper is running and its `TRENDS_*` environment is unset, which is a
-  different fault from the sweeper not running at all.
-- **Apply without the migration.** The sweeper queries a `trend_runs` table that
-  does not exist and finds nothing to do, every minute, harmlessly. The button
-  is the only thing that suffers, and it says why: PostgREST reports the missing
-  function and the toast passes that on.
-
-The `ecs:RunTask` grant names the task-definition **family** with a revision
-wildcard rather than the current ARN. Every image build registers a new
-revision, and a policy pinned to one would start denying the button the moment
-the task definition changed.
-
-**A run that never finishes.** At most one may be in flight, so a task killed by
-Fargate would otherwise hold the button shut permanently. `dispatch_trend_runs`
-writes off a run left `running` for more than 3 hours, or `requested` for more
-than 10 minutes, before it claims anything -- expiry first, so the one state
-that needs recovering is not the one state that never recovers. Nothing has to
-be done by hand; the button comes back within the minute.
-
-### `reels/postiz`
-
-Only read when `postiz_enabled = true`, so it does not have to exist yet.
-
-Written to `/opt/postiz/.env` at boot. Every key becomes an environment
-variable for the compose stack.
-
-```json
-{
-  "JWT_SECRET":              "long random string, unique to this install",
-  "POSTIZ_DB_PASSWORD":      "…",
-  "TEMPORAL_DB_PASSWORD":    "…",
-  "MAIN_URL":                "https://social.example.org",
-  "FRONTEND_URL":            "https://social.example.org",
-  "NEXT_PUBLIC_BACKEND_URL": "https://social.example.org/api",
-
-  "INSTAGRAM_APP_ID":     "…", "INSTAGRAM_APP_SECRET":     "…",
-  "LINKEDIN_CLIENT_ID":   "…", "LINKEDIN_CLIENT_SECRET":   "…",
-  "YOUTUBE_CLIENT_ID":    "…", "YOUTUBE_CLIENT_SECRET":    "…",
-  "TIKTOK_CLIENT_ID":     "…", "TIKTOK_CLIENT_SECRET":     "…"
-}
-```
-
-The three URL values must match the certificate's domain, or OAuth callbacks
-land nowhere.
-
-## 2. Build images
-
-Push to `main`, or run the `images` workflow by hand. It needs
-`AWS_DEPLOY_ROLE_ARN` (an OIDC role, so no long-lived keys in GitHub) and an
-`AWS_REGION` variable. The job summary prints the tag to deploy.
-
-## 3. Apply
+**Supabase.** The system of record and the render store. A hosted project is
+fine; nothing here needs it to be self-hosted.
 
 ```sh
-cd infra
-terraform init
-terraform apply \
-  -var supabase_url=https://uerpeuidrxjzxqfxqzic.supabase.co \
-  -var image_tag=<sha from the workflow>
+bunx supabase link --project-ref <your-ref>
+bunx supabase db push
 ```
 
-The `next_steps` output prints the remaining checklist for whichever mode you
-applied in, and `publishing_enabled` reports which one that was.
-
-To include publishing, add `-var postiz_enabled=true` and
-`-var postiz_certificate_arn=<acm arn>`. Without the certificate everything
-comes up and the Postiz UI loads, but **no channel can be connected** —
-Instagram, TikTok, YouTube and LinkedIn all require an HTTPS redirect URI on a
-registered domain.
-
-## 4. Connect the channels
-
-Skip this while publishing is off; there is nothing to connect to.
-
-Open `postiz_public_url`, create the **single** owner account, then connect
-each platform. Registration is disabled in the compose file, so that first
-account is the only one.
-
-Two things to get right here:
-
-- Connect a LinkedIn **Page**, not a personal profile. The personal provider
-  reports no analytics at all, so the feedback loop would be silently blind on
-  that platform.
-- Copy the API key from Settings → Public API into `POSTIZ_API_KEY` and
-  re-apply, so the pipeline can authenticate.
-
-## 5. Wire the webhooks
-
-Two Database Webhooks in the Supabase dashboard, pointed at the `gate1` and
-`gate2` outputs. **Set the `WHEN` clauses**, or the pipeline's own writes to
-`productions` will re-invoke the Gate 2 bridge dozens of times per production:
-
-| Gate | Table | Condition | Timeout |
-|---|---|---|---|
-| 1 | `ideas` | `old.status <> 'approved' AND new.status = 'approved'` | 5000 ms |
-| 2 | `productions` | `old.status IS DISTINCT FROM new.status AND new.status IN ('approved','rejected')` | 5000 ms |
-
-Add the `GATE_BRIDGE_SECRET` as a static header on both.
-
-The default webhook timeout is **1000 ms**, which an API Gateway hop routinely
-exceeds. Raise it to 5000. Even then the webhook is only a latency
-optimisation — it is `pg_net`, so at-most-once with no retry and no
-dead-letter queue. The `reconcile_gates` sweeper, running every minute, is the
-actual guarantee.
-
-## 5a. Check the presenter lane before anyone approves one
-
-The `ai-presenter` preset is active, so it is approvable at Gate 1 and it
-spends real money on a pay-as-you-go wallet rather than a monthly allowance.
-Two things are worth confirming before the first approval:
+**Credentials.** Two env files, each with an example beside it:
 
 ```sh
-# The key is valid, and there is money behind it. Costs nothing.
+cp apps/pipeline/.env.example apps/pipeline/.env
+cp services/mpt/.env.example  services/mpt/.env
+```
+
+The minimum for a working stock-footage reel is four values: Supabase's URL and
+service-role key, a shared `MPT_API_KEY` (any long random string — MoneyPrinter-
+Turbo compares it in constant time), and a **free Pexels key** from
+pexels.com/api, without which the stock lane has no footage to cut together.
+Everything else is per-lane and can stay empty: `FAL_API_KEY` and
+`HEYGEN_API_KEY` are only read when a preset that names them is approved, and
+each trend source's credential is checked before scouting starts rather than at
+the point of use — which matters most on Apify, where finding out afterwards
+means having paid for a scrape whose results were then thrown away.
+
+**A niche brief.** Set it under Settings in the app. A trend run with no brief
+is a hard failure on purpose: without one it produces plausible, irrelevant
+ideas, and each costs the owner a review and possibly a render.
+
+---
+
+## Locally, without Docker
+
+Everything except publishing runs natively, which is the fastest way to watch a
+production go through both gates.
+
+**ffmpeg and ffprobe** are needed by the quality check and by the fal assembly
+lane. If your package manager is awkward, the static build needs no root:
+
+```sh
+curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+  | tar -xJ --strip-components=1 --wildcards -C ~/.local/bin '*/ffmpeg' '*/ffprobe'
+```
+
+Then three terminals:
+
+```sh
+# 1. MoneyPrinterTurbo. It is a plain FastAPI app; the Docker image only exists
+#    because upstream's own launches the Streamlit WebUI instead of the API.
+cd services/mpt
+python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+set -a && . ./.env && set +a
+MPT__APP__ENABLE_REDIS=false ./.venv/bin/python main.py     # :8080
+
+# 2. The pipeline worker.
+cd apps/pipeline
+python -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
+set -a && . ./.env && set +a
+MPT_BASE_URL=http://127.0.0.1:8080 ./.venv/bin/python -m pipeline.driver.worker
+
+# 3. The approval app.
+cd apps/web && bun install && bun run dev                    # :5173
+```
+
+`enable_redis=false` is fine for one local run and not for the VPS: without
+Redis, MoneyPrinterTurbo keeps task state in process memory and loses every
+in-flight render when it restarts. `reconcile_renders` reports exactly that and
+parks the rows.
+
+### Watching one go through
+
+```sql
+select status, stage, run_state->>'step', run_state->>'due_at'
+  from productions order by created_at desc limit 5;
+```
+
+Approve an idea at Gate 1 and the row should appear within five seconds, then
+walk `submit_render → poll_render → fetch_and_qc → generate_copy → await_gate2`.
+The app shows the same walk without the SQL: approving now stays on the idea's
+page and the timeline there advances as the driver writes, over Realtime rather
+than a poll. At Gate 2 it stops until you decide. With publishing off, approving leaves it at
+`status='approved'` with `step = 'publishing_disabled'` — that is the backlog,
+not a failure.
+
+**Worth doing once:** kill the worker mid-render and start it again. It should
+resume polling the same render rather than submitting a second one. That is the
+property `run_state` exists for, and the one thing the old state machine
+provided for free.
+
+---
+
+## On a VPS
+
+Any box with Docker and Compose. Two CPUs and 4 GB is enough for the stock lane;
+rendering is what wants the headroom, not the driver.
+
+```sh
+git clone --recurse-submodules <this repo> && cd <repo>
+cp apps/pipeline/.env.example apps/pipeline/.env   # and fill it in
+cp services/mpt/.env.example  services/mpt/.env    # and fill it in
+./deploy.sh
+```
+
+`deploy.sh` pulls, builds the approval app, builds the images and restarts the
+stack. Redeploying is the same command; Compose sends SIGTERM, and the worker
+finishes the step it is on and releases its leases rather than abandoning them,
+so a deploy costs seconds of latency instead of a lease timeout of stalled
+queue.
+
+The stack is four containers: `worker`, `mpt`, `mpt-redis`, and nginx serving
+the built SPA on :8080. Put a reverse proxy in front of that if you want TLS;
+nothing in the pipeline needs to be reachable from outside.
+
+### Watching it
+
+```sh
+docker compose logs -f worker
+```
+
+A production that stopped is **parked**, which means it is waiting for a person
+rather than broken. That distinction is deliberate throughout: a rejection and a
+park are both ordinary outcomes, so anything that looks like a failure really is
+one.
+
+```sql
+select id, error, run_state->>'step' from productions where status = 'parked';
+```
+
+In the app this is the **In production** panel on the queue page, which lists
+every production that has not finished and puts the stopped ones first. Opening
+one shows its whole step log and the controls to retry, pause or re-run it, so
+parking no longer means reaching for psql. The step-by-step record is:
+
+```sql
+select step, outcome, detail, error, created_at
+  from production_events where production_id = '<id>' order by created_at;
+```
+
+---
+
+## If you are migrating from the AWS deployment
+
+Three things do not happen by themselves.
+
+1. **Delete the two Supabase Database Webhooks** (Database → Webhooks, on
+   `ideas` and `productions`). They are configured in the Supabase dashboard,
+   not in this repo, so nothing here removes them — and left in place they keep
+   firing `pg_net` requests at a dead API Gateway on every idea approval and
+   every Gate 2 decision. The driver does not need them: it polls.
+2. **Apply both migrations.** `..._driver_run_state.sql` is additive and safe to
+   apply while the old stack is still up; `..._retire_gate_tokens.sql` drops the
+   callback machinery and should go last.
+3. **Tear down the AWS stack by hand.** `infra/` is gone from this repo, so
+   there is no `terraform destroy` to run — delete the state machine, the two
+   Lambdas, the ECS cluster, the SQS queues, the API Gateway, the EventBridge
+   schedules, the ECR repositories and the secrets from the console, and check
+   the NAT gateway is gone, because it is the line item that keeps billing.
+
+In-flight productions carry over. A row mid-render has `task_id` and its status,
+which is all `reconcile_renders` needs; a row at `awaiting_review` is picked up
+by the new claim the moment it is decided. Rows whose Step Functions execution
+died are parked by `reconcile_leases` within a minute of the worker starting.
+
+---
+
+## Turning publishing on
+
+Publishing is off by default and not in `docker-compose.yml` at all. It is the
+only part of the system that needs approved platform apps, connected channels
+and a public HTTPS domain, and it brings its own Postgres, Redis, Temporal and
+Elasticsearch — most of the box's memory, for a capability that is worth nothing
+until the channels exist.
+
+Nothing produced while it was off is wasted. Every approved production is
+sitting at `status='approved'` with `run_state.step = 'publishing_disabled'`,
+holding its finished render and its per-platform copy.
+
+1. Bring up Postiz from `docker/postiz-compose.yaml`. It needs a `.env` with
+   `JWT_SECRET`, its two database passwords, and `MAIN_URL` / `FRONTEND_URL` /
+   `NEXT_PUBLIC_BACKEND_URL` all set to the domain the platform apps will
+   redirect to. Those three must match the certificate or OAuth callbacks land
+   nowhere.
+2. Put a reverse proxy with TLS in front of it — Caddy will get a certificate on
+   its own. Postiz has to be publicly reachable because connecting a channel is
+   an OAuth flow completed in a browser and the platforms require an HTTPS
+   redirect URI on a registered domain.
+3. Create the single owner account, then connect each platform. Registration is
+   disabled in the compose file, so that first account is the only one. Connect
+   a LinkedIn **Page**, not a personal profile — the personal provider reports
+   no analytics at all, so the feedback loop would be silently blind there.
+4. Copy the key from Settings → Public API into `POSTIZ_API_KEY`, set
+   `PUBLISHING_ENABLED=true` and `POSTIZ_BASE_URL`, and restart the worker.
+5. The backlog releases itself: `flush_publishing_backlog` sends rested
+   productions back through the gate. Watch the first few — a month of backlog
+   released at once is a month of posts released at once, and `daily_cap` in
+   `platform_targets` is not what will stop it.
+
+### As platforms clear
+
+`platform_targets` ships with Instagram and LinkedIn enabled and YouTube and
+TikTok disabled, because YouTube's default quota allows six uploads a day
+against a target of ten, and TikTok will not publish automatically without an
+audited app. Both are multi-week external processes.
+
+```sql
+update platform_targets set enabled = true, daily_cap = <new cap> where platform = 'youtube';
+update platform_targets set enabled = true where platform = 'tiktok';
+```
+
+**Back up the Postiz volume.** It holds OAuth tokens for four platforms, and
+re-obtaining them means re-running TikTok's audit and YouTube's review. On AWS
+this was an EBS volume with `prevent_destroy` and nightly snapshots; a Docker
+volume has neither, so a `pg_dump` of `postiz-postgres` plus a tar of
+`/uploads`, on a timer, is doing real work here rather than being tidy.
+
+---
+
+## The presenter lane
+
+`ai-presenter` is approvable at Gate 1 and spends real money against a
+pay-as-you-go wallet. Two checks before the first approval:
+
+```sh
+# Valid key, and money behind it. Costs nothing.
 curl -s https://api.heygen.com/v3/users/me -H "X-Api-Key: $HEYGEN_API_KEY"
-```
 
-- `wallet.remaining_balance` is the ceiling on presenter renders. An empty
-  wallet fails the render *after* Gate 1 has been passed, which wastes a
-  review rather than preventing one.
-- The preset's `params.heygen.avatar_id` must be a look this account can use.
-  A stale id fails with `avatar_not_found`, which the pipeline treats as
-  terminal and parks — correctly, since it would fail identically on retry.
-
-```sh
-# The looks this account owns, with their ids and portrait/landscape hint.
+# The looks this account owns. Prefer preferred_orientation = portrait: a 9:16
+# render from a landscape source crops the speaker to fill the frame.
 curl -s "https://api.heygen.com/v3/avatars/looks?limit=50&ownership=private" \
   -H "X-Api-Key: $HEYGEN_API_KEY"
 ```
 
-Prefer a look whose `preferred_orientation` is `portrait`: a 9:16 render from a
-landscape source crops the speaker to fill the frame. To change the avatar or
-the voice, update the preset — no deploy:
+An empty wallet fails the render *after* Gate 1 has been passed, which wastes a
+review rather than preventing one. A stale `avatar_id` fails with
+`avatar_not_found`, which the pipeline treats as terminal and parks — correctly,
+since it would fail identically on retry. Changing the avatar or voice is a
+preset update, not a deploy:
 
 ```sql
 update style_presets
@@ -336,68 +255,16 @@ set params = jsonb_set(params, '{heygen,avatar_id}', '"<look id>"')
 where slug = 'ai-presenter';
 ```
 
-## 6. Enable platforms as they clear
+There is a live test that submits one real render. It is off unless asked for:
 
-`platform_targets` ships with Instagram and LinkedIn enabled, and **YouTube and
-TikTok disabled**:
-
-```sql
--- once the YouTube quota extension is granted
-update platform_targets set enabled = true, daily_cap = <new cap> where platform = 'youtube';
--- once the TikTok app audit clears and DIRECT_POST is available
-update platform_targets set enabled = true where platform = 'tiktok';
+```sh
+cd apps/pipeline
+set -a && . ./.env && set +a
+HEYGEN_LIVE=1 ./.venv/bin/pytest tests/test_heygen_live.py -v
 ```
 
-No deploy needed. Both are multi-week external processes and neither has
-started; until they do, the pipeline publishes to two platforms.
-
-## Turning publishing on
-
-Nothing has to be undone first, and no earlier work is wasted.
-
-1. Create the `reels/postiz` secret (above) and add `POSTIZ_API_KEY` to
-   `reels/pipeline` — the key comes from Postiz itself, so on the very first
-   run it is a second apply: bring Postiz up, read the key from Settings →
-   Public API, put it in the secret, apply again.
-2. Request an ACM certificate for the domain the platform apps will redirect
-   to, and point that domain at the `postiz_public_url` load balancer.
-3. `terraform apply -var postiz_enabled=true -var postiz_certificate_arn=<arn>`
-   plus the usual `supabase_url` and `image_tag`. This creates the host, the
-   volume, the ALB, the two schedules, and re-templates the state machine so
-   Gate 2 approval routes to `Publish` again.
-4. Connect the channels (step 4) and enable platforms (step 6).
-5. Flush the backlog. Everything approved while publishing was off is sitting
-   at `status='approved'`:
-
-   ```sql
-   select id, created_at from productions where status = 'approved' order by created_at;
-   ```
-
-   Each one has its render in the `renders` bucket and its `platform_copy`
-   written, so it publishes by starting a fresh execution for that
-   `production_id`. Do this deliberately rather than in bulk: a month of
-   backlog released at once is a month of posts released at once, and the
-   `daily_cap` in `platform_targets` is not what will stop it.
-
-Turning it back **off** is not symmetrical. The data volume is
-`prevent_destroy`, because it holds the OAuth tokens for four platforms, so a
-plan that would delete it fails instead. That is deliberate: re-obtaining those
-tokens means re-running TikTok's audit and YouTube's review. Removing the volume
-has to be an explicit `terraform state rm` or an edit to `postiz.tf`.
-
-## Operational notes
-
-- **Shell access to Postiz:** the `postiz_ssh` output prints a Session Manager
-  command. There is no SSH key and no open port 22.
-- **A rejection or a park is a `Succeed`**, so a `FAILED` execution always
-  means something is genuinely broken. That is why the two CloudWatch alarms
-  are worth paging on.
-- **The presenter lane bills per render and cannot be undone.** A HeyGen
-  submit carries the production id as an `Idempotency-Key`, so a retry inside
-  24 hours replays rather than re-renders. Past 24 hours the same production
-  re-run is a new charge — which matters if a backlog is ever replayed.
-- **MPT deploys are disruptive by design.** One replica, stop-before-start.
-  In-flight renders are lost, `reconcile_renders` parks them, and a human
-  re-runs. Deploy it when the queue is empty.
-- **The `renders` bucket is private.** Postiz gets a short-lived signed URL at
-  publish time; a public bucket would expose every unreviewed cut.
+**Cost, measured on 2026-09-07: $0.40** for the 10.5-second render it submits —
+about $2.29 a rendered minute, which is where the $1–2 estimate for a full reel
+comes from. A rerun spends nothing: the submit carries a stable
+`Idempotency-Key`, so a resubmit within 24 hours replays the original response,
+and the file is cached in `apps/pipeline/.heygen-live/` after that.

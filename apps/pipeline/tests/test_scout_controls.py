@@ -259,3 +259,79 @@ class TestOneRunSOwnLength:
         merged = mod.with_run_overrides(ScoutControls(), row)
         assert merged.run_budget_minutes == 240
         assert merged.hashtags_per_run == 1
+
+
+class TestWhichPlatformsApifyScrapes:
+    """`apify_platforms`, coerced the way `schedule_days` is.
+
+    Same shape of problem: a list of names from a database column, where an
+    unrecognised entry should be ignored and an empty result should mean the
+    default rather than "nothing".
+    """
+
+    def test_both_platforms_by_default(self):
+        # They answer the same question of different audiences, and an owner
+        # who wants one can say so in a click.
+        assert mod.from_row({}).apify_platforms == ("tiktok", "instagram")
+
+    def test_one_platform_is_honoured(self):
+        assert mod.from_row({"apify_platforms": ["instagram"]}).apify_platforms == ("instagram",)
+
+    def test_the_order_is_fixed_rather_than_however_the_row_stored_it(self):
+        # Two installs with the same platforms selected should scout them in
+        # the same sequence, because a run budget can expire partway through
+        # and "we ran out of time" should not mean a different platform each
+        # time.
+        assert mod.from_row({"apify_platforms": ["instagram", "tiktok"]}).apify_platforms == (
+            "tiktok",
+            "instagram",
+        )
+
+    def test_an_unscrapeable_platform_is_ignored_rather_than_fatal(self):
+        # A row written by a build newer than this one should degrade to
+        # scouting what it understands, not refuse to run.
+        assert mod.from_row({"apify_platforms": ["tiktok", "threads"]}).apify_platforms == (
+            "tiktok",
+        )
+
+    def test_an_empty_list_takes_the_default_rather_than_meaning_none(self):
+        # A source that is selected and can never scout is indistinguishable
+        # from a runner that has stopped working. "Neither" is said by choosing
+        # a different source.
+        assert mod.from_row({"apify_platforms": []}).apify_platforms == ("tiktok", "instagram")
+
+    def test_a_list_of_nothing_recognisable_takes_the_default(self):
+        assert mod.from_row({"apify_platforms": ["threads", "bluesky"]}).apify_platforms == (
+            "tiktok",
+            "instagram",
+        )
+
+    def test_a_value_that_is_not_a_list_takes_the_default(self):
+        assert mod.from_row({"apify_platforms": "tiktok"}).apify_platforms == (
+            "tiktok",
+            "instagram",
+        )
+
+    def test_duplicates_collapse(self):
+        assert mod.from_row({"apify_platforms": ["tiktok", "tiktok"]}).apify_platforms == (
+            "tiktok",
+        )
+
+    def test_case_and_padding_are_forgiven(self):
+        assert mod.from_row({"apify_platforms": [" TikTok "]}).apify_platforms == ("tiktok",)
+
+
+class TestTheRetiredSource:
+    def test_a_row_still_naming_tiktok_falls_back(self):
+        # TikTok-Api refused every feed, so the source was retired. An install
+        # that has not run the migration must degrade to scouting something.
+        assert mod.from_row({"trend_source": "tiktok"}).trend_source == "google_trends"
+
+    def test_the_three_live_sources_are_accepted(self):
+        for name in ("apify", "google_trends", "youtube"):
+            assert mod.from_row({"trend_source": name}).trend_source == name
+
+    def test_only_the_video_sources_count_as_video_sources(self):
+        assert mod.is_video_source("apify") is True
+        assert mod.is_video_source("youtube") is True
+        assert mod.is_video_source("google_trends") is False

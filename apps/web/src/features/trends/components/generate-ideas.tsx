@@ -12,7 +12,7 @@ import {
   isNothingToStopError,
   isUnclaimed,
   latestTrendRunQueryOptions,
-  REQUEST_UNCLAIMED_WRITE_OFF_MINUTES,
+  SCOUT_CADENCE_MINUTES,
   TREND_RUN_MINUTES,
   trendSettingsQueryOptions,
   useCancelTrendRun,
@@ -209,7 +209,7 @@ function InFlight({ run }: { run: TrendRunRow }) {
       <AlertDescription>
         {run.trigger === 'schedule' && 'This is the scheduled run. '}
         {run.status === 'requested'
-          ? 'Waiting for a scout to pick this up — usually under a minute.'
+          ? `Queued for the next scout, which runs about every ${formatMinutes(SCOUT_CADENCE_MINUTES)} — so this may wait a while before it starts.`
           : `Started ${formatRelative(started)}.`}{' '}
         A full pass takes about {formatMinutes(TREND_RUN_MINUTES)}, and new ideas appear here as soon as it finishes.
         You do not need to stay on this page.
@@ -226,17 +226,19 @@ function NobodyPickedItUp({ run }: { run: TrendRunRow }) {
       <AlertTitle>Nothing has picked this run up</AlertTitle>
       <AlertDescription>
         <span>
-          It was requested {formatRelative(run.requested_at)} and no scout has claimed it. A request is normally claimed
-          within a minute, so this usually means the dispatcher is not running.
+          It was requested {formatRelative(run.requested_at)} and no scout has claimed it. The scout runs about every{' '}
+          {formatMinutes(SCOUT_CADENCE_MINUTES)}, so a wait is normal — but this one has now missed a full cycle, which
+          usually means the scheduled job is not running.
         </span>
         <span>
-          The dispatcher is also what writes an unclaimed request off, after{' '}
-          {formatMinutes(REQUEST_UNCLAIMED_WRITE_OFF_MINUTES)} — so if this one is still here, nothing is coming to
-          clear it either.
+          The scout is a thread inside the pipeline worker, so the worker's logs are the place to look (
+          <code>docker compose logs worker</code>): a container that is down, a crash loop, or bad credentials all look
+          identical from here. Nothing will clear this row on its own — a dispatcher that is not running is not sweeping
+          either.
         </span>
         <span>
-          Stopping it clears the row from the browser, without needing the dispatcher. That frees the button — though if
-          nothing is claiming runs, the next one will sit here too.
+          Stopping it clears the row without needing the scout. That frees the button — though if nothing is claiming
+          runs, the next one will sit here too.
         </span>
         <StopRunButton run={run} />
       </AlertDescription>

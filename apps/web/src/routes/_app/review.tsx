@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { reviewQueueQueryOptions } from '@/features/queue/api';
 import { PageHeader } from '@/features/queue/components/page-header';
+import { ProductionStatusBadge } from '@/features/queue/components/production-status';
 import { EmptyQueue, ListSkeleton, QueryError } from '@/features/queue/components/query-state';
 import { formatDuration, formatRelative, formatUsd, parseQcReport } from '@/lib/format';
 
@@ -75,6 +76,7 @@ function ReviewQueuePage() {
                         {formatDuration(production.duration_seconds)}
                       </span>
                       <span>{formatUsd(production.cost_actual_usd ?? production.cost_estimate_usd)}</span>
+                      <ProductionStatusBadge production={production} />
                     </div>
                     <Button asChild size="sm">
                       <Link to="/review/$productionId" params={{ productionId: production.id }}>

@@ -4,9 +4,9 @@
 #
 # Upstream's own Dockerfile launches the Streamlit WebUI, which is not what the
 # pipeline drives -- we need the REST API in main.py. Our fork's entrypoint
-# renders config.toml from the environment and Secrets Manager first, because
-# MoneyPrinterTurbo reads all configuration from that file at import time and
-# honours only two environment overrides in its entire codebase.
+# renders config.toml from the environment first, because MoneyPrinterTurbo
+# reads all configuration from that file at import time and honours only two
+# environment overrides in its entire codebase.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -28,14 +28,13 @@ WORKDIR /MoneyPrinterTurbo
 
 COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir --upgrade pip \
- && python -m pip install --no-cache-dir -r requirements.txt \
- && python -m pip install --no-cache-dir boto3
+ && python -m pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Renders, the stock-footage cache and task state all live here. Mounted from
-# EFS in production: MoneyPrinterTurbo has no object-storage support at all, so
-# on ephemeral storage a task replacement loses every in-flight render.
+# Renders, the stock-footage cache and task state all live here. Backed by a
+# named volume: MoneyPrinterTurbo has no object-storage support at all, so on
+# ephemeral storage a restart loses every in-flight render.
 VOLUME ["/MoneyPrinterTurbo/storage"]
 
 EXPOSE 8080

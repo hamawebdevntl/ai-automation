@@ -33,6 +33,7 @@ def slideshow_risk(
     duration_s: float,
     frozen_s: float,
     scene_changes: int,
+    expect_cuts: bool = True,
 ) -> float:
     """Score 0.0 (lively) to 1.0 (a slideshow).
 
@@ -40,11 +41,22 @@ def slideshow_risk(
     fraction catches long held stills but misses a slow pan that never cuts;
     cut rate catches the absence of editing but misses a file that is 80%
     frozen between a handful of cuts.
+
+    `expect_cuts=False` drops the cut-rate signal and scores on frozen fraction
+    alone. That is for the presenter lane, where a single continuous shot of a
+    person talking is the intended output rather than a defect: scored the
+    normal way, every talking head lands at 0.40 for the crime of not being
+    edited, and a warning that fires on every video in a lane is a warning
+    nobody reads. Frozen fraction still applies, because an avatar render that
+    froze is a real failure and looks identical to a still image.
     """
     if duration_s <= 0:
         return 1.0
 
     frozen_fraction = max(0.0, min(1.0, frozen_s / duration_s))
+
+    if not expect_cuts:
+        return round(max(0.0, min(1.0, frozen_fraction)), 3)
 
     cuts_per_10s = scene_changes / (duration_s / 10.0)
     motion_deficit = max(0.0, min(1.0, 1.0 - (cuts_per_10s / TARGET_CUTS_PER_10S)))
@@ -60,6 +72,7 @@ def build_report(
     mean_volume_db: float | None,
     has_subtitles: bool,
     expect_portrait: bool = True,
+    expect_cuts: bool = True,
 ) -> QcReport:
     """Assemble `productions.qc`.
 
@@ -143,7 +156,7 @@ def build_report(
         )
     )
 
-    risk = slideshow_risk(info.duration_s, frozen_s, scene_changes)
+    risk = slideshow_risk(info.duration_s, frozen_s, scene_changes, expect_cuts=expect_cuts)
     if risk >= FAIL_AT:
         risk_status = "fail"
     elif risk >= WARN_AT:
@@ -151,16 +164,19 @@ def build_report(
     else:
         risk_status = "pass"
     frozen_pct = (frozen_s / info.duration_s * 100) if info.duration_s else 100.0
-    checks.append(
-        QcCheck(
-            key="slideshow_risk",
-            label="Motion",
-            status=risk_status,
-            detail=(
-                f"risk {risk:.2f} -- {scene_changes} cuts over {info.duration_s:.0f}s, "
-                f"{frozen_pct:.0f}% of the runtime frozen"
-            ),
+    # The detail has to match how the score was actually computed, or a
+    # reviewer reads "0 cuts" next to a pass and stops trusting the number.
+    detail = (
+        f"risk {risk:.2f} -- {scene_changes} cuts over {info.duration_s:.0f}s, "
+        f"{frozen_pct:.0f}% of the runtime frozen"
+        if expect_cuts
+        else (
+            f"risk {risk:.2f} -- single-shot lane, so cuts are not counted; "
+            f"{frozen_pct:.0f}% of the runtime frozen"
         )
+    )
+    checks.append(
+        QcCheck(key="slideshow_risk", label="Motion", status=risk_status, detail=detail)
     )
 
     return QcReport(

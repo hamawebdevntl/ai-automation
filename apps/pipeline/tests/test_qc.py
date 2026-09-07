@@ -32,6 +32,18 @@ class TestSlideshowRisk:
     def test_zero_duration_is_maximum_risk_not_a_crash(self):
         assert slideshow_risk(0.0, frozen_s=0.0, scene_changes=0) == 1.0
 
+    def test_a_single_shot_lane_is_not_penalised_for_not_cutting(self):
+        # A talking head is one continuous shot on purpose. Scored the normal
+        # way it lands at 0.40 and warns on every presenter video ever made,
+        # which is how a reviewer learns to ignore the warning.
+        assert slideshow_risk(30.0, frozen_s=0.0, scene_changes=0) >= 0.35
+        assert slideshow_risk(30.0, frozen_s=0.0, scene_changes=0, expect_cuts=False) < 0.35
+
+    def test_a_frozen_presenter_is_still_caught(self):
+        # Dropping the cut signal must not drop the one that matters here: an
+        # avatar render that stalled is indistinguishable from a still image.
+        assert slideshow_risk(30.0, frozen_s=25.0, scene_changes=0, expect_cuts=False) >= 0.6
+
     def test_score_is_bounded(self):
         assert slideshow_risk(10.0, frozen_s=999.0, scene_changes=0) <= 1.0
 
@@ -64,6 +76,16 @@ class TestReport:
                          mean_volume_db=-18.0, has_subtitles=False)
         assert r.passed is True
         assert any(c.key == "captions" and c.status == "warn" for c in r.checks)
+
+    def test_a_presenter_render_passes_without_a_motion_warning(self):
+        r = build_report(info(), frozen_s=0.0, scene_changes=0,
+                         mean_volume_db=-18.0, has_subtitles=True, expect_cuts=False)
+        assert r.passed is True
+        motion = next(c for c in r.checks if c.key == "slideshow_risk")
+        assert motion.status == "pass"
+        # The detail has to explain why cuts were not counted, or the number
+        # next to "0 cuts" reads as a bug in the check.
+        assert "single-shot" in motion.detail
 
     def test_a_slideshow_fails_the_report_not_just_the_score(self):
         r = build_report(info(), frozen_s=25.0, scene_changes=1,

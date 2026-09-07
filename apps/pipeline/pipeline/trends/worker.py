@@ -1,12 +1,14 @@
-"""The trend scout as a scheduled job, with no AWS behind it.
+"""The trend scout's dispatcher and the scout, in one process.
 
-On AWS this is two pieces: `dispatch_trend_runs`, a Lambda that fires every
-minute and decides whether to start anything, and a Fargate task that does the
-scouting. That split exists because a Lambda cannot run a browser for an hour.
+On AWS this was two pieces: `dispatch_trend_runs`, a Lambda that fired every
+minute and decided whether to start anything, and a Fargate task that did the
+scouting. That split existed because a Lambda cannot run for an hour.
 
-A CI runner has no such constraint -- it is a machine that boots, does one
-thing and exits -- so both halves collapse into this: decide whether there is
-work, and if there is, do it in the same process.
+Neither a CI runner nor a worker on a VPS has that constraint, so both halves
+collapse into this: decide whether there is work, and if there is, do it in the
+same process. It was written for GitHub Actions and is now the only
+implementation -- `pipeline.driver.worker` calls it on a timer, and the AWS
+dispatcher it replaced has been deleted rather than ported.
 
 What it deliberately keeps from the AWS path:
 
@@ -18,14 +20,15 @@ What it deliberately keeps from the AWS path:
     moving the runner does not move the schedule into a cron expression nobody
     can edit -- which was the whole point of making it a setting.
 
-What it changes: the granularity. A workflow cron cannot fire every minute
-without spending the free tier on doing nothing, so this runs hourly and a
-scheduled slot starts at the top of the hour following it. A run the owner
-asks for waits at most that long too, unless something triggers the workflow
-sooner.
+Granularity came back with the move off GitHub Actions. A workflow cron cannot
+fire every minute without spending the free tier on doing nothing, so the CI
+version ran hourly and a scheduled slot started at the top of the hour after it.
+A thread has no such cost, so this runs every minute again -- which is what the
+owner's schedule in `trend_settings` was designed for, and what the EventBridge
+dispatcher used to give it.
 
-Exits 0 with nothing done when there is no work. That is the common case --
-most invocations of this find an empty queue and stop within seconds.
+Returns having done nothing when there is no work, which is the common case:
+most calls find an empty queue and return within milliseconds.
 """
 
 from __future__ import annotations
@@ -36,7 +39,6 @@ import sys
 from typing import Any
 
 from pipeline.activities.reconcile import (
-    REQUEST_STALE_MINUTES,
     RUN_STALE_HOURS,
     open_due_scheduled_run,
 )
@@ -47,19 +49,39 @@ log = logging.getLogger(__name__)
 
 
 def _write_off_stale(supa: Supa) -> list[str]:
-    """Clear runs that will never finish, so they stop holding the lock.
+    """Clear *claimed* runs that will never finish, so they stop holding the lock.
 
-    The same job the AWS sweeper does, and needed for the same reason: at most
-    one run may be in flight, so a job cancelled mid-scout -- which on a CI
-    runner means the whole machine vanished without warning -- would otherwise
-    block every future run rather than just its own.
+    At most one run may be in flight, so a run whose process vanished mid-scout
+    would otherwise block every future run rather than just its own.
 
-    A CI runner makes this more likely than Fargate did, not less: workflows
-    get cancelled, time out, and lose their machine to spot reclamation.
+    Unclaimed requests are deliberately left alone, and that is the whole
+    difference between this and the AWS sweeper it replaced. That one gave up on
+    any request older than ten minutes, on the reasoning that its dispatcher ran
+    every minute so ten of them missing a request meant it was not running.
+
+    That reasoning does not transfer, and the cadence is not why. There, the
+    dispatcher and the scout were separate -- a Lambda deciding, a Fargate task
+    doing -- so a request could genuinely sit unclaimed. Here they are the same
+    process: the next thing this function's caller does is claim the request,
+    whatever its age. Reaping it first would mean writing off a request a few
+    lines before claiming it.
+
+    That is not hypothetical; it is the incident this comment exists for. While
+    this ran as an hourly cron the ten-minute rule meant a button pressed more
+    than ten minutes before the run fired was written off by the process about
+    to serve it -- so the button worked for ten minutes in every sixty and spent
+    the other fifty reporting "gave up on a run left requested with nothing
+    running it", a sweeper describing a stall it had caused itself. Restoring
+    the rule now that the dispatcher runs every minute again would shrink that
+    window rather than close it, and it would reopen the moment anything
+    delayed the thread.
+
+    A request only strands if this process has stopped running -- and then no
+    sweeper of ours is running either, which is what Stop in the app is for.
     """
     expired: list[str] = []
     for row in supa.stale_trend_runs(
-        running_hours=RUN_STALE_HOURS, requested_minutes=REQUEST_STALE_MINUTES
+        running_hours=RUN_STALE_HOURS, requested_minutes=None
     ):
         supa.finish_trend_run(
             row["id"],
@@ -72,10 +94,11 @@ def _write_off_stale(supa: Supa) -> list[str]:
     return expired
 
 
-def main() -> int:
+def main(supa: Supa | None = None) -> int:
     """Claim a run if there is one, and carry it out. Returns an exit code."""
-    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-    supa = Supa()
+    if supa is None:
+        logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+        supa = Supa()
 
     _write_off_stale(supa)
 
@@ -96,9 +119,13 @@ def main() -> int:
     run_id = str(run["id"])
     log.info("claimed run %s (%s)", run_id, run.get("trigger", "manual"))
 
-    # `runner.main` reads this to know which row to report into, and the scout
-    # reads it to notice being stopped from the app.
-    os.environ["TREND_RUN_ID"] = run_id
+    # The run id is passed as an argument and never through the environment.
+    # It used to be set here as `os.environ["TREND_RUN_ID"]`, which was wrong in
+    # two ways that cancelled each other out: it is process-global, so it would
+    # race between this thread and anything else in the worker -- and it never
+    # took effect anyway, because `settings()` is `lru_cache`d and would not
+    # have re-read it. `runner.run` takes the id directly, and the cancellation
+    # check is built from that parameter.
 
     try:
         result: dict[str, Any] = runner.run(supa, run_id=run_id)

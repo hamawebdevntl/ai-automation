@@ -19,9 +19,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import boto3
-from botocore.exceptions import ClientError
-
 from pipeline.activities import publish as publish_mod
 from pipeline.clients.mpt import MptClient, MptError, MptTaskStateLost
 from pipeline.clients.supa import Supa
@@ -38,7 +35,10 @@ RENDER_STALE_MINUTES = 2
 # progress 0, and is indistinguishable from a running one, so give a job that
 # has not started a far longer leash than one that has stalled mid-render.
 NOT_STARTED_GRACE_MINUTES = 45
-LIVE_STATUSES = ("queued", "running", "awaiting_review", "qc_failed", "publishing")
+# The Step Functions state machine carried `TimeoutSeconds: 2592000` at the top
+# level. Kept, but narrowed: `expired_runs` exempts a production sitting at
+# Gate 2, because that clock was measuring the machine, not the owner.
+RUN_TIMEOUT_DAYS = 30
 
 
 def _now() -> datetime:
@@ -65,8 +65,23 @@ def _stale(raw: Any, minutes: int) -> bool:
 
 
 def reconcile_renders(supa: Supa | None = None, mpt: MptClient | None = None) -> dict[str, Any]:
+    """Park renders that MoneyPrinterTurbo will never finish.
+
+    Skips rather than raises when MPT is not configured, for the same reason
+    `reconcile_publishes` skips when publishing is off: rendering is a
+    deployable half of this system, and a sweeper that throws on every tick of
+    a deployment that has deliberately left it out is noise standing exactly
+    where a real failure would appear.
+
+    Note this is not the same as MPT being *down*. An unreachable MPT still
+    raises `MptError` per row below and is logged as the outage it is; this is
+    only the case where no render backend was ever configured.
+    """
     supa = supa or Supa()
-    mpt = mpt or MptClient()
+    if mpt is None:
+        if not settings().mpt_base_url:
+            return {"skipped": "MPT_BASE_URL is not set"}
+        mpt = MptClient()
 
     rows = (
         supa.raw.table("productions")
@@ -122,41 +137,65 @@ def reconcile_renders(supa: Supa | None = None, mpt: MptClient | None = None) ->
 
 
 # ---------------------------------------------------------------------------
-# B -- executions
+# B -- leases
 # ---------------------------------------------------------------------------
 
+# How many times a worker may die on the same row before we stop handing it out.
+MAX_LEASE_EXPIRIES = 5
 
-def reconcile_executions(supa: Supa | None = None) -> dict[str, Any]:
-    """Catch rows whose state machine is no longer running.
 
-    This is the only thing that detects a dead Gate 2 token: the row sits at
-    awaiting_review looking perfectly healthy, and the owner's decision would
-    resume nothing.
+def reconcile_leases(supa: Supa | None = None) -> dict[str, Any]:
+    """Rows the driver cannot make progress on by itself.
+
+    This replaced `reconcile_executions`, but it is a different job rather than
+    a port. That function existed to detect a dead Gate 2 task token -- "the row
+    sits at awaiting_review looking perfectly healthy, and the owner's decision
+    would resume nothing". There is no token now, so that failure cannot happen
+    and the function has nothing to do.
+
+    What is left is narrower. Note first what is NOT here: an expired lease is
+    the ordinary recovery path, not an error. A worker that stops mid-step
+    leaves a lease that lapses, and the very next claim picks the row up and
+    carries on. Sweeping those would be sweeping the mechanism working.
+
+    Two things the claim genuinely cannot resolve:
+
+      * a row that kills whichever worker claims it. The lease lapses, the row
+        is re-claimed, the worker dies again -- which is what an out-of-memory
+        `fetch_and_qc` looks like from here. Re-driving it forever is a loop.
+      * a row the driver never picked up at all. `reconcile_renders` cannot see
+        these: it only looks at rows already `running`.
+
+    And the old top-level 30-day execution timeout, narrowed to exempt a
+    production waiting on a human -- see `expired_runs` below.
     """
     supa = supa or Supa()
-    sfn = boto3.client("stepfunctions")
 
-    rows = (
-        supa.raw.table("productions")
-        .select("id,status,execution_arn,updated_at")
-        .in_("status", list(LIVE_STATUSES))
-        .execute()
-    ).data or []
+    parked: list[str] = []
 
-    parked = []
-    for row in rows:
-        arn = row.get("execution_arn")
-        if not arn:
-            continue
-        try:
-            described = sfn.describe_execution(executionArn=arn)
-        except ClientError as exc:
-            log.warning("describe_execution failed for %s: %s", row["id"], exc)
-            continue
-        state = described.get("status")
-        if state != "RUNNING":
-            supa.park(row["id"], f"row is {row['status']} but its execution is {state}")
+    for row in supa.repeatedly_expired_leases(MAX_LEASE_EXPIRIES):
+        state = row.get("run_state") or {}
+        supa.park(
+            row["id"],
+            f"the driver died {state.get('lease_expiries')} times on step "
+            f"{state.get('step') or 'unknown'} -- it needs a person, not another attempt",
+        )
+        parked.append(row["id"])
+
+    for row in supa.unstarted_productions():
+        # Opened by Gate 1 and never claimed. Only real when the driver was
+        # down; the grace is generous for the same reason it is in
+        # `reconcile_renders` -- a queue is not a stall.
+        if _stale(row.get("created_at"), NOT_STARTED_GRACE_MINUTES):
+            supa.park(row["id"], "queued but never claimed -- was the driver running?")
             parked.append(row["id"])
+
+    for row in supa.expired_runs(RUN_TIMEOUT_DAYS):
+        supa.park(row["id"], f"still running {RUN_TIMEOUT_DAYS} days after it opened")
+        parked.append(row["id"])
+
+    if parked:
+        log.warning("lease reconciler parked %d production(s): %s", len(parked), parked)
     return {"parked": parked}
 
 
@@ -168,7 +207,7 @@ def reconcile_executions(supa: Supa | None = None) -> dict[str, Any]:
 def reconcile_publishes(supa: Supa | None = None) -> dict[str, Any]:
     """The only publish-failure detector that exists."""
     if not settings().publishing_enabled:
-        return {"skipped": "publishing is disabled (postiz_enabled=false)"}
+        return {"skipped": "publishing is disabled (PUBLISHING_ENABLED=false)"}
 
     supa = supa or Supa()
     rows = (
@@ -205,7 +244,12 @@ def reap_mpt_tasks(supa: Supa | None = None, mpt: MptClient | None = None) -> di
     reached a terminal state and the video is already in our own storage.
     """
     supa = supa or Supa()
-    mpt = mpt or MptClient()
+    if mpt is None:
+        # Same reasoning as `reconcile_renders`: nothing to reap when no render
+        # backend is configured.
+        if not settings().mpt_base_url:
+            return {"skipped": "MPT_BASE_URL is not set"}
+        mpt = MptClient()
 
     terminal = (
         supa.raw.table("productions")
@@ -274,52 +318,16 @@ def _scout_controls(supa: Supa) -> ScoutControls:
         return ScoutControls()
 
 
-def stop_cancelled_tasks(supa: Supa) -> list[str]:
-    """Kill the Fargate task behind a run the owner stopped.
-
-    Cancelling is deliberately a pure database operation -- it has to work when
-    this dispatcher is not running, since a dispatcher that is not running is
-    the most common reason a run gets stuck in the first place. The cost of
-    that choice is that the row can be `cancelled` while the browser session it
-    was protecting is still going.
-
-    Two things close that window, and neither is sufficient alone. This is the
-    first: an `ecs:StopTask` within the minute, which works even against a task
-    that has stopped responding. The second is the scout checking its own row
-    between hashtags, which works even when this Lambda is the thing that is
-    broken. Together they cover each other's failure, and the three-hour
-    write-off is the backstop behind both.
-
-    Never raises. A run that cannot be stopped is already out of the way of
-    every future run -- the lock was freed when it was cancelled -- so failing
-    here is untidy rather than harmful, and must not take the rest of the sweep
-    down with it.
-    """
-    stopped: list[str] = []
-    cfg = settings()
-    if not cfg.trends_cluster_arn:
-        return stopped
-
-    for row in supa.cancelled_runs_needing_stop():
-        try:
-            boto3.client("ecs").stop_task(
-                cluster=cfg.trends_cluster_arn,
-                task=row["task_arn"],
-                reason="stopped from the app",
-            )
-            stopped.append(row["id"])
-            log.info("stopped the task for cancelled run %s", row["id"])
-        except ClientError as exc:
-            # A task that has already exited is the expected failure here, not
-            # an exceptional one: the scout may well have noticed the
-            # cancellation and stopped itself first, which is the system
-            # working. Logged at info for that reason.
-            log.info("could not stop the task for run %s: %s", row["id"], exc)
-        finally:
-            # Recorded either way. See `Supa.mark_task_stopped` -- this is what
-            # stops an unstoppable task being retried every minute forever.
-            supa.mark_task_stopped(row["id"])
-    return stopped
+# `stop_cancelled_tasks` lived here and is gone with ECS.
+#
+# It called `ecs:StopTask` on the Fargate task behind a run the owner had
+# cancelled -- one of the two halves that closed the window between a row being
+# marked `cancelled` and the browser session it was protecting actually
+# stopping. The other half is the scout checking its own row between hashtags,
+# and that half is the one that never needed AWS. It is now the whole
+# mechanism, and it is the better of the two: it works when the dispatcher is
+# the broken part, and the dispatcher is now in the same process as the scout
+# anyway, so the failure the first half covered no longer has a way to happen.
 
 
 def open_due_scheduled_run(supa: Supa, now: datetime | None = None) -> dict[str, Any] | None:
@@ -361,174 +369,23 @@ def open_due_scheduled_run(supa: Supa, now: datetime | None = None) -> dict[str,
 # early produces nothing at all, so the cost of waiting too long is a late
 # button and the cost of giving up too early is a wasted hour of scouting.
 RUN_STALE_HOURS = 3
-# A request the dispatcher never picked up. This one can be short -- the
-# dispatcher runs every minute, so ten of them missing it means it is not
-# running or ecs:RunTask is failing in a way that never reached the row.
+# A request the dispatcher never picked up. This can be short again: the
+# dispatcher is a thread in the worker running every minute, so ten of them
+# missing a request means it is not running. It was widened to `None` while
+# the dispatcher was an hourly GitHub Actions cron, where ten minutes of
+# silence was the normal state rather than evidence of anything.
 REQUEST_STALE_MINUTES = 10
 
 
-def dispatch_trend_runs(supa: Supa | None = None) -> dict[str, Any]:
-    """Start the Fargate task for a trend run, requested or scheduled.
-
-    The app has no way to call AWS -- there is no server tier -- so a request
-    is a row, and this is what acts on it. Same shape as every other write in
-    this system: Postgres records the intention, a scheduled job carries it out.
-
-    Since the schedule became a setting rather than a cron, this is also what
-    decides that a run is due. That is why it does three things in a fixed
-    order, and the order is the interesting part:
-
-      0. Stop the task behind any run an owner cancelled. First because it is
-         the only step that is racing something -- a live browser session that
-         no longer holds the lock protecting it.
-      1. Write off runs that will never finish. At most one run may be in
-         flight, which means a single crashed task disables both the button
-         and the schedule until something clears the row. If that clearing
-         only happened after a successful claim, the one state that needs
-         recovering would be the one state that never recovers.
-      2. Open a run if the owner's schedule says one is due -- which can only
-         succeed once step 1 has freed the lock.
-      3. Claim whatever is waiting and start it. A run opened in step 2 is
-         started by step 3 on the same tick, so the schedule is accurate to
-         the minute rather than to the next sweep.
-    """
-    supa = supa or Supa()
-
-    # Isolated for the same reason the schedule step below is: this sweep is
-    # also the only thing that recovers a stuck run and the only thing that
-    # starts a run the owner asked for. Neither may stop happening because an
-    # ecs:StopTask misbehaved.
-    try:
-        cancelled = stop_cancelled_tasks(supa)
-    except Exception as exc:  # noqa: BLE001 - see above
-        log.warning("could not stop cancelled trend tasks: %s", exc)
-        cancelled = []
-
-    expired = []
-    for row in supa.stale_trend_runs(
-        running_hours=RUN_STALE_HOURS, requested_minutes=REQUEST_STALE_MINUTES
-    ):
-        was = row["status"]
-        supa.finish_trend_run(
-            row["id"],
-            status="failed",
-            error=(
-                f"gave up on a run left {was} for more than "
-                + (
-                    f"{RUN_STALE_HOURS}h"
-                    if was == "running"
-                    else f"{REQUEST_STALE_MINUTES} minutes without starting"
-                )
-            ),
-        )
-        expired.append(row["id"])
-    if expired:
-        log.warning("wrote off %d stalled trend run(s): %s", len(expired), expired)
-
-    # Between the write-off and the claim: a slot that was due while a dead run
-    # held the lock is startable now, and one opened here is claimed below.
-    #
-    # Isolated from the rest of the sweep on purpose. This function is also the
-    # only thing that writes off a stuck run and the only thing that starts a
-    # run the owner asked for, and neither should stop happening because the
-    # schedule could not be read or a slot insert misbehaved.
-    try:
-        scheduled = open_due_scheduled_run(supa)
-    except Exception as exc:  # noqa: BLE001 - see above
-        log.warning("could not open a scheduled trend run: %s", exc)
-        scheduled = None
-
-    run = supa.claim_trend_run()
-    if run is None:
-        return {"cancelled": cancelled, "expired": expired, "scheduled": None, "started": None}
-
-    cfg = settings()
-    missing = [
-        name
-        for name, value in (
-            ("TRENDS_CLUSTER_ARN", cfg.trends_cluster_arn),
-            ("TRENDS_TASK_DEFINITION", cfg.trends_task_definition),
-            ("TRENDS_SUBNET_IDS", cfg.trends_subnet_ids),
-        )
-        if not value
-    ]
-    if missing:
-        # Configuration, not weather. Fail the row rather than leaving it
-        # claimed, so the owner sees why instead of watching a spinner.
-        reason = f"the trend task is not configured for on-demand runs: {', '.join(missing)} unset"
-        supa.finish_trend_run(run["id"], status="failed", error=reason)
-        log.error("%s", reason)
-        return {
-            "cancelled": cancelled,
-            "expired": expired,
-            "scheduled": _slot_of(scheduled),
-            "started": None,
-            "error": reason,
-        }
-
-    try:
-        started = boto3.client("ecs").run_task(
-            cluster=cfg.trends_cluster_arn,
-            taskDefinition=cfg.trends_task_definition,
-            launchType="FARGATE",
-            networkConfiguration={
-                "awsvpcConfiguration": {
-                    "subnets": cfg.trends_subnet_id_list,
-                    "securityGroups": cfg.trends_security_group_id_list,
-                    # Egress goes out through the NAT gateway, exactly as the
-                    # scheduled run does.
-                    "assignPublicIp": "DISABLED",
-                }
-            },
-            overrides={
-                "containerOverrides": [
-                    {
-                        "name": "trends",
-                        # How the task knows which row to report back into.
-                        "environment": [{"name": "TREND_RUN_ID", "value": run["id"]}],
-                    }
-                ]
-            },
-        )
-    except ClientError as exc:
-        supa.finish_trend_run(run["id"], status="failed", error=f"could not start the task: {exc}")
-        log.exception("ecs:RunTask failed for trend run %s", run["id"])
-        return {
-            "cancelled": cancelled,
-            "expired": expired,
-            "scheduled": _slot_of(scheduled),
-            "started": None,
-            "error": str(exc),
-        }
-
-    # RunTask answers 200 even when it started nothing: a task that cannot be
-    # placed comes back in `failures`, with `tasks` empty.
-    tasks = started.get("tasks") or []
-    if not tasks:
-        reason = f"ECS accepted the request but placed no task: {started.get('failures')}"
-        supa.finish_trend_run(run["id"], status="failed", error=reason)
-        log.error("%s", reason)
-        return {
-            "cancelled": cancelled,
-            "expired": expired,
-            "scheduled": _slot_of(scheduled),
-            "started": None,
-            "error": reason,
-        }
-
-    arn = tasks[0].get("taskArn")
-    supa.raw.table("trend_runs").update({"task_arn": arn}).eq("id", run["id"]).execute()
-    log.info("started trend run %s as %s", run["id"], arn)
-    return {
-        "cancelled": cancelled,
-        "expired": expired,
-        "scheduled": _slot_of(scheduled),
-        "started": run["id"],
-        "trigger": run.get("trigger", "manual"),
-        "task_arn": arn,
-    }
-
-
-def _slot_of(run: dict[str, Any] | None) -> str | None:
-    """The slot a scheduled run was opened for, for the sweep's own log line."""
-    return (run or {}).get("scheduled_for")
+# `dispatch_trend_runs` lived here and is gone with ECS.
+#
+# It was a Lambda firing every minute that decided whether to start a trend run
+# and then called `ecs:RunTask`, because a Lambda cannot run a browser for an
+# hour. That split was an AWS constraint, not a design: a worker on a VPS is a
+# process that can simply do both.
+#
+# `pipeline.trends.worker.main` already collapsed the two halves for the GitHub
+# Actions path, and it is now the only implementation -- the driver runs it on
+# its own thread. Everything this function did survives there: the write-off of
+# stalled runs, `open_due_scheduled_run` below, the single in-flight claim, and
+# the run reporting back into its own row.

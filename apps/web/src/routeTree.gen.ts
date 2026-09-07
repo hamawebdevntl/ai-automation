@@ -18,8 +18,9 @@ import { Route as ResetPasswordRouteImport } from './routes/reset-password';
 import { Route as AppQueueRouteImport } from './routes/_app/queue';
 import { Route as AppReviewRouteImport } from './routes/_app/review';
 import { Route as AppSettingsRouteImport } from './routes/_app/settings';
-import { Route as AppQueueIdeaIdRouteImport } from './routes/_app/queue.$ideaId';
-import { Route as AppReviewProductionIdRouteImport } from './routes/_app/review.$productionId';
+import { Route as AppProductionsProductionIdRouteImport } from './routes/_app/productions_.$productionId';
+import { Route as AppQueueIdeaIdRouteImport } from './routes/_app/queue_.$ideaId';
+import { Route as AppReviewProductionIdRouteImport } from './routes/_app/review_.$productionId';
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -65,15 +66,21 @@ const AppSettingsRoute = AppSettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => AppRoute,
 } as any);
+const AppProductionsProductionIdRoute =
+  AppProductionsProductionIdRouteImport.update({
+    id: '/productions_/$productionId',
+    path: '/productions/$productionId',
+    getParentRoute: () => AppRoute,
+  } as any);
 const AppQueueIdeaIdRoute = AppQueueIdeaIdRouteImport.update({
-  id: '/$ideaId',
-  path: '/$ideaId',
-  getParentRoute: () => AppQueueRoute,
+  id: '/queue_/$ideaId',
+  path: '/queue/$ideaId',
+  getParentRoute: () => AppRoute,
 } as any);
 const AppReviewProductionIdRoute = AppReviewProductionIdRouteImport.update({
-  id: '/$productionId',
-  path: '/$productionId',
-  getParentRoute: () => AppReviewRoute,
+  id: '/review_/$productionId',
+  path: '/review/$productionId',
+  getParentRoute: () => AppRoute,
 } as any);
 
 export interface FileRoutesByFullPath {
@@ -82,9 +89,10 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute;
   '/register': typeof RegisterRoute;
   '/reset-password': typeof ResetPasswordRoute;
-  '/queue': typeof AppQueueRouteWithChildren;
-  '/review': typeof AppReviewRouteWithChildren;
+  '/queue': typeof AppQueueRoute;
+  '/review': typeof AppReviewRoute;
   '/settings': typeof AppSettingsRoute;
+  '/productions/$productionId': typeof AppProductionsProductionIdRoute;
   '/queue/$ideaId': typeof AppQueueIdeaIdRoute;
   '/review/$productionId': typeof AppReviewProductionIdRoute;
 }
@@ -94,9 +102,10 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute;
   '/register': typeof RegisterRoute;
   '/reset-password': typeof ResetPasswordRoute;
-  '/queue': typeof AppQueueRouteWithChildren;
-  '/review': typeof AppReviewRouteWithChildren;
+  '/queue': typeof AppQueueRoute;
+  '/review': typeof AppReviewRoute;
   '/settings': typeof AppSettingsRoute;
+  '/productions/$productionId': typeof AppProductionsProductionIdRoute;
   '/queue/$ideaId': typeof AppQueueIdeaIdRoute;
   '/review/$productionId': typeof AppReviewProductionIdRoute;
 }
@@ -108,11 +117,12 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute;
   '/register': typeof RegisterRoute;
   '/reset-password': typeof ResetPasswordRoute;
-  '/_app/queue': typeof AppQueueRouteWithChildren;
-  '/_app/review': typeof AppReviewRouteWithChildren;
+  '/_app/queue': typeof AppQueueRoute;
+  '/_app/review': typeof AppReviewRoute;
   '/_app/settings': typeof AppSettingsRoute;
-  '/_app/queue/$ideaId': typeof AppQueueIdeaIdRoute;
-  '/_app/review/$productionId': typeof AppReviewProductionIdRoute;
+  '/_app/productions_/$productionId': typeof AppProductionsProductionIdRoute;
+  '/_app/queue_/$ideaId': typeof AppQueueIdeaIdRoute;
+  '/_app/review_/$productionId': typeof AppReviewProductionIdRoute;
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath;
@@ -125,6 +135,7 @@ export interface FileRouteTypes {
     | '/queue'
     | '/review'
     | '/settings'
+    | '/productions/$productionId'
     | '/queue/$ideaId'
     | '/review/$productionId';
   fileRoutesByTo: FileRoutesByTo;
@@ -137,6 +148,7 @@ export interface FileRouteTypes {
     | '/queue'
     | '/review'
     | '/settings'
+    | '/productions/$productionId'
     | '/queue/$ideaId'
     | '/review/$productionId';
   id:
@@ -150,8 +162,9 @@ export interface FileRouteTypes {
     | '/_app/queue'
     | '/_app/review'
     | '/_app/settings'
-    | '/_app/queue/$ideaId'
-    | '/_app/review/$productionId';
+    | '/_app/productions_/$productionId'
+    | '/_app/queue_/$ideaId'
+    | '/_app/review_/$productionId';
   fileRoutesById: FileRoutesById;
 }
 export interface RootRouteChildren {
@@ -228,57 +241,46 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsRouteImport;
       parentRoute: typeof AppRoute;
     };
-    '/_app/queue/$ideaId': {
-      id: '/_app/queue/$ideaId';
-      path: '/$ideaId';
+    '/_app/productions_/$productionId': {
+      id: '/_app/productions_/$productionId';
+      path: '/productions/$productionId';
+      fullPath: '/productions/$productionId';
+      preLoaderRoute: typeof AppProductionsProductionIdRouteImport;
+      parentRoute: typeof AppRoute;
+    };
+    '/_app/queue_/$ideaId': {
+      id: '/_app/queue_/$ideaId';
+      path: '/queue/$ideaId';
       fullPath: '/queue/$ideaId';
       preLoaderRoute: typeof AppQueueIdeaIdRouteImport;
-      parentRoute: typeof AppQueueRoute;
+      parentRoute: typeof AppRoute;
     };
-    '/_app/review/$productionId': {
-      id: '/_app/review/$productionId';
-      path: '/$productionId';
+    '/_app/review_/$productionId': {
+      id: '/_app/review_/$productionId';
+      path: '/review/$productionId';
       fullPath: '/review/$productionId';
       preLoaderRoute: typeof AppReviewProductionIdRouteImport;
-      parentRoute: typeof AppReviewRoute;
+      parentRoute: typeof AppRoute;
     };
   }
 }
 
-interface AppQueueRouteChildren {
+interface AppRouteChildren {
+  AppQueueRoute: typeof AppQueueRoute;
+  AppReviewRoute: typeof AppReviewRoute;
+  AppSettingsRoute: typeof AppSettingsRoute;
+  AppProductionsProductionIdRoute: typeof AppProductionsProductionIdRoute;
   AppQueueIdeaIdRoute: typeof AppQueueIdeaIdRoute;
-}
-
-const AppQueueRouteChildren: AppQueueRouteChildren = {
-  AppQueueIdeaIdRoute: AppQueueIdeaIdRoute,
-};
-
-const AppQueueRouteWithChildren = AppQueueRoute._addFileChildren(
-  AppQueueRouteChildren,
-);
-
-interface AppReviewRouteChildren {
   AppReviewProductionIdRoute: typeof AppReviewProductionIdRoute;
 }
 
-const AppReviewRouteChildren: AppReviewRouteChildren = {
-  AppReviewProductionIdRoute: AppReviewProductionIdRoute,
-};
-
-const AppReviewRouteWithChildren = AppReviewRoute._addFileChildren(
-  AppReviewRouteChildren,
-);
-
-interface AppRouteChildren {
-  AppQueueRoute: typeof AppQueueRouteWithChildren;
-  AppReviewRoute: typeof AppReviewRouteWithChildren;
-  AppSettingsRoute: typeof AppSettingsRoute;
-}
-
 const AppRouteChildren: AppRouteChildren = {
-  AppQueueRoute: AppQueueRouteWithChildren,
-  AppReviewRoute: AppReviewRouteWithChildren,
+  AppQueueRoute: AppQueueRoute,
+  AppReviewRoute: AppReviewRoute,
   AppSettingsRoute: AppSettingsRoute,
+  AppProductionsProductionIdRoute: AppProductionsProductionIdRoute,
+  AppQueueIdeaIdRoute: AppQueueIdeaIdRoute,
+  AppReviewProductionIdRoute: AppReviewProductionIdRoute,
 };
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren);

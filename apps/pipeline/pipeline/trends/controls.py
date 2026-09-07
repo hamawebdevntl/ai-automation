@@ -53,6 +53,10 @@ DEFAULT_SCHEDULE_DAYS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6)
 DEFAULT_MAX_VIDEO_AGE_DAYS = 30
 
 DEFAULT_MIN_PLAYS = 0
+# Google Trends reports interest as 0-100 against a term's own peak, so no
+# floor is the right default: the *rise* is what this source measures, and the
+# ratio check already covers it.
+DEFAULT_MIN_INTEREST = 0
 DEFAULT_MIN_ENGAGEMENT_RATE = 0.0
 # Was `Signal.is_worth_surfacing`, a hardcoded `ratio >= 1.5`.
 DEFAULT_MIN_OUTLIER_RATIO = 1.5
@@ -93,6 +97,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "schedule_minute_utc": (0, 59),
     "max_video_age_days": (1, 365),
     "min_plays": (0, 100_000_000),
+    "min_interest": (0, 100),
     "min_engagement_rate": (0.0, 0.5),
     "min_outlier_ratio": (1.0, 50.0),
     "videos_per_hashtag": (5, 100),
@@ -112,6 +117,40 @@ BLOCKLIST_MAX_WORD_LENGTH = 60
 
 PROVIDERS = ("claude", "gemini")
 
+# Where signals come from.
+#
+# `tiktok` is gone from this tuple, though `tiktok.py` is still in the tree. It
+# drove a browser through TikTok-Api, which is refused on every feed and pinned
+# at a release that was already five months old; offering it was offering a
+# source that reports success and finds nothing. `apify` is how TikTok signals
+# are read now -- a hosted scraper somebody else keeps working -- and it brings
+# Instagram with it, which had no trend source at all.
+#
+# The module stays because the code is sound and the arms race is not settled
+# forever. Restoring it is adding a string here.
+SOURCES = ("apify", "google_trends", "youtube")
+DEFAULT_TREND_SOURCE = "google_trends"
+
+# The sources that measure videos rather than search demand.
+#
+# A tuple rather than `!= "google_trends"` at each site, because the question
+# is asked in five places and the negation stops being true the moment a second
+# search-demand source arrives. Everything that separates a view count from an
+# interest score keys off this: which filters apply, which vocabulary is read,
+# and which half of the Settings card is shown.
+VIDEO_SOURCES = ("apify", "youtube")
+
+# Which platforms the Apify source scrapes. Both by default: they answer the
+# same question about different audiences, and a run that scouts neither is a
+# source selected with nothing to do.
+APIFY_PLATFORMS = ("tiktok", "instagram")
+DEFAULT_APIFY_PLATFORMS: tuple[str, ...] = APIFY_PLATFORMS
+
+
+def is_video_source(source: str) -> bool:
+    """Whether this source measures videos, and so has authors and view counts."""
+    return source in VIDEO_SOURCES
+
 
 @dataclass(frozen=True)
 class ScoutControls:
@@ -124,6 +163,7 @@ class ScoutControls:
 
     max_video_age_days: int = DEFAULT_MAX_VIDEO_AGE_DAYS
     min_plays: int = DEFAULT_MIN_PLAYS
+    min_interest: int = DEFAULT_MIN_INTEREST
     min_engagement_rate: float = DEFAULT_MIN_ENGAGEMENT_RATE
     min_outlier_ratio: float = DEFAULT_MIN_OUTLIER_RATIO
     caption_blocklist: tuple[str, ...] = DEFAULT_CAPTION_BLOCKLIST
@@ -139,6 +179,13 @@ class ScoutControls:
     dedup_window_days: int = DEFAULT_DEDUP_WINDOW_DAYS
     idea_expiry_days: int = DEFAULT_IDEA_EXPIRY_DAYS
     idea_provider: str = DEFAULT_IDEA_PROVIDER
+
+    trend_source: str = DEFAULT_TREND_SOURCE
+    # Google Trends only. Empty means worldwide, which is the honest default:
+    # nothing in the pipeline knows where this business sells.
+    trend_geo: str = ""
+    # Apify only. Which platforms its scrapers are pointed at.
+    apify_platforms: tuple[str, ...] = DEFAULT_APIFY_PLATFORMS
 
     @property
     def run_budget_seconds(self) -> float | None:
@@ -163,6 +210,7 @@ def from_row(row: dict[str, Any] | None) -> ScoutControls:
         schedule_days=_days(row.get("schedule_days")),
         max_video_age_days=_int(row, "max_video_age_days", DEFAULT_MAX_VIDEO_AGE_DAYS),
         min_plays=_int(row, "min_plays", DEFAULT_MIN_PLAYS),
+        min_interest=_int(row, "min_interest", DEFAULT_MIN_INTEREST),
         min_engagement_rate=_float(row, "min_engagement_rate", DEFAULT_MIN_ENGAGEMENT_RATE),
         min_outlier_ratio=_float(row, "min_outlier_ratio", DEFAULT_MIN_OUTLIER_RATIO),
         caption_blocklist=normalise_blocklist(row.get("caption_blocklist")),
@@ -177,6 +225,9 @@ def from_row(row: dict[str, Any] | None) -> ScoutControls:
         dedup_window_days=_int(row, "dedup_window_days", DEFAULT_DEDUP_WINDOW_DAYS),
         idea_expiry_days=_int(row, "idea_expiry_days", DEFAULT_IDEA_EXPIRY_DAYS),
         idea_provider=_provider(row.get("idea_provider")),
+        trend_source=_source(row.get("trend_source")),
+        trend_geo=str(row.get("trend_geo") or "").strip().upper(),
+        apify_platforms=_platforms(row.get("apify_platforms")),
     )
 
     # Cross-field, so it cannot be done per-column above. Jitter needs a range
@@ -287,6 +338,52 @@ def _provider(raw: Any) -> str:
     if name not in PROVIDERS:
         log.warning("idea_provider=%r is not a provider; deferring to the environment", raw)
         return DEFAULT_IDEA_PROVIDER
+    return name
+
+
+def _platforms(raw: Any) -> tuple[str, ...]:
+    """Which platforms the Apify source scrapes, in a fixed order.
+
+    Ordered by `APIFY_PLATFORMS` rather than by however the row happened to
+    store them, so two installs with the same platforms selected scout them in
+    the same sequence -- which matters because a run budget can expire partway
+    through and "we ran out of time" should not mean a different platform each
+    time.
+
+    An empty or unusable list takes the default rather than meaning "none", for
+    the same reason `schedule_days` does: a source that is selected but can
+    never scout is indistinguishable from a runner that is not working, and
+    "none" is said by choosing a different source.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return DEFAULT_APIFY_PLATFORMS
+    wanted = {str(item).strip().lower() for item in raw if item}
+    unknown = wanted - set(APIFY_PLATFORMS)
+    if unknown:
+        log.warning(
+            "apify_platforms contains %s, which is not scrapeable; ignoring",
+            ", ".join(sorted(unknown)),
+        )
+    chosen = tuple(p for p in APIFY_PLATFORMS if p in wanted)
+    if not chosen:
+        log.warning("apify_platforms is empty or unusable; scouting all of %s", ", ".join(APIFY_PLATFORMS))
+        return DEFAULT_APIFY_PLATFORMS
+    return chosen
+
+
+def _source(raw: Any) -> str:
+    """Where signals come from, falling back rather than guessing.
+
+    An unknown value takes the default instead of raising. A row written by a
+    build newer than this one -- naming a source this code has never heard of
+    -- should degrade to scouting something, not to refusing to run.
+    """
+    name = str(raw or "").strip().lower()
+    if not name:
+        return DEFAULT_TREND_SOURCE
+    if name not in SOURCES:
+        log.warning("trend_source=%r is not a known source; using %s", raw, DEFAULT_TREND_SOURCE)
+        return DEFAULT_TREND_SOURCE
     return name
 
 

@@ -41,6 +41,7 @@ const PRESENTER = preset({
   name: 'AI presenter',
   lane: 'presenter',
   video_source: 'heygen',
+  render_mode: 'heygen',
   est_cost_min_usd: 1,
   est_cost_max_usd: 2,
   est_minutes: 18,
@@ -105,5 +106,11 @@ describe('render backend visibility', () => {
     mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
     render(<StylePicker presets={[preset()]} value={null} onChange={vi.fn()} />);
     expect(screen.queryByText('Standard render')).not.toBeInTheDocument();
+  });
+
+  it('names the presenter engine, which is the most expensive one to pick by accident', () => {
+    mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
+    render(<StylePicker presets={[PRESENTER]} value={null} onChange={vi.fn()} />);
+    expect(screen.getByText('HeyGen presenter')).toBeInTheDocument();
   });
 });

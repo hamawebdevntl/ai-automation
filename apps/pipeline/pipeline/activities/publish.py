@@ -14,6 +14,7 @@ from typing import Any
 from pipeline.clients.mpt import MptClient
 from pipeline.clients.postiz import PostizClient, PostizError, deterministic_post_id
 from pipeline.clients.supa import Supa
+from pipeline.config import settings
 from pipeline.copy import copy_for_platforms
 from pipeline.models import Platform, PostizIntegration, PostizMedia, ProductionStatus
 
@@ -123,8 +124,17 @@ def publish(
     call.
     """
     supa = supa or Supa()
-    postiz = postiz or PostizClient()
     production_id = event["production_id"]
+
+    # Belt and braces. With publishing switched off the state machine never
+    # routes here at all, so reaching this means the deployment and the
+    # definition disagree. Park rather than raise: the video is finished and a
+    # human should decide, and an error would land in a poll loop that can
+    # never resolve because there is nothing to poll.
+    if not settings().publishing_enabled:
+        return _park(supa, production_id, "publishing is disabled (PUBLISHING_ENABLED=false)")
+
+    postiz = postiz or PostizClient()
 
     production = supa.production(production_id)
     copy_map = production.get("platform_copy") or {}
@@ -132,7 +142,22 @@ def publish(
     if not platforms:
         return _park(supa, production_id, "no platform is enabled in platform_targets")
 
-    supa.update_production(production_id, status=ProductionStatus.PUBLISHING.value, stage="publishing")
+    # Conditional, and this is the only thing standing between a worker restart
+    # and a second real post.
+    #
+    # Under Step Functions the exclusivity came from the execution: one
+    # execution per production, and this activity ran inside it. The driver's
+    # lease is the equivalent, but a lease can expire under a worker that is
+    # wedged rather than dead -- and at that moment two workers legitimately
+    # hold the same row. `claim_render_slot` is what stops the second one
+    # starting a second billed render; without this, nothing stopped it posting
+    # to a real audience a second time.
+    if not supa.claim_publish_slot(production_id):
+        # Someone else is already publishing this. Fall through to the poll,
+        # which is where the graph's catch arc goes for the same reason: on an
+        # unknown outcome we look rather than guess.
+        log.info("production %s is already being published; leaving it alone", production_id)
+        return {"production_id": production_id, "skipped": "already publishing"}
 
     # Postiz pulls the file itself, and requires a public HTTPS URL: our bucket
     # is private, so mint a short-lived signed URL now rather than storing one.
@@ -212,8 +237,15 @@ def poll_publish(
     notification.
     """
     supa = supa or Supa()
-    postiz = postiz or PostizClient()
     production_id = event["production_id"]
+
+    # "parked", not "pending": PublishOutcome routes a parked result to a
+    # terminal state, so an execution that somehow entered the publish chain
+    # with no publishing service ends instead of waiting forever.
+    if not settings().publishing_enabled:
+        return {"state": "parked", "error": "publishing is disabled (PUBLISHING_ENABLED=false)"}
+
+    postiz = postiz or PostizClient()
 
     production = supa.production(production_id)
     created_at = _parse_ts(production.get("created_at")) or datetime.now(timezone.utc)

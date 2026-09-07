@@ -6,8 +6,6 @@ service-role key should fail loudly at import, not silently write nowhere.
 
 from __future__ import annotations
 
-import json
-import os
 from functools import lru_cache
 
 from pydantic import Field
@@ -45,7 +43,9 @@ class Settings(BaseSettings):
     # --- Postiz -------------------------------------------------------------
     # Publishing is a deployable half of the system, not a given: Postiz is only
     # worth its t3.large once the platform apps are approved and channels are
-    # connected, so `postiz_enabled` in Terraform can leave it out entirely.
+    # connected, so `PUBLISHING_ENABLED=false` leaves it out entirely -- and
+    # Postiz is not in `docker-compose.yml` at all until it is wanted, since it
+    # brings its own Postgres, Redis, Temporal and Elasticsearch.
     #
     # These two therefore default to empty rather than failing at import, which
     # is the one exception to the rule at the top of this file. The loudness is
@@ -115,26 +115,25 @@ class Settings(BaseSettings):
     tiktok_ms_token: str | None = Field(default=None, alias="TIKTOK_MS_TOKEN")
     ideas_per_run: int = Field(default=10, alias="IDEAS_PER_RUN")
 
-    # Where the on-demand trend run is launched. Only `dispatch_trend_runs`
-    # reads these; the daily run is launched by EventBridge, which is told the
-    # same things by Terraform and needs nothing here.
+    # Credentials for the two sources that replaced the browser-driven scout.
     #
-    # The run id the task should report into. Set per-task by the dispatcher as
-    # a container override, so it is empty on the scheduled run -- which is how
-    # the runner tells an on-demand run from a scheduled one.
+    # Empty rather than required, like every other key here: a deployment that
+    # only ever selects Google Trends should not have to hold credentials for
+    # sources it does not use. The refusal happens when the source is selected
+    # -- see `trends.credentials`, which checks before scouting starts rather
+    # than at the point of use.
+    #
+    # Apify bills per compute unit, so this token spends money when a run uses
+    # it. The YouTube key is quota'd rather than billed: 10,000 units a day,
+    # and a search costs 100 of them.
+    apify_token: str = Field(default="", alias="APIFY_TOKEN")
+    youtube_api_key: str = Field(default="", alias="YOUTUBE_API_KEY")
+
+    # The trend run currently in flight, when the scout is driven directly
+    # rather than through the dispatcher. Left for the tests and for a one-off
+    # `python -m pipeline.trends.runner`; the worker passes the id as an
+    # argument instead, because a process-global would race across its threads.
     trend_run_id: str = Field(default="", alias="TREND_RUN_ID")
-    trends_cluster_arn: str = Field(default="", alias="TRENDS_CLUSTER_ARN")
-    trends_task_definition: str = Field(default="", alias="TRENDS_TASK_DEFINITION")
-    trends_subnet_ids: str = Field(default="", alias="TRENDS_SUBNET_IDS")
-    trends_security_group_ids: str = Field(default="", alias="TRENDS_SECURITY_GROUP_IDS")
-
-    @property
-    def trends_subnet_id_list(self) -> list[str]:
-        return [s.strip() for s in self.trends_subnet_ids.split(",") if s.strip()]
-
-    @property
-    def trends_security_group_id_list(self) -> list[str]:
-        return [s.strip() for s in self.trends_security_group_ids.split(",") if s.strip()]
 
     @property
     def hashtag_list(self) -> list[str]:
@@ -144,38 +143,48 @@ class Settings(BaseSettings):
     def keyword_list(self) -> list[str]:
         return [k.strip() for k in self.trend_keywords.split(",") if k.strip()]
 
-    # --- AWS ----------------------------------------------------------------
-    state_machine_arn: str | None = Field(default=None, alias="STATE_MACHINE_ARN")
-    gate_bridge_secret: str | None = Field(default=None, alias="GATE_BRIDGE_SECRET")
+    # --- The driver ---------------------------------------------------------
+    # What used to be Step Functions' concern. A production is advanced by
+    # whichever worker holds its lease, so these are the three numbers that
+    # decide how quickly work is picked up and how long a dead worker holds on.
+    #
+    # An identity for the lease. Only ever read back in a log line or the
+    # `leased_by` column -- `lease_expires_at` is what actually excludes -- so a
+    # duplicate across two hosts is untidy rather than unsafe. Defaults to the
+    # hostname plus a random suffix.
+    worker_id: str = Field(default="", alias="WORKER_ID")
+
+    # Two, because the failure to avoid is a multi-minute `fetch_and_qc` --
+    # hundreds of megabytes and four ffmpeg passes -- stalling every other
+    # production's thirty-second poll. One spare thread fixes that. Past about
+    # four you are only queueing on MoneyPrinterTurbo's own concurrency limit,
+    # which answers with the 429 that `submit_render` already retries, and on a
+    # CPU that MPT is saturating anyway.
+    production_workers: int = Field(default=2, alias="PRODUCTION_WORKERS")
+
+    # How long an idle worker waits before asking again. This is the Gate 2
+    # latency: it is what stands between an owner clicking approve and the
+    # production moving. The webhook it replaced managed about a second but was
+    # at-most-once, and the sweeper that made it trustworthy ran every sixty.
+    driver_poll_seconds: int = Field(default=5, alias="DRIVER_POLL_SECONDS")
+
+    # How long a claim survives without being renewed. Long enough that an
+    # ordinary step never loses its row mid-flight, short enough that a worker
+    # killed by the OOM reaper does not hold a production hostage. `fetch_and_qc`
+    # overrides this per step -- see `driver/graph.py`.
+    lease_seconds: int = Field(default=900, alias="LEASE_SECONDS")
 
 
-def _load_secrets_into_env() -> None:
-    """Resolve a Secrets Manager bundle into the environment.
-
-    Lambda cannot inject Secrets Manager values into environment variables, and
-    putting a service-role key or an API key in a plain Lambda env var leaves it
-    readable to anyone with GetFunctionConfiguration. So the ARN is the only
-    thing passed in, and the bundle is fetched once at cold start.
-
-    Existing environment variables win, which keeps local overrides and tests
-    working without touching AWS.
-    """
-    arn = os.environ.get("PIPELINE_SECRETS_ARN")
-    if not arn:
-        return
-    try:
-        import boto3
-
-        payload = boto3.client("secretsmanager").get_secret_value(SecretId=arn)["SecretString"]
-        for key, value in json.loads(payload).items():
-            os.environ.setdefault(key, str(value))
-    except Exception as exc:
-        raise RuntimeError(
-            f"could not resolve PIPELINE_SECRETS_ARN: {type(exc).__name__}"
-        ) from exc
+# `_load_secrets_into_env` lived here and is gone with AWS.
+#
+# Lambda cannot inject a Secrets Manager value into an environment variable, and
+# a service-role key sitting in a plain Lambda env var is readable to anyone
+# with GetFunctionConfiguration -- so only the ARN was passed in and the bundle
+# was fetched once at cold start. Neither constraint exists on a machine we
+# control: an `.env` file read by Compose is the same secret with one fewer
+# service in front of it.
 
 
 @lru_cache(maxsize=1)
 def settings() -> Settings:
-    _load_secrets_into_env()
     return Settings()  # type: ignore[call-arg]

@@ -55,6 +55,15 @@ class PostizClient:
     ) -> None:
         cfg = settings()
         self._base = (base_url or cfg.postiz_base_url).rstrip("/")
+        # Nothing should construct this client when publishing is switched off,
+        # so say so here rather than letting an empty base URL turn into a
+        # connection error against "http:///public/v1/posts".
+        if not self._base:
+            raise PostizError(
+                "POSTIZ_BASE_URL is empty: no publishing service is deployed "
+                "(PUBLISHING_ENABLED=false). Publishing and analytics are "
+                "switched off, and nothing should be reaching for this client."
+            )
         # The raw key, with no scheme. Postiz compares the Authorization header
         # verbatim against organization.apiKey, so prefixing "Bearer " -- which
         # any generic bearer-token HTTP client will do -- silently 401s.

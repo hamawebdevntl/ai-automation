@@ -179,28 +179,48 @@ describe('what the last run did', () => {
     expect(await screen.findByText(/scouting for ideas/i)).toBeInTheDocument();
   });
 
-  it('reads a fresh request as a slow start, not a problem', async () => {
+  it('reads a fresh request as queued, and says how long that means', async () => {
     latest = run({ status: 'requested', started_at: null, requested_at: new Date().toISOString() });
     render(<TrendRunBanner />, { wrapper });
 
     expect(await screen.findByText(/scouting for ideas/i)).toBeInTheDocument();
-    expect(screen.getByText(/usually under a minute/i)).toBeInTheDocument();
+    // The honest number. The scout dispatcher runs on a timer, so promising
+    // "under a minute" was the sentence that made a normal wait look broken.
+    expect(screen.getByText(/queued for the next scout/i)).toBeInTheDocument();
   });
 
-  it('stops calling a request that nobody claimed a slow start', async () => {
-    // The dispatcher runs every minute. A row still unclaimed after several of
-    // them is the shape of an unapplied terraform, not of a busy queue -- and
-    // saying "usually under a minute" for the twentieth minute running makes a
-    // broken deployment look like a working one.
-    const twentyMinutesAgo = new Date(Date.now() - 20 * 60_000).toISOString();
-    latest = run({ status: 'requested', started_at: null, requested_at: twentyMinutesAgo });
+  it('treats a wait shorter than the cadence as normal, because it is', async () => {
+    // The false alarm the threshold is derived for. Whatever the cadence, a
+    // request that has not yet waited one full cycle has not missed anything --
+    // it is waiting for a dispatcher that has not come round yet, and calling
+    // that "nothing has picked this run up" sends someone hunting for a dead
+    // worker that is in fact running fine.
+    //
+    // This was once twenty minutes against an hourly GitHub Actions cron. The
+    // dispatcher is a thread again now and runs every minute, so the number
+    // moved -- which is exactly why the threshold is computed from
+    // SCOUT_CADENCE_MINUTES rather than written down twice.
+    const justNow = new Date(Date.now() - 30_000).toISOString();
+    latest = run({ status: 'requested', started_at: null, requested_at: justNow });
+    render(<TrendRunBanner />, { wrapper });
+
+    expect(await screen.findByText(/scouting for ideas/i)).toBeInTheDocument();
+    expect(screen.queryByText(/nothing has picked this run up/i)).not.toBeInTheDocument();
+  });
+
+  it('raises the alarm once a request has missed a whole cycle', async () => {
+    // Past a full cadence plus its slack, silence does mean something: the
+    // worker is down, crash-looping, or misconfigured. A minute-by-minute
+    // dispatcher that has been quiet for an hour is not busy.
+    const anHourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+    latest = run({ status: 'requested', started_at: null, requested_at: anHourAgo });
     render(<TrendRunBanner />, { wrapper });
 
     expect(await screen.findByText(/nothing has picked this run up/i)).toBeInTheDocument();
-    // And names the one thing to check. The write-off is the *same* sweeper,
-    // so promising automatic recovery here would be promising it from the
-    // component that has just reported that sweeper missing.
-    expect(screen.getByText(/dispatcher is also what writes an unclaimed request off/i)).toBeInTheDocument();
+    // And names where to look. It is a thread in the pipeline worker, not an AWS
+    // dispatcher -- pointing at the wrong system is how the last hour got
+    // spent on the wrong thing.
+    expect(screen.getByText(/pipeline worker/i)).toBeInTheDocument();
   });
 
   it('surfaces why a run failed', async () => {
@@ -317,10 +337,10 @@ describe('stopping a run', () => {
 
   it('is offered on the stuck request nothing has claimed', async () => {
     // The case that motivated the button. Without it the queue is wedged
-    // until somebody opens the AWS console.
+    // until somebody goes and restarts the worker.
     latest = run({
       status: 'requested',
-      requested_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+      requested_at: new Date(Date.now() - 180 * 60_000).toISOString(),
       started_at: null,
     });
     render(<TrendRunBanner />, { wrapper });

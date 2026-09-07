@@ -85,4 +85,4 @@ export interface TextFormatting {
 // The types above are kept because `<FreeWriteCmsBlockRenderer />` is purely
 // presentational and still renders `Block[]` from any source. If CMS content
 // is wanted again, fetch it somewhere that can hold the key (a Supabase Edge
-// Function, or the AWS API) and pass the blocks in as props.
+// Function, or a small API of our own) and pass the blocks in as props.

@@ -55,13 +55,38 @@ export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
 export type ProductionStatus =
   | 'queued'
   | 'running'
+  /** Stopped at the script gate: the narration is drafted and waiting for an
+   *  owner to read it. Nothing is rendered from this state, which is the point
+   *  of it — the spend happens after the words are approved, not before. */
+  | 'awaiting_script'
   | 'qc_failed'
   | 'awaiting_review'
   | 'approved'
   | 'rejected'
   | 'publishing'
   | 'published'
-  | 'failed';
+  | 'failed'
+  /** The pipeline stopped deliberately and wants a person. The DB has allowed
+   *  this since the pipeline-integration migration; this file had drifted. */
+  | 'parked'
+  /** A person stopped it before it finished — `cancel_production`. */
+  | 'cancelled';
+
+/** Statuses that mean the pipeline is still working on this production. */
+export const LIVE_PRODUCTION_STATUSES = [
+  'queued',
+  'running',
+  'publishing',
+] as const satisfies readonly ProductionStatus[];
+
+/** Statuses that mean nothing more will happen without a person. */
+export const STOPPED_PRODUCTION_STATUSES = ['parked', 'failed'] as const satisfies readonly ProductionStatus[];
+
+/** The longest script any lane accepts. HeyGen's `POST /v3/videos` rejects more
+ *  outright rather than truncating, and `productions_script_length` in Postgres
+ *  enforces the same number. Mirrored here for the editor's own counter; the
+ *  constraint is what actually holds. */
+export const MAX_SCRIPT_CHARS = 5000;
 
 export type ApprovalDecision = 'approved' | 'rejected';
 
@@ -124,7 +149,10 @@ export type TrendSettingsRow = {
   // --- Filters, in the order the scout applies them. ---
   /** Reject a video older than this before it is scored. */
   max_video_age_days: number;
+  /** Video sources only. Absolute view count — unbounded, not comparable to min_interest. */
   min_plays: number;
+  /** Google Trends only. Interest as a percentage of the term's own 3-month peak, 0-100. */
+  min_interest: number;
   /** Interactions per view, as a fraction: 0.04 is 4%. */
   min_engagement_rate: number;
   /** How far above its own author's median a video must perform. */
@@ -147,7 +175,36 @@ export type TrendSettingsRow = {
   dedup_window_days: number;
   idea_expiry_days: number;
   idea_provider: IdeaProvider;
+
+  /** Where signals come from. */
+  trend_source: TrendSource;
+  /** Search terms in buyer language, for Google Trends and YouTube. Not hashtags. */
+  trend_keywords: string[];
+  /** ISO-3166 region for Google Trends, or empty for worldwide. */
+  trend_geo: string;
+  /** Which platforms the Apify source scrapes. At least one. Ignored by the others. */
+  apify_platforms: ApifyPlatform[];
 };
+
+/**
+ * Where the scout looks.
+ *
+ * `google_trends` measures search demand — what people type when a manual
+ * process has finally cost them an afternoon. It says a subject is live and
+ * nothing about how to open a video about it.
+ *
+ * `apify` and `youtube` measure video formats, with engagement as proof, which
+ * is the better half for a hook. They differ in what they cost: Apify rents
+ * hosted scrapers and bills per result, YouTube is the official API and spends
+ * a daily quota instead.
+ *
+ * `tiktok` was here until TikTok-Api began refusing every feed. Apify is how
+ * TikTok is read now.
+ */
+export type TrendSource = 'apify' | 'google_trends' | 'youtube';
+
+/** The platforms the Apify source can be pointed at. */
+export type ApifyPlatform = 'tiktok' | 'instagram';
 
 /** Which model drafts the queue. Both are wired; the key must be in the bundle. */
 export type IdeaProvider = 'claude' | 'gemini';
@@ -186,11 +243,29 @@ export type TrendRejections = {
   inserted: number;
   failed_hashtags: Array<{ hashtag: string; error: string }>;
   budget_exhausted: boolean;
+  /**
+   * The source ran out of allowance rather than time.
+   *
+   * Separate from `budget_exhausted` because the remedy is the opposite:
+   * YouTube's search quota does not reset until midnight US/Pacific, so a
+   * longer budget changes nothing and a shorter term list is the fix. Absent
+   * on runs recorded before this existed.
+   */
+  quota_exhausted?: boolean;
   /** The scout noticed it had been stopped and gave up the remaining hashtags. */
   cancelled: boolean;
   hashtags_skipped: number;
   hashtags_scouted: string[];
   hashtags_configured: number | null;
+  /**
+   * Which source produced this run.
+   *
+   * Written by the pipeline and needed for reading the rest: the stage labels
+   * are already relabelled per source, but `hashtags_scouted` holds hashtags
+   * on one source and search terms on the others, and only this says which.
+   * Absent on runs recorded before it was stored.
+   */
+  source?: string;
 };
 
 /**
@@ -282,16 +357,37 @@ export type ProductionRow = {
   status: ProductionStatus;
   stage: string | null;
   task_id: string | null;
+  /** Where the driver has got to with this production, plus the payload its
+   *  steps pass between each other. Replaced the Step Functions execution. */
+  run_state: Record<string, unknown> | null;
+  /** Which worker currently holds this row. Advisory; `lease_expires_at` is
+   *  what actually excludes. */
+  leased_by: string | null;
+  lease_expires_at: string | null;
   /** The render_mode in force when this ran, kept even if the preset later changes. */
   render_backend: RenderMode | null;
-  execution_arn: string | null;
+  /** The narration, and the source of truth for it. Drafted by `write_script`,
+   *  edited and approved by an owner, then handed to whichever backend renders:
+   *  `video_script` for MoneyPrinterTurbo, the script body for HeyGen, the TTS
+   *  input for the fal end-to-end lane. No lane writes its own any more. */
   script: string | null;
+  /** When an owner approved the script. Null is the gate: `claim_production`
+   *  will not return this row at `await_script` while it is null, and
+   *  `submit_render` refuses outright. Any later edit clears it again. */
+  script_approved_at: string | null;
+  script_approved_by: string | null;
+  /** When the text last changed, by draft or by hand. */
+  script_updated_at: string | null;
+  /** Who last changed it. Null when the pipeline wrote the draft. */
+  script_updated_by: string | null;
   video_url: string | null;
   thumbnail_url: string | null;
   duration_seconds: number | null;
   qc: Json;
   platform_copy: Json;
   cost_estimate_usd: number | null;
+  /** Never written by the pipeline today. Rendered in the review UI, so it is
+   *  reliably null — real spend is not tracked anywhere yet. */
   cost_actual_usd: number | null;
   error: string | null;
   decided_by: string | null;
@@ -299,7 +395,49 @@ export type ProductionRow = {
   decision_note: string | null;
   created_at: string;
   completed_at: string | null;
+  /** Maintained by the `productions_touch_updated_at` trigger. */
+  updated_at: string;
+  postiz_media_id: string | null;
+  postiz_media_path: string | null;
+  /** Set by `pause_production`. A paused row is one `claim_production` does not
+   *  return, so the driver simply never picks it up again. */
+  paused_at: string | null;
+  /** The production that replaced this one, set by `rerun_production`. */
+  superseded_by: string | null;
 };
+
+/**
+ * One entry in a production's step log.
+ *
+ * Append-only, and the only record of how a production actually ran:
+ * `run_state` is a rolling snapshot that each step overwrites.
+ */
+export type ProductionEventRow = {
+  id: string;
+  production_id: string;
+  /** A driver step name, or `control` for a human action. */
+  step: string;
+  outcome: ProductionEventOutcome;
+  detail: string | null;
+  error: string | null;
+  attempt: number | null;
+  payload: Json;
+  /** Set only on `control` events — a driver event has no actor. */
+  actor_id: string | null;
+  created_at: string;
+};
+
+export type ProductionEventOutcome =
+  | 'started'
+  | 'progress'
+  | 'succeeded'
+  | 'retrying'
+  | 'infra_retry'
+  | 'waiting'
+  | 'failed'
+  | 'parked'
+  | 'terminal'
+  | 'control';
 
 export type ApprovalRow = {
   id: string;
@@ -309,9 +447,22 @@ export type ApprovalRow = {
   decision: ApprovalDecision;
   note: string | null;
   style_preset_id: string | null;
-  actor_id: string;
+  /** Nullable since the pipeline-integration migration, so that an automated
+   *  transition can be recorded; a check constraint still requires an actor
+   *  whenever `source` is `human`. */
+  actor_id: string | null;
+  source: 'human' | 'system';
   created_at: string;
 };
+
+/**
+ * The steps a production can be sent back to on its own row.
+ *
+ * `submit_render` is deliberately absent: a re-render costs money and opens a
+ * fresh production instead, via `rerun_production`.
+ */
+export const REWIND_STEPS = ['fetch_and_qc', 'generate_copy', 'open_gate2'] as const;
+export type RewindStep = (typeof REWIND_STEPS)[number];
 
 type Writable<T> = Partial<T>;
 
@@ -360,14 +511,39 @@ export interface Database {
       };
       productions: {
         Row: ProductionRow;
-        Insert: Omit<ProductionRow, 'id' | 'created_at' | 'status' | 'qc' | 'platform_copy'> & {
+        Insert: Omit<
+          ProductionRow,
+          | 'id'
+          | 'created_at'
+          | 'updated_at'
+          | 'status'
+          | 'qc'
+          | 'platform_copy'
+          | 'paused_at'
+          | 'superseded_by'
+          | 'script_approved_at'
+          | 'script_approved_by'
+          | 'script_updated_at'
+          | 'script_updated_by'
+        > & {
           id?: string;
           created_at?: string;
+          updated_at?: string;
           status?: ProductionStatus;
           qc?: Json;
           platform_copy?: Json;
+          paused_at?: string | null;
+          superseded_by?: string | null;
         };
         Update: Writable<ProductionRow>;
+        Relationships: [];
+      };
+      production_events: {
+        Row: ProductionEventRow;
+        // Written by the service-role worker and by the control functions.
+        // There is no insert policy, so the browser structurally cannot append.
+        Insert: never;
+        Update: never;
         Relationships: [];
       };
       approvals: {
@@ -402,6 +578,58 @@ export interface Database {
       };
       decide_production: {
         Args: { p_production_id: string; p_decision: ApprovalDecision; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      // The pipeline controls. Owner-gated in SQL exactly as the gates are —
+      // each raises 42501 for a viewer, and each writes its own event row.
+      pause_production: {
+        Args: { p_production_id: string; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      resume_production: {
+        Args: { p_production_id: string; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      retry_production: {
+        Args: { p_production_id: string; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      cancel_production: {
+        Args: { p_production_id: string; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      rerun_production: {
+        // Null keeps the style the superseded production used.
+        Args: { p_production_id: string; p_style_id?: string | null; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      rewind_production: {
+        Args: { p_production_id: string; p_step: RewindStep; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      // The script gate. Same shape and the same owner check as the controls
+      // above, and for the same reason: there is no server tier, so a
+      // `security definer` function is what keeps 'change the row' and 'write
+      // the audit row' in one transaction, and what refuses a viewer rather
+      // than trusting a disabled button.
+      //
+      // Saving and approving are separate functions rather than one with a
+      // flag, because they differ in what they do to the pipeline: saving
+      // persists words and leaves the gate shut, approving hands the row back
+      // to the driver. A single endpoint would make 'did that start a render?'
+      // a question about an argument.
+      save_script: {
+        Args: { p_production_id: string; p_script: string };
+        Returns: ProductionRow;
+      };
+      approve_script: {
+        // The text goes with the approval, so 'save then approve' is one round
+        // trip and one transaction — an owner cannot leave a version behind.
+        Args: { p_production_id: string; p_script: string; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      request_script_redraft: {
+        Args: { p_production_id: string; p_note?: string | null };
         Returns: ProductionRow;
       };
     };

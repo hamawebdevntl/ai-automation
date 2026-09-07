@@ -1,0 +1,98 @@
+# The whole system, on one machine.
+#
+# What this replaces: a VPC with two subnets and a NAT gateway, four ECR
+# repositories, a Step Functions state machine, two Lambda functions, an SQS
+# pair with a dead-letter queue, an API Gateway, eight EventBridge schedules, an
+# ECS cluster with a Fargate service behind an internal ALB, ElastiCache, EFS,
+# Secrets Manager and three CloudWatch alarms.
+#
+# Publishing is not here. Postiz needs a public HTTPS domain for four platforms'
+# OAuth callbacks, plus its own Postgres, Redis, Temporal and Elasticsearch --
+# and it is switched off by default anyway. `docker/postiz-compose.yaml` is kept
+# for when channels are worth connecting; see docs/DEPLOY.md. Until then
+# PUBLISHING_ENABLED=false, and approved cuts wait in a queryable backlog rather
+# than being lost.
+
+name: reels
+
+services:
+  worker:
+    build:
+      context: ./apps/pipeline
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: [./apps/pipeline/.env]
+    environment:
+      MPT_BASE_URL: http://mpt:8080
+      # Compose sends SIGTERM on `up -d` and `restart`. The worker handles it by
+      # finishing its current step and releasing its leases, so a redeploy costs
+      # seconds rather than a lease TTL of a stalled queue -- but it needs long
+      # enough to finish a step it has already started.
+      LOG_LEVEL: INFO
+    stop_grace_period: 60s
+    depends_on:
+      mpt:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  mpt:
+    # MoneyPrinterTurbo, from our fork at services/mpt. Upstream's own image
+    # launches the Streamlit WebUI; this one runs the REST API the pipeline
+    # drives.
+    build:
+      context: ./services/mpt
+      dockerfile: ../../docker/mpt.Dockerfile
+    restart: unless-stopped
+    environment:
+      MPT__APP__ENABLE_REDIS: "true"
+      MPT__APP__REDIS_HOST: mpt-redis
+      MPT__APP__REDIS_PORT: "6379"
+      MPT__APP__ENDPOINT: http://mpt:8080
+      # Two, matching the worker's default thread count: past this the renders
+      # queue on CPU rather than on anything we control, and MPT answers a full
+      # queue with the 429 that `submit_render` already retries.
+      MPT__APP__MAX_CONCURRENT_TASKS: "2"
+      MPT__APP__MAX_QUEUED_TASKS: "20"
+      MPT__APP__UPLOAD_POST_AUTO_UPLOAD: "false"
+    env_file: [./services/mpt/.env]
+    volumes:
+      # Renders, the stock-footage cache and task state. MoneyPrinterTurbo has
+      # no object-storage support at all, so on an ephemeral volume a restart
+      # loses every in-flight render.
+      - mpt-storage:/MoneyPrinterTurbo/storage
+    depends_on:
+      mpt-redis:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  mpt-redis:
+    # Replaces ElastiCache, and it is not optional: without it MoneyPrinterTurbo
+    # keeps task state in process memory and loses every in-flight render on
+    # restart. `reconcile_renders` reports exactly that, and parks the rows.
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    volumes: [mpt-redis:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  web:
+    # The approval app: a static Vite SPA that talks to Supabase directly. It
+    # has no server tier by design -- row-level security and a pair of Postgres
+    # functions are what decide who may pass a gate, not the browser.
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports: ["8080:80"]
+    volumes:
+      - ./apps/web/dist:/usr/share/nginx/html:ro
+      - ./docker/web-nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  mpt-storage:
+  mpt-redis:

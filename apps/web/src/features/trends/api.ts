@@ -166,32 +166,46 @@ export const TREND_RUN_MINUTES = 60;
 const IN_FLIGHT_POLL_MS = 15_000;
 
 /**
- * When the dispatcher gives up on a request it never claimed.
+ * How often the scout wakes up and looks for work.
  *
- * Mirrors `REQUEST_STALE_MINUTES` in `activities/reconcile.py`, which is the
- * side that acts on it. Duplicated rather than derived because there is no
- * server tier to ask, and it is quoted to the owner as a promise -- so a change
- * on that side that is not made here turns a true sentence into a false one.
+ * Mirrors `TRENDS_INTERVAL_SECONDS` in `pipeline/driver/worker.py`, which is
+ * the thread that dispatches trend runs.
+ *
+ * This has been all three values. The AWS dispatcher was a Lambda firing every
+ * minute; it then became an hourly GitHub Actions cron, because a workflow cron
+ * cannot fire every minute without spending the whole free tier on finding
+ * nothing to do; and it is a minute again now that the dispatcher is a thread
+ * in a process that is already running. A thread that finds no work returns in
+ * milliseconds and costs nothing.
  */
-export const REQUEST_UNCLAIMED_WRITE_OFF_MINUTES = 10;
+export const SCOUT_CADENCE_MINUTES = 1;
+const SCOUT_CADENCE_SLACK_MINUTES = 2;
 
 /**
  * How long a request may sit unclaimed before that is worth saying out loud.
  *
- * Comfortably more than the dispatcher's one-minute cadence -- two missed
- * sweeps is a hiccup, not news -- and comfortably less than the write-off
- * above, so the owner learns something is wrong while the row is still there
- * to explain it.
+ * Derived from the cadence rather than chosen, which is the part worth keeping
+ * whatever the cadence happens to be. It was once three minutes against an
+ * hourly scout, and reported a broken deployment for fifty-seven minutes of
+ * every hour while the scout was working perfectly and the run was simply
+ * queued -- so the number and the cadence have to move together, and the only
+ * way to guarantee that is to compute one from the other.
+ *
+ * The sentence it gates is about a dispatcher that has stopped running, not one
+ * that has not got to this yet.
  */
-const UNCLAIMED_AFTER_MS = 3 * 60_000;
+const UNCLAIMED_AFTER_MS = (SCOUT_CADENCE_MINUTES + SCOUT_CADENCE_SLACK_MINUTES) * 60_000;
 
 /**
  * A request that has been sitting in the queue too long to still read as new.
  *
  * `requested` means "inserted, and waiting for the dispatcher". That is the one
  * in-flight state that can mean nothing is listening rather than something is
- * happening: an unapplied `terraform apply` leaves the sweeper unscheduled, and
- * the row then waits for something that does not exist.
+ * happening: a worker that is down leaves nothing polling, and the row then
+ * waits for something that is not coming.
+ *
+ * Waiting is still the normal case. Only past a full cadence is silence
+ * evidence of anything.
  */
 export function isUnclaimed(run: TrendRunRow, now: number = Date.now()): boolean {
   if (run.status !== 'requested') return false;
@@ -241,10 +255,10 @@ export function latestTrendRunQueryOptions() {
  * settings, and therefore the scheduled run, are untouched. Sending nothing is
  * the same request this made before the length control existed.
  *
- * Inserting the row is the whole client-side story: `dispatch_trend_runs` picks
- * it up within the minute and starts the Fargate task. The function refuses a
- * second concurrent run with `55006`, which is a sentence for the owner rather
- * than a failure -- someone has already pressed it.
+ * Inserting the row is the whole client-side story: the worker's trend thread
+ * claims it within the minute and scouts in the same process. The function
+ * refuses a second concurrent run with `55006`, which is a sentence for the
+ * owner rather than a failure -- someone has already pressed it.
  */
 export interface RequestTrendRunInput {
   /** Time ceiling for this run only. Null uses the saved setting. */
@@ -328,9 +342,9 @@ export function isAlreadyRunningError(error: unknown): boolean {
  * produces stuck rows most often: the dispatcher not running.
  *
  * `cancel_trend_run` moves the row out of the in-flight set, and the partial
- * unique index frees itself. No Lambda, no sweep, no AWS call is involved in
- * that taking effect. Stopping the Fargate task, where one exists, is a
- * separate and best-effort concern handled by the pipeline.
+ * unique index frees itself. No sweep and no service call is involved in that
+ * taking effect -- it is one statement against Postgres. The scout notices
+ * separately, by checking its own row between hashtags, and stops itself.
  */
 export function useCancelTrendRun() {
   const queryClient = useQueryClient();

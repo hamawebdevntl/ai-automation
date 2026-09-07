@@ -26,6 +26,7 @@ export function trendSettings(over: Partial<TrendSettingsRow> = {}): TrendSettin
 
     max_video_age_days: 30,
     min_plays: 0,
+    min_interest: 0,
     min_engagement_rate: 0,
     min_outlier_ratio: 1.5,
     caption_blocklist: [],
@@ -41,6 +42,10 @@ export function trendSettings(over: Partial<TrendSettingsRow> = {}): TrendSettin
     dedup_window_days: 14,
     idea_expiry_days: 7,
     idea_provider: 'claude',
+    trend_source: 'google_trends',
+    trend_keywords: ['invoice software', 'crm software', 'bookkeeping software'],
+    trend_geo: '',
+    apify_platforms: ['tiktok', 'instagram'],
     ...over,
   };
 }

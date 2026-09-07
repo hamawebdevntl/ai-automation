@@ -18,7 +18,7 @@ Every threshold below arrives in a `ScoutControls`, read from `trend_settings`.
 The two things that used to be constants and now are not -- what qualifies as a
 signal, and how long a run may take -- are the same two things that decide
 whether this finishes at all, so the order the filters run in is load-bearing
-and is described at `_filter_cheaply`.
+and is described at `base.filter_cheaply`.
 """
 
 from __future__ import annotations
@@ -32,8 +32,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from pipeline.trends import velocity as vel
+
+# The filter chain and the outcome type used to live here. They moved to
+# `base.py` when a third source arrived: the order the filters run in is the
+# funnel every source reports into, and three copies of it would drift.
+# Imported under its old private name so the rest of this module reads unchanged.
+from pipeline.trends.base import ScoutOutcome
+from pipeline.trends.base import filter_cheaply as _filter_cheaply
 from pipeline.trends.controls import BlocklistMatcher, ScoutControls
 from pipeline.trends.report import ScoutReport
+
+__all__ = ["ScoutConfig", "ScoutOutcome", "scout", "scout_hashtags"]
 
 log = logging.getLogger(__name__)
 
@@ -77,14 +86,6 @@ class ScoutConfig:
     # and a hashtag is minutes long -- and because a half-scouted feed is not
     # worth finishing when nobody wants the result.
     should_stop: Callable[[], bool] | None = None
-
-
-@dataclass
-class ScoutOutcome:
-    """What a scout produced, and what it discarded getting there."""
-
-    signals: list[vel.Signal]
-    report: ScoutReport
 
 
 class _Budget:
@@ -141,46 +142,6 @@ def _caption(video: Any) -> str:
 def _url(video: Any) -> str:
     author = getattr(getattr(video, "author", None), "username", None) or "unknown"
     return f"https://www.tiktok.com/@{author}/video/{getattr(video, 'id', '')}"
-
-
-def _filter_cheaply(
-    *,
-    age: float,
-    stats: dict[str, int],
-    caption: str,
-    controls: ScoutControls,
-    blocklist: BlocklistMatcher,
-) -> str | None:
-    """The filters that cost nothing, or the stage that rejected this video.
-
-    These three run before the author baseline is fetched, and that ordering is
-    the single largest thing deciding how long a run takes. Age, play count and
-    the caption are already in the payload the feed handed us. The outlier
-    ratio is not: it is measured against the author's own median, which is a
-    separate paced request per author never seen before -- the dominant cost of
-    a run by a wide margin.
-
-    Checking the free filters first means tightening one makes a run *shorter*,
-    which is the behaviour anyone adjusting them would assume. The previous
-    order fetched a baseline for every video before deciding whether the video
-    was worth having a baseline for.
-
-    One consequence worth naming: a video rejected here contributes nothing to
-    its author's baseline, so an author whose recent posts are all too old is
-    no longer measured at all. That is the intended trade -- their median was
-    only ever wanted in order to score a video we have already discarded.
-    """
-    # An unreadable timestamp is not evidence of age. `age_days` answers
-    # YOUNG_DAYS for a missing one, which passes any limit of a week or more;
-    # rejecting on a missing field would quietly discard whole feeds when the
-    # library's shape changes.
-    if age > controls.max_video_age_days:
-        return "too_old"
-    if stats["plays"] < controls.min_plays:
-        return "too_few_plays"
-    if blocklist and blocklist.matched(caption):
-        return "blocked_caption"
-    return None
 
 
 async def scout_hashtags(config: ScoutConfig) -> ScoutOutcome:
