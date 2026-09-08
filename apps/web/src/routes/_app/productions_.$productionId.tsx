@@ -14,7 +14,7 @@ import { ProductionTimeline } from '@/features/queue/components/production-timel
 import { QcReportCard } from '@/features/queue/components/qc-report-card';
 import { QueryError } from '@/features/queue/components/query-state';
 import { ScriptEditor } from '@/features/queue/components/script-editor';
-import { describeProduction, isAtGate2, isAtScriptGate } from '@/features/queue/pipeline-steps';
+import { describeProduction, hasStarted, isAtGate2, isAtScriptGate } from '@/features/queue/pipeline-steps';
 import { useProductionStream } from '@/features/queue/use-production-stream';
 import { RENDER_MODE_LABELS } from '@/lib/database.types';
 import { formatDuration, formatRelative, formatUsd, parseQcReport } from '@/lib/format';
@@ -41,7 +41,14 @@ export const Route = createFileRoute('/_app/productions_/$productionId')({
 function ProductionProcessPage() {
   const { productionId } = Route.useParams();
 
-  const { data, error } = useQuery(productionQueryOptions(productionId));
+  const { data, error } = useQuery({
+    ...productionQueryOptions(productionId),
+    // Realtime carries every change the worker makes. The one thing it cannot
+    // carry is the worker never arriving, so poll until the row has been
+    // touched — that re-render is what turns "Starting" into an honest
+    // "Waiting for a worker".
+    refetchInterval: (query) => (query.state.data && hasStarted(query.state.data.production) ? false : 5_000),
+  });
   const eventsQuery = useQuery(productionEventsQueryOptions(productionId));
   const presetsQuery = useQuery(stylePresetsQueryOptions());
 

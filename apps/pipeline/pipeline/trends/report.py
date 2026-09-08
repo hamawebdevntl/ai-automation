@@ -70,6 +70,13 @@ STAGES: tuple[tuple[str, str, str | None, str], ...] = (
     ("no_baseline", "Author's own history could not be read", None, "video"),
     ("below_ratio", "Did not outperform its author's median enough", "min_outlier_ratio", "video"),
     ("below_engagement", "Under your minimum engagement rate", "min_engagement_rate", "video"),
+    # Only on a run started from a description, and counted in ideas: the
+    # relevance floor is applied to what the model drafted, before duplicate
+    # suppression. Not a setting -- the fix for a run that dropped everything
+    # here is a better description, not a looser filter, and the app says so
+    # in those words rather than pointing at Settings. Omitted from the report
+    # of a run that had no description; see `payload`.
+    ("irrelevant", "Did not connect to what you described", None, "idea"),
     # Counted in ideas, not videos -- see the module docstring. The `level`
     # is what stops the app adding it to the others.
     ("duplicate", "Too close to an idea already in the queue", "dedup_window_days", "idea"),
@@ -168,6 +175,7 @@ def payload(
     inserted: int,
     hashtags_configured: int,
     source: str = DEFAULT_TREND_SOURCE,
+    prompted: bool = False,
 ) -> dict[str, Any]:
     """The `trend_runs.rejections` document.
 
@@ -175,10 +183,16 @@ def payload(
     reads as an accusation; one that lists everything reads as a funnel, and
     the zeroes are how the owner sees that a filter they were about to loosen
     was not the problem.
+
+    The one exception is `irrelevant`, which appears only when `prompted`: on a
+    run that had no description nothing was judged against one, and a zero row
+    labelled "what you described" would be a misstatement, not a reassurance.
     """
     overrides = STAGE_OVERRIDES.get(source, {})
     stages = []
     for key, label, setting, level in STAGES:
+        if key == "irrelevant" and not prompted:
+            continue
         shown_label, shown_setting = overrides.get(key, (label, setting))
         stages.append(
             {

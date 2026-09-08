@@ -1,4 +1,4 @@
-import type { TrendRejections, TrendRunRow, TrendSettingsRow } from '@/lib/database.types';
+import type { TrendRejections, TrendRunInterpretation, TrendRunRow, TrendSettingsRow } from '@/lib/database.types';
 
 /**
  * Trend rows for tests, built from the seeded defaults.
@@ -74,8 +74,39 @@ export function trendRun(over: Partial<TrendRunRow> = {}): TrendRunRow {
     task_stopped_at: null,
     override_run_budget_minutes: null,
     override_hashtags_per_run: null,
+    prompt: null,
+    interpretation: null,
+    interpreted_at: null,
     ...over,
   };
+}
+
+/** How the worker read the example description, as the app would find it on the row. */
+export function trendInterpretation(over: Partial<TrendRunInterpretation> = {}): TrendRunInterpretation {
+  return {
+    restatement: 'A home fitness brand for parents short on time.',
+    terms: ['home workout for parents', 'quick workout at home', 'fitness for busy mums'],
+    vocabulary: 'keywords',
+    source: 'google_trends',
+    vague: false,
+    nudge: null,
+    suggestions: ['Home fitness for parents of toddlers, in the US', 'Short strength workouts for working parents'],
+    provider: 'gemini',
+    model: 'gemini-test',
+    ...over,
+  };
+}
+
+/** A run started from a description: the ordinary run plus the prompt and how it was read. */
+export function trendSearchRun(over: Partial<TrendRunRow> = {}): TrendRunRow {
+  return trendRun({
+    id: 'search-1',
+    prompt: 'I want to start a small home fitness brand for busy parents',
+    interpretation: trendInterpretation(),
+    interpreted_at: '2026-09-06T10:01:30Z',
+    hashtags_scouted: trendInterpretation().terms,
+    ...over,
+  });
 }
 
 /**

@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OwnerState } from '@/features/auth/use-owner';
-import { trendRejections, trendRun, trendSettings } from '@/features/trends/test-fixtures';
+import { trendRejections, trendRun, trendSearchRun, trendSettings } from '@/features/trends/test-fixtures';
 import type { TrendRunRow } from '@/lib/database.types';
 
 const mockOwner = vi.fn<() => OwnerState>(() => ({
@@ -46,7 +46,7 @@ vi.mock('@/features/trends/api', async (importOriginal) => {
   };
 });
 
-const { GenerateIdeasButton, TrendRunBanner } = await import('@/features/trends/components/generate-ideas');
+const { GenerateIdeasButton, RunBanner, TrendRunBanner } = await import('@/features/trends/components/generate-ideas');
 
 function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -522,5 +522,71 @@ describe('search length', () => {
 
     await screen.findByText(/only an owner can start/i);
     expect(screen.queryByRole('radiogroup', { name: /search length/i })).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * A described search is a run, and its state is reported once. The panel has
+ * it when it is the selected one; this banner has it otherwise -- and says
+ * what a search has to add: how it was understood, and that a thin result is
+ * fixed by a better description rather than a looser filter.
+ */
+describe('a described search', () => {
+  it('is left to the panel when it is the selected one', async () => {
+    latest = trendSearchRun({ status: 'running' });
+    const { container } = render(<TrendRunBanner exceptRunId="search-1" />, { wrapper });
+
+    await Promise.resolve();
+    expect(container.textContent).toBe('');
+  });
+
+  it('is reported here otherwise, with how it was understood', async () => {
+    latest = trendSearchRun({ status: 'running' });
+    render(<TrendRunBanner />, { wrapper });
+
+    expect(await screen.findByText(/searching for ideas/i)).toBeInTheDocument();
+    expect(screen.getByText(/understood as/i)).toBeInTheDocument();
+    expect(screen.getByText('home workout for parents')).toBeInTheDocument();
+  });
+
+  it('says it is still being read while there is no interpretation', async () => {
+    latest = trendSearchRun({ status: 'running', interpretation: null, interpreted_at: null });
+    render(<TrendRunBanner />, { wrapper });
+
+    expect(await screen.findByText(/reading your description/i)).toBeInTheDocument();
+  });
+
+  it('does not tell someone to loosen a filter when nothing relevant came back', async () => {
+    latest = trendSearchRun({
+      status: 'succeeded',
+      inserted: 0,
+      rejections: trendRejections({ seen: 12, surfaced: 3, inserted: 0 }),
+    });
+    render(<TrendRunBanner />, { wrapper });
+
+    expect(await screen.findByText(/nothing relevant came back/i)).toBeInTheDocument();
+    expect(screen.getByText('Home fitness for parents of toddlers, in the US')).toBeInTheDocument();
+    expect(screen.getByText(/open this search/i)).toBeInTheDocument();
+    expect(screen.queryByText(/loosen/i)).not.toBeInTheDocument();
+  });
+
+  it('offers the way into a failed search rather than a retry it cannot send', async () => {
+    latest = trendSearchRun({ status: 'failed', error: 'gemini returned no content', inserted: null });
+    render(<TrendRunBanner />, { wrapper });
+
+    expect(await screen.findByText(/the search did not finish/i)).toBeInTheDocument();
+    expect(screen.getByText(/open this search/i)).toBeInTheDocument();
+  });
+
+  it('sends the same words again when asked to, next to the box', async () => {
+    const user = userEvent.setup();
+    const retry = vi.fn();
+    render(<RunBanner run={trendSearchRun({ status: 'failed', error: 'x', inserted: null })} onRetry={retry} />, {
+      wrapper,
+    });
+
+    await user.click(screen.getByRole('button', { name: /try this search again/i }));
+
+    expect(retry).toHaveBeenCalledWith('I want to start a small home fitness brand for busy parents');
   });
 });

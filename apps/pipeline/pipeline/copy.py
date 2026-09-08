@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 
-from pipeline.clients.mpt import MptClient, MptError
+from pipeline.clients.mpt import MptError
+from pipeline.llm import TextGenerator
 from pipeline.models import MPT_SOCIAL_PLATFORM, Platform, PlatformCopy
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def _compose_caption(caption: str, tags: list[str], limit: int) -> str:
 
 
 def copy_for_platform(
-    client: MptClient,
+    client: TextGenerator,
     platform: Platform,
     *,
     video_subject: str,
@@ -99,7 +100,7 @@ def copy_for_platform(
 
 
 def copy_for_platforms(
-    client: MptClient,
+    client: TextGenerator,
     platforms: list[Platform],
     *,
     video_subject: str,

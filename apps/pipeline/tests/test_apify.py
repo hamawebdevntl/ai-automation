@@ -55,6 +55,22 @@ class TestTheTokenIsRequiredAtConstruction:
         assert client()._headers == {"Authorization": "Bearer test-token"}
 
 
+class TestConnectingIsGivenLessTimeThanReading:
+    def test_the_connect_phase_times_out_before_the_request_does(self):
+        # api.apify.com answers on two addresses. A SYN the network drops on
+        # the first is never answered, so the connect phase waits its whole
+        # allowance before trying the second -- a full minute with a single
+        # timeout number. Ten seconds turns that into a hiccup the scout's
+        # retry absorbs.
+        timeout = client()._timeout
+        assert timeout.connect == 10.0
+        assert timeout.read == 60.0
+
+    def test_a_short_request_timeout_is_not_undercut_by_the_connect_default(self):
+        timeout = ApifyClient(api_key="t", timeout=5.0)._timeout
+        assert timeout.connect == 5.0
+
+
 class TestTheActorIdIsPathEncoded:
     @respx.mock
     def test_a_slash_is_rewritten_as_a_tilde(self):
@@ -111,6 +127,43 @@ class TestWhatTheStatusesMean:
         )
         with pytest.raises(ApifyError, match="named no run id"):
             client().start_run("a~b", {})
+
+
+class TestReachingApify:
+    @respx.mock
+    @pytest.mark.parametrize(
+        "blip",
+        [httpx.ConnectError("boom"), httpx.ReadTimeout("boom"), httpx.RemoteProtocolError("boom")],
+        ids=["connect", "read-timeout", "protocol"],
+    )
+    def test_a_dropped_connection_is_an_apify_error_not_an_httpx_one(self, blip):
+        # The scout catches `ApifyError` and decides what giving up means. A raw
+        # httpx exception skips that decision, fails the whole trend run three
+        # frames up, and leaves the remote run scraping and billing.
+        respx.get(f"{API_BASE}/actor-runs/run-1").mock(side_effect=blip)
+        with pytest.raises(ApifyError) as caught:
+            client().run_status("run-1")
+        assert not isinstance(caught.value, ApifyRefused)
+        assert caught.value.__cause__ is blip
+
+    @respx.mock
+    def test_the_server_side_timeout_travels_as_a_query_parameter(self):
+        # Apify's own ceiling on the run, for the worker that dies mid-poll
+        # with nobody left to abort. The actors' defaults are unlimited and
+        # seven days.
+        route = respx.post(f"{API_BASE}/acts/a~b/runs").mock(
+            return_value=httpx.Response(201, json={"data": {"id": "run-1"}})
+        )
+        client().start_run("a~b", {}, timeout_s=660)
+        assert route.calls[0].request.url.params["timeout"] == "660"
+
+    @respx.mock
+    def test_no_timeout_is_sent_unless_asked(self):
+        route = respx.post(f"{API_BASE}/acts/a~b/runs").mock(
+            return_value=httpx.Response(201, json={"data": {"id": "run-1"}})
+        )
+        client().start_run("a~b", {})
+        assert "timeout" not in route.calls[0].request.url.params
 
 
 class TestReadingADataset:
@@ -187,27 +240,42 @@ def instagram_item(
 
 
 class FakeApify:
-    """Answers with scripted datasets, and records what it was asked for."""
+    """Answers with scripted datasets, and records what it was asked for.
 
-    def __init__(self, datasets: list[list[dict[str, Any]]], states: list[str] | None = None):
+    An exception instance in either scripted list is raised in place of that
+    answer, which is how a poll or a dataset read is made to fail once.
+    """
+
+    def __init__(self, datasets: list[Any], states: list[Any] | None = None):
         self._datasets = list(datasets)
         self._states = list(states or [])
         self.started: list[tuple[str, dict[str, Any]]] = []
+        self.timeouts: list[float | None] = []
         self.aborted: list[str] = []
+        self.polls = 0
 
-    def start_run(self, actor_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def start_run(
+        self, actor_id: str, payload: dict[str, Any], *, timeout_s: float | None = None
+    ) -> dict[str, Any]:
         self.started.append((actor_id, payload))
+        self.timeouts.append(timeout_s)
         return {"id": f"run-{len(self.started)}"}
 
     def run_status(self, run_id: str) -> dict[str, Any]:
+        self.polls += 1
         state = self._states.pop(0) if self._states else "SUCCEEDED"
+        if isinstance(state, Exception):
+            raise state
         return {"status": state, "defaultDatasetId": f"ds-{run_id}"}
 
     def abort_run(self, run_id: str) -> None:
         self.aborted.append(run_id)
 
     def dataset_items(self, dataset_id: str, limit: int = 0) -> list[dict[str, Any]]:
-        return self._datasets.pop(0) if self._datasets else []
+        items = self._datasets.pop(0) if self._datasets else []
+        if isinstance(items, Exception):
+            raise items
+        return items
 
 
 def scout(
@@ -349,13 +417,27 @@ class TestTheEconomyOfARun:
 
         assert len(fake.started) == 1
 
-    def test_the_recency_bar_is_pushed_into_the_actor(self):
-        # The actor filters by date server-side, so this is the same bar
-        # applied before we are charged for the result rather than after.
+    def test_no_date_filter_is_sent_on_a_hashtag_scrape(self):
+        # The actor documents its date filter for profile and search scrapes,
+        # and a live run confirmed a hashtag scrape ignores it: neither applied
+        # nor charged. Sending it anyway would tell the next reader that
+        # recency is enforced upstream when `too_old` is doing all of it.
         _, fake = scout(controls=ScoutControls(max_video_age_days=30))
 
         _, payload = fake.started[0]
-        assert "oldestPostDateUnified" in payload
+        assert "oldestPostDateUnified" not in payload
+
+    def test_pinned_posts_are_left_out_of_the_baseline(self):
+        # A profile page leads with the author's pinned videos -- their
+        # showcase, not their norm. Three of five baseline items were pinned
+        # for two of three authors in the live check, one of them two
+        # year-old 1.3M-view videos, and a median built from those hides the
+        # next hit. The switch is free.
+        _, fake = scout(datasets=[[tiktok_item(plays=30_000)], []])
+
+        _, payload = fake.started[1]
+        assert "profiles" in payload
+        assert payload["excludePinnedPosts"] is True
 
     def test_media_downloads_are_explicitly_off(self):
         # This actor bills per result and these flags pull files we never read.
@@ -365,12 +447,50 @@ class TestTheEconomyOfARun:
         assert payload["shouldDownloadVideos"] is False
         assert payload["shouldDownloadCovers"] is False
 
+    def test_the_profile_scrape_turns_the_same_downloads_off(self):
+        # Same actor, same bill; a default flipping upstream would otherwise
+        # show up on the baseline half of the run only.
+        _, fake = scout(datasets=[[tiktok_item(plays=30_000)], []])
+
+        _, payload = fake.started[1]
+        assert "profiles" in payload
+        for flag in (
+            "shouldDownloadVideos",
+            "shouldDownloadCovers",
+            "shouldDownloadSlideshowImages",
+            "shouldDownloadAvatars",
+        ):
+            assert payload[flag] is False
+
+    def test_the_remote_run_is_given_a_timeout_of_its_own(self):
+        # Longer than the local deadline, so the local abort is the normal
+        # path and the report names the reason; the remote one is the backstop
+        # for a worker that dies mid-poll.
+        _, fake = scout()
+
+        assert fake.timeouts == [apify.REMOTE_TIMEOUT_S]
+        assert apify.REMOTE_TIMEOUT_S > apify.RUN_TIMEOUT_S
+
     def test_each_platform_is_scraped_with_its_own_actor(self):
         _, fake = scout(platforms=("tiktok", "instagram"), datasets=[[], [], [], []])
 
         actors = [actor for actor, _ in fake.started]
         assert "clockworks~tiktok-scraper" in actors[0]
         assert "instagram" in actors[1]
+
+    def test_instagram_is_asked_for_reels_on_both_scrapes(self):
+        # A hashtag page's top posts are mostly images -- ten of ten on the
+        # live check -- and an image has no play count, so every one was paid
+        # for and dropped as `no_metrics`. Reels all carry one. The baseline
+        # asks for the same type so the median is over items that can be in it.
+        candidates = [instagram_item(plays=9_000)]
+        history = [instagram_item(post_id=f"h{i}", plays=1_000) for i in range(3)]
+        _, fake = scout(platforms=("instagram",), datasets=[candidates, history])
+
+        hashtag_payload, profile_payload = fake.started[0][1], fake.started[1][1]
+        assert "hashtags" in hashtag_payload and "directUrls" in profile_payload
+        assert hashtag_payload["resultsType"] == "reels"
+        assert profile_payload["resultsType"] == "reels"
 
     def test_the_two_actors_take_differently_named_limits(self):
         # `resultsPerPage` on one and `resultsLimit` on the other. They really
@@ -431,6 +551,70 @@ class TestStoppingEarly:
         )
 
         assert outcome.report.hashtags_scouted == ["crm", "erp"]
+
+
+class TestTransientFailuresWhilePolling:
+    def history(self):
+        return [tiktok_item(video_id=f"h{i}", plays=5_000) for i in range(3)]
+
+    def test_a_blip_while_polling_is_retried_not_fatal(self):
+        # One 500 in the middle of a run that is still going should cost a
+        # poll interval, not the hashtag.
+        outcome, fake = scout(
+            states=["RUNNING", ApifyError("500"), "SUCCEEDED"],
+            datasets=[[tiktok_item(plays=30_000)], self.history()],
+        )
+
+        assert len(outcome.signals) == 1
+        assert outcome.report.failed_hashtags == []
+        assert fake.aborted == []
+
+    def test_a_rate_limit_waits_as_long_as_it_was_told(self, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr(apify.time, "sleep", slept.append)
+
+        scout(
+            states=["RUNNING", ApifyRateLimited("slow down", retry_after=7), "SUCCEEDED"],
+            datasets=[[tiktok_item(plays=30_000)], self.history()],
+        )
+
+        assert 7 in slept
+
+    def test_giving_up_on_a_run_we_cannot_read_aborts_it(self):
+        # The run we could not read is still scraping and still billing.
+        # Giving up on reading it is not the same as stopping it.
+        outcome, fake = scout(states=[ApifyError("500")] * apify.TRANSIENT_ATTEMPTS)
+
+        assert fake.aborted == ["run-1"]
+        assert len(outcome.report.failed_hashtags) == 1
+        assert outcome.signals == []
+
+    def test_a_refused_poll_is_not_retried(self):
+        # A bad token does not become good by waiting.
+        outcome, fake = scout(states=[ApifyRefused("401"), "SUCCEEDED"])
+
+        assert fake.polls == 1
+        assert fake.aborted == ["run-1"]
+        assert len(outcome.report.failed_hashtags) == 1
+
+    def test_a_dataset_that_fails_once_is_fetched_again(self):
+        # The run succeeded and its results are paid for; a dropped connection
+        # on the read must not throw them away.
+        outcome, fake = scout(
+            datasets=[ApifyError("503"), [tiktok_item(plays=30_000)], self.history()],
+        )
+
+        assert len(outcome.signals) == 1
+        assert outcome.report.failed_hashtags == []
+        assert fake.aborted == []
+
+    def test_a_dataset_that_keeps_failing_is_recorded_not_raised(self):
+        outcome, fake = scout(datasets=[ApifyError("503")] * apify.TRANSIENT_ATTEMPTS)
+
+        assert outcome.signals == []
+        assert len(outcome.report.failed_hashtags) == 1
+        # Nothing to abort: the run had already finished.
+        assert fake.aborted == []
 
 
 class TestTheReportAddsUp:

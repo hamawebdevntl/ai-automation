@@ -269,6 +269,30 @@ export type TrendRejections = {
 };
 
 /**
+ * How the worker read a described search.
+ *
+ * Written shortly after the run is claimed, so it can arrive up to a minute
+ * after the row does. While the run is in flight, null means "not read yet";
+ * once it has finished, null on a run that has a prompt means the worker that
+ * ran it predates described searches.
+ */
+export type TrendRunInterpretation = {
+  /** The request in the app's own words, so a misreading is visible at once. */
+  restatement: string;
+  /** What the scout was told to look for. Hashtags or search terms, by `vocabulary`. */
+  terms: string[];
+  vocabulary: 'keywords' | 'hashtags';
+  source: string;
+  /** Too thin to derive good terms from. `nudge` says what would help. */
+  vague: boolean;
+  nudge: string | null;
+  /** Rephrasings worth trying when this one comes back thin. Empty, never null. */
+  suggestions: string[];
+  provider: string;
+  model: string | null;
+};
+
+/**
  * A trend run is in flight while it is one of these. At most one row can be.
  *
  * `cancelled` is its own status rather than a flavour of `failed` because the
@@ -325,6 +349,12 @@ export type TrendRunRow = {
    */
   override_run_budget_minutes: number | null;
   override_hashtags_per_run: number | null;
+
+  /** What the owner said they were working on, verbatim. Null on a manual or scheduled run. */
+  prompt: string | null;
+  /** Null until the worker has read the prompt. Always null on a run without one. */
+  interpretation: TrendRunInterpretation | null;
+  interpreted_at: string | null;
 };
 
 /** The button, or the dispatcher acting on the owner's schedule. */
@@ -348,6 +378,12 @@ export type IdeaRow = {
   decided_at: string | null;
   decision_note: string | null;
   created_at: string;
+  /** The run that drafted this idea. Null on rows from before it was recorded. */
+  trend_run_id: string | null;
+  /** How well it fits the description its run was given, 0–100. Null unless the run had a prompt. */
+  relevance: number | null;
+  /** One sentence on how the idea connects to that description. Null unless the run had a prompt. */
+  connection: string | null;
 };
 
 export type ProductionRow = {
@@ -500,11 +536,19 @@ export interface Database {
       };
       ideas: {
         Row: IdeaRow;
-        Insert: Omit<IdeaRow, 'id' | 'created_at' | 'target_platforms' | 'status'> & {
+        Insert: Omit<
+          IdeaRow,
+          'id' | 'created_at' | 'target_platforms' | 'status' | 'trend_run_id' | 'relevance' | 'connection'
+        > & {
           id?: string;
           created_at?: string;
           target_platforms?: string[];
           status?: IdeaStatus;
+          // Pipeline-owned. The browser never inserts an idea, but the type
+          // should not demand columns only the worker knows.
+          trend_run_id?: string | null;
+          relevance?: number | null;
+          connection?: string | null;
         };
         Update: Writable<IdeaRow>;
         Relationships: [];
@@ -560,8 +604,9 @@ export interface Database {
         Returns: boolean;
       };
       request_trend_run: {
-        // Both optional. Null, or omitted, uses the saved settings.
-        Args: { p_budget_minutes?: number | null; p_hashtags_per_run?: number | null };
+        // All optional. Null, or omitted, uses the saved settings; a prompt
+        // makes the run a described search, scouted on terms read from it.
+        Args: { p_budget_minutes?: number | null; p_hashtags_per_run?: number | null; p_prompt?: string | null };
         Returns: TrendRunRow;
       };
       cancel_trend_run: {

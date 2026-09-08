@@ -11,11 +11,11 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from pipeline.clients.mpt import MptClient
 from pipeline.clients.postiz import PostizClient, PostizError, deterministic_post_id
 from pipeline.clients.supa import Supa
 from pipeline.config import settings
 from pipeline.copy import copy_for_platforms
+from pipeline.llm import TextGenerator, text_client
 from pipeline.models import Platform, PostizIntegration, PostizMedia, ProductionStatus
 
 log = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ STALE_QUEUE_MINUTES = 45
 
 
 def generate_platform_copy(
-    event: dict[str, Any], supa: Supa | None = None, mpt: MptClient | None = None
+    event: dict[str, Any], supa: Supa | None = None, mpt: TextGenerator | None = None
 ) -> dict[str, Any]:
     """Write `productions.platform_copy` for every enabled platform.
 
@@ -50,7 +50,9 @@ def generate_platform_copy(
     could approve one version and publish another.
     """
     supa = supa or Supa()
-    mpt = mpt or MptClient()
+    # The same direct-or-MPT choice `write_script` makes, so a HeyGen-only
+    # deployment reaches Gate 2 with copy rather than four connection refusals.
+    mpt = mpt or text_client()
     production_id = event["production_id"]
 
     production = supa.production(production_id)

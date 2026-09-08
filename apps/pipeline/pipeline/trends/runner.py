@@ -22,6 +22,7 @@ from pipeline.clients.supa import Supa
 from pipeline.config import Settings, settings
 from pipeline.trends import controls as controls_mod
 from pipeline.trends import ideas as ideas_mod
+from pipeline.trends import interpret as interpret_mod
 from pipeline.trends import report as report_mod
 from pipeline.trends import sources as sources_mod
 from pipeline.trends.controls import ScoutControls
@@ -98,6 +99,10 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     down rather than only used for bookkeeping because it is also how the scout
     learns it has been stopped: cancelling frees the in-flight lock in Postgres
     immediately, and this task is the thing that lock was protecting.
+
+    The row can also carry a description -- see `interpret` -- in which case
+    the saved vocabulary is not scouted at all: the terms come from the
+    description, for this run only, and the rotation cursor is left alone.
     """
     supa = supa or Supa()
     cfg = settings()
@@ -105,12 +110,21 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     niche_brief, terms, controls = _inputs(supa, cfg)
     source = sources_mod.spec(controls.trend_source)
 
-    # A run started from the button may carry its own length. Merged here
-    # rather than inside `_inputs` because it belongs to this run, not to the
-    # configuration -- and because a scheduled run has no row-level overrides
-    # to merge, so the two paths stay visibly different.
-    if run_id:
-        controls = controls_mod.with_run_overrides(controls, supa.trend_run(run_id))
+    # A run started from the app may carry its own length, and may carry a
+    # description. Both ride on the row rather than on the configuration
+    # because they belong to this run -- and a scheduled run has neither, so
+    # the two paths stay visibly different.
+    run_row = supa.trend_run(run_id) if run_id else None
+    controls = controls_mod.with_run_overrides(controls, run_row)
+    description = str((run_row or {}).get("prompt") or "").strip()
+
+    # Whether the database has the columns this build writes. The row shape is
+    # the evidence: `select("*")` returns `prompt` only once the migration that
+    # added it has been applied, and that migration added the idea columns too.
+    # A worker ahead of its database should insert ideas exactly as the build
+    # before it did, not fail every run after an hour of scouting over a column
+    # PostgREST has never heard of.
+    migrated = run_row is not None and "prompt" in run_row
 
     if not niche_brief.strip():
         # Deliberately a hard stop. A trend run without a brief fills the
@@ -122,27 +136,11 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
             "refusing to fill the approval queue with generic ideas."
         )
 
-    if not terms:
-        raise RuntimeError(source.nothing_to_scout)
-
-    # Rotation. Scouting a slice of the list keeps a run short without changing
-    # what qualifies as a signal, and the cursor is advanced before scouting
-    # rather than after so that a run which dies mid-session does not make the
-    # next one repeat the same tags.
-    selected, next_cursor = controls_mod.rotate(terms, controls.hashtag_cursor, controls.hashtags_per_run)
-    if len(selected) < len(terms):
-        log.info(
-            "rotating: scouting %d of %d terms this run (%s)",
-            len(selected),
-            len(terms),
-            ", ".join(selected),
-        )
-        supa.save_hashtag_cursor(next_cursor)
-
-    # Both credential checks happen here, before the scout, and not where the
-    # credential is used: scouting takes minutes and, on Apify, bills per
-    # result. A missing key would otherwise throw all of that away at the last
-    # step -- or on Apify, spend money and then throw it away.
+    # Both credential checks happen here, before anything is spent: before the
+    # scout, which takes minutes and on Apify bills per result, and before the
+    # description is read, which is a paid model call. They used to sit after
+    # rotation, which meant a refused preflight had already advanced the cursor
+    # for a run that never scouted.
     #
     # The source goes first because it is the thing about to run.
     source.preflight(cfg, controls)
@@ -150,6 +148,62 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     provider = ideas_mod.resolve_provider(
         controls.idea_provider or cfg.idea_provider, gemini_api_key=cfg.gemini_api_key
     )
+
+    if description:
+        # Read the description into terms, and write how it was read onto the
+        # row *before* scouting: the app shows "understood as ..." while the
+        # scout is still going, which is the only point at which a misreading
+        # is cheap to correct. A model that returns nothing usable raises, and
+        # the run fails with that as its reason. It never falls back to the
+        # saved list -- that would answer a question nobody asked and call it
+        # success.
+        interp = interpret_mod.interpret(
+            description,
+            niche_brief,
+            source,
+            cap=interpret_mod.term_cap(controls),
+            provider=provider,
+        )
+        supa.record_interpretation(
+            run_id,
+            interpret_mod.payload(
+                interp,
+                source=source.name,
+                vocabulary=source.vocabulary,
+                provider=provider,
+                model=getattr(cfg, "gemini_model", None) if provider == ideas_mod.GEMINI else None,
+            ),
+        )
+        selected = list(interp.terms)
+        if not selected:
+            raise RuntimeError(
+                "Could not turn that description into anything to search for. "
+                + (interp.nudge or "Say who it is for and what problem it solves.")
+            )
+        # No rotation and no cursor. These terms belong to this run only, and
+        # the saved list is an audience choice that a one-off question must
+        # not nudge along.
+        log.info("scouting from a description: %s", ", ".join(selected))
+    else:
+        if not terms:
+            raise RuntimeError(source.nothing_to_scout)
+
+        # Rotation. Scouting a slice of the list keeps a run short without
+        # changing what qualifies as a signal, and the cursor is advanced before
+        # scouting rather than after so that a run which dies mid-session does
+        # not make the next one repeat the same tags.
+        selected, next_cursor = controls_mod.rotate(
+            terms, controls.hashtag_cursor, controls.hashtags_per_run
+        )
+        if len(selected) < len(terms):
+            log.info(
+                "rotating: scouting %d of %d terms this run (%s)",
+                len(selected),
+                len(terms),
+                ", ".join(selected),
+            )
+            supa.save_hashtag_cursor(next_cursor)
+
     log.info("scouting %s, drafting ideas with %s", source.name, provider)
 
     # Only when there is a row to be stopped. A container started by hand has
@@ -172,6 +226,7 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     drafted: list = []
     inserted: list = []
     suppressed = 0
+    irrelevant = 0
 
     # A stopped run drafts nothing and inserts nothing, even when it had
     # already found something worth drafting. Stop has to mean stop: filling
@@ -179,10 +234,25 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
     # surprise, and it spends an LLM call on a batch nobody asked to finish.
     if signals and not report.cancelled:
         drafted = ideas_mod.generate_ideas(
-            signals, niche_brief, count=controls.ideas_per_run, provider=provider
+            signals,
+            niche_brief,
+            count=controls.ideas_per_run,
+            provider=provider,
+            description=description or None,
         )
+
+        # On a described run the model is told not to propose ideas that do not
+        # connect, and this is the countable backstop behind that instruction:
+        # what it proposed anyway is dropped here and reported as its own
+        # stage, so "nothing relevant" reads differently from "nothing
+        # trending". An ordinary run's ideas carry no score and all pass.
+        kept, dropped = ideas_mod.split_relevant(drafted)
+        irrelevant = len(dropped)
+        if description:
+            report.drop("irrelevant", irrelevant)
+
         platforms = supa.enabled_platforms()
-        rows = ideas_mod.to_rows(drafted, signals, platforms)
+        rows = ideas_mod.to_rows(kept, signals, platforms, run_id=run_id if migrated else None)
 
         # EventBridge schedules are at-least-once, so a retried run must not
         # double the queue. This is application-level rather than a unique
@@ -205,8 +275,9 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
         surfaced=len(signals),
         drafted=len(drafted),
         inserted=len(inserted),
-        hashtags_configured=len(terms),
+        hashtags_configured=len(selected) if description else len(terms),
         source=controls.trend_source,
+        prompted=bool(description),
     )
     log.info("trend run funnel: %s", report_mod.summarise(rejections))
 
@@ -216,6 +287,8 @@ def run(supa: Supa | None = None, run_id: str = "") -> dict:
         "drafted": len(drafted),
         "inserted": len(inserted),
         "suppressed": suppressed,
+        "irrelevant": irrelevant,
+        "prompted": bool(description),
         "scouted": report.seen,
         "hashtags_scouted": report.hashtags_scouted,
         "rejections": rejections,

@@ -21,6 +21,7 @@ import pytest
 
 from pipeline.trends import gtrends, runner, worker
 from pipeline.trends import ideas as ideas_mod
+from pipeline.trends import interpret as interpret_mod
 
 KEYWORDS = ["invoice software", "bookkeeping software", "excel alternative"]
 
@@ -100,12 +101,14 @@ class FakeSupa:
         requested_at: str | None = None,
         settings_row: dict[str, Any] | None = None,
         existing_titles: list[str] | None = None,
+        prompt: str | None = None,
     ) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
         self.raw = FakeRaw(existing_titles or [])
         self.inserted: list[dict[str, Any]] = []
         self.cursor_saves: list[int] = []
         self.stale_calls: list[dict[str, Any]] = []
+        self.interpretations: list[dict[str, Any]] = []
         self._settings = settings_row if settings_row is not None else {
             "niche_brief": "we automate operations for small businesses",
             "trend_source": "google_trends",
@@ -119,6 +122,9 @@ class FakeSupa:
                 "trigger": "manual",
                 "requested_at": requested_at,
                 "started_at": None,
+                # Present even when null: the migrated row shape, which is what
+                # tells the runner it may tag ideas with their run.
+                "prompt": prompt,
             }
 
     # -- what the worker calls ------------------------------------------
@@ -178,6 +184,12 @@ class FakeSupa:
     def save_hashtag_cursor(self, cursor: int) -> None:
         self.cursor_saves.append(cursor)
 
+    def record_interpretation(self, run_id: str, interpretation: dict[str, Any]) -> None:
+        self.interpretations.append({"run_id": run_id, **interpretation})
+        row = self.rows.get(run_id)
+        if row is not None:
+            row["interpretation"] = interpretation
+
     def trend_run_is_cancelled(self, _run_id: str) -> bool:
         return False
 
@@ -222,13 +234,20 @@ def google_trends_only(monkeypatch):
     # Drafting is not what these tests are about, but it must be exercised --
     # the incident's second failure was a run that claimed fine and then died
     # in the drafting step for a missing dependency.
-    def fake_generate(signals, brief, *, count, provider):
+    def fake_generate(signals, brief, *, count, provider, description=None):
+        make = ideas_mod.RelevantReelIdea if description else ideas_mod.ReelIdea
+        scored = (
+            {"relevance": 80, "connection": "It speaks to the parents you described."}
+            if description
+            else {}
+        )
         return [
-            ideas_mod.ReelIdea(
+            make(
                 title=f"Idea about {s.keyword}",
                 hook="A hook that earns two seconds",
                 angle="What this reel argues.",
                 rationale=f"{s.keyword} is rising at {s.ratio}x its own recent history.",
+                **scored,
             )
             for s in signals[:count]
         ]
@@ -409,3 +428,67 @@ class TestFailureIsRecordedRatherThanLost:
         row = supa.rows["run-1"]
         assert row["status"] == "failed"
         assert "No module named" in row["error"]
+
+
+class TestADescribedRequest:
+    """A row that carries a description, over the same seam as the rest.
+
+    The description is read before anything is scouted, the scout is handed
+    what was read rather than the saved list, the cursor is left alone, and the
+    ideas that land carry the run that drafted them.
+    """
+
+    PROMPT = "I want to start a small home fitness brand for busy parents"
+    READ = ("home workout for parents", "quick workout at home")
+
+    def test_it_is_read_scouted_on_what_was_read_and_tagged(self, monkeypatch, google_trends_only):
+        supa = FakeSupa(requested_at=ago(seconds=30), prompt=self.PROMPT)
+        order: list[str] = []
+
+        def fake_interpret(description, brief, source, *, cap, provider, **_kw):
+            order.append("interpret")
+            assert description == self.PROMPT
+            return interpret_mod.Interpretation(
+                restatement="A home fitness brand for busy parents.",
+                terms=list(self.READ),
+                vague=False,
+            )
+
+        monkeypatch.setattr(runner.interpret_mod, "interpret", fake_interpret)
+
+        building = google_trends_only.build_payload
+
+        def recording_build(kw_list, **kw):
+            order.append("scout")
+            return building(kw_list, **kw)
+
+        monkeypatch.setattr(google_trends_only, "build_payload", recording_build)
+
+        assert run_worker(supa, monkeypatch) == 0
+
+        row = supa.rows["run-1"]
+        assert row["status"] == "succeeded"
+        assert order[0] == "interpret" and "scout" in order
+        assert row["interpretation"]["restatement"] == "A home fitness brand for busy parents."
+        assert google_trends_only.asked == list(self.READ)
+        assert supa.cursor_saves == []
+        assert supa.inserted
+        assert all(r["trend_run_id"] == "run-1" for r in supa.inserted)
+        assert all(r["relevance"] == 80 and r["connection"] for r in supa.inserted)
+        assert any(s["key"] == "irrelevant" for s in row["rejections"]["stages"])
+
+    def test_an_ordinary_request_is_tagged_but_never_read(self, monkeypatch, google_trends_only):
+        supa = FakeSupa(requested_at=ago(seconds=30))
+        monkeypatch.setattr(
+            runner.interpret_mod,
+            "interpret",
+            lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("read a run with no prompt")),
+        )
+
+        run_worker(supa, monkeypatch)
+
+        assert supa.interpretations == []
+        assert google_trends_only.asked == KEYWORDS
+        assert all(r["trend_run_id"] == "run-1" for r in supa.inserted)
+        assert all(r["relevance"] is None for r in supa.inserted)
+        assert not any(s["key"] == "irrelevant" for s in supa.rows["run-1"]["rejections"]["stages"])

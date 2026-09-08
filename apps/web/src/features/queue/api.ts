@@ -26,7 +26,14 @@ export const queueKeys = {
     [...queueKeys.all, 'approvals', subjectType, subjectId] as const,
   events: (productionId: string) => [...queueKeys.all, 'events', productionId] as const,
   live: () => [...queueKeys.all, 'live'] as const,
+  // Under `live` on purpose, so the table-wide productions subscription that
+  // invalidates the live list invalidates this too: a production appearing is
+  // exactly what removes an idea from here.
+  undispatched: () => [...queueKeys.live(), 'undispatched'] as const,
   productionForIdea: (ideaId: string) => [...queueKeys.all, 'production-for-idea', ideaId] as const,
+  // Under `all` on purpose: a run finishing, an approval and a dismissal each
+  // invalidate that namespace, and each is exactly what changes this list.
+  searchIdeas: (runId: string) => [...queueKeys.all, 'search-ideas', runId] as const,
 };
 
 /** Statuses that mean "a person still has to look at this cut". */
@@ -135,6 +142,36 @@ export function ideaQueryOptions(id: string) {
   });
 }
 
+/** More than any run can insert (`ideas_per_run` tops out at 25), so a guard rather than a page. */
+export const SEARCH_IDEAS_LIMIT = 50;
+
+/**
+ * The pending ideas one described search produced, best fit first.
+ *
+ * Unpaged: a run inserts at most `ideas_per_run`. Pending only, so Review and
+ * Dismiss mean what they mean everywhere else; the header quotes the run's own
+ * `inserted` for the total. Relevance is null on ideas from a run that had no
+ * prompt, hence `nullsFirst: false`, and `created_at` breaks ties the way the
+ * main queue orders.
+ */
+export function searchIdeasQueryOptions(runId: string) {
+  return queryOptions({
+    queryKey: queueKeys.searchIdeas(runId),
+    queryFn: async (): Promise<IdeaRow[]> => {
+      const { data, error } = await supabase
+        .from('ideas')
+        .select('*')
+        .eq('trend_run_id', runId)
+        .eq('status', 'pending')
+        .order('relevance', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(SEARCH_IDEAS_LIMIT);
+      if (error) throw toError(error);
+      return data ?? [];
+    },
+  });
+}
+
 /**
  * Productions plus the idea and style they came from.
  *
@@ -230,6 +267,46 @@ export function productionEventsQueryOptions(productionId: string) {
         .order('created_at', { ascending: true });
       if (error) throw toError(error);
       return data ?? [];
+    },
+  });
+}
+
+/**
+ * Ideas that were approved and never dispatched.
+ *
+ * The one state that used to appear in no list at all. An approved idea leaves
+ * the pending queue at once, but it only reaches the live list when a worker
+ * opens a production for it — so with no worker running, every approval simply
+ * vanished. These are the ideas in that gap.
+ *
+ * Two round trips rather than an anti-join: the hand-written `Database` type
+ * carries no relationship metadata, so an embedded select would not be typed.
+ * Fifty approved ideas is far more than this queue holds at once.
+ */
+export function undispatchedIdeasQueryOptions() {
+  return queryOptions({
+    queryKey: queueKeys.undispatched(),
+    queryFn: async (): Promise<IdeaRow[]> => {
+      const { data: ideas, error } = await supabase
+        .from('ideas')
+        .select('*')
+        .eq('status', 'approved')
+        .order('decided_at', { ascending: false })
+        .limit(50);
+      if (error) throw toError(error);
+      if (!ideas || ideas.length === 0) return [];
+
+      const { data: productions, error: productionsError } = await supabase
+        .from('productions')
+        .select('idea_id')
+        .in(
+          'idea_id',
+          ideas.map((idea) => idea.id),
+        );
+      if (productionsError) throw toError(productionsError);
+
+      const dispatched = new Set((productions ?? []).map((production) => production.idea_id));
+      return ideas.filter((idea) => !dispatched.has(idea.id));
     },
   });
 }

@@ -231,7 +231,20 @@ volume has neither, so a `pg_dump` of `postiz-postgres` plus a tar of
 ## The presenter lane
 
 `ai-presenter` is approvable at Gate 1 and spends real money against a
-pay-as-you-go wallet. Two checks before the first approval:
+pay-as-you-go wallet.
+
+**It does not need MoneyPrinterTurbo.** HeyGen returns a finished, voiced,
+captioned 9:16 reel, and the two pieces of text the lane needs — the script an
+owner approves at the script gate, and the per-platform copy — are written by
+the same provider that drafts ideas (`IDEA_LLM_PROVIDER` with `GEMINI_API_KEY`
+or `ANTHROPIC_API_KEY`; see `pipeline/llm.py`). A deployment that only renders
+with HeyGen therefore needs Supabase, that one LLM key, `HEYGEN_API_KEY`, and
+`ffmpeg`/`ffprobe` for the quality check. `MPT_BASE_URL` can stay unset; it is
+read only when a preset with `render_mode = 'mpt'` or a fal lane is approved,
+or when no LLM key is configured at all, in which case scripts fall back to MPT
+and the worker log says so.
+
+Two checks before the first approval:
 
 ```sh
 # Valid key, and money behind it. Costs nothing.

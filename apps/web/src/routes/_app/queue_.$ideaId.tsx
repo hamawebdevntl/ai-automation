@@ -81,7 +81,8 @@ function IdeaDecisionPage() {
       // Deliberately no navigation. This page becomes the live view of the
       // production the approval just opened; bouncing back to the list of
       // *pending* ideas is what made the whole post-approval pipeline
-      // invisible in the first place.
+      // invisible in the first place. The production panel renders in this
+      // card's place, below, so the replacement appears where the eye already is.
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Could not approve this idea');
     }
@@ -130,8 +131,6 @@ function IdeaDecisionPage() {
         </Alert>
       )}
 
-      {idea.status === 'approved' && <IdeaProductionPanel ideaId={idea.id} />}
-
       <Card>
         <CardHeader>
           <CardTitle className="text-base">The idea</CardTitle>
@@ -139,6 +138,9 @@ function IdeaDecisionPage() {
         <CardContent className="space-y-4">
           <Detail label="Angle">{idea.angle}</Detail>
           <Detail label="Why now">{idea.rationale}</Detail>
+          {/* Only an idea from a described search has one: how it connects to
+              what the owner said they were working on. */}
+          <Detail label="How it fits">{idea.connection}</Detail>
           <Detail label="Platforms">
             <div className="flex flex-wrap gap-1.5">
               {idea.target_platforms.map((platform) => (
@@ -163,6 +165,8 @@ function IdeaDecisionPage() {
           )}
         </CardContent>
       </Card>
+
+      {idea.status === 'approved' && <IdeaProductionPanel ideaId={idea.id} decidedAt={idea.decided_at} />}
 
       {isPending && (
         <Card>

@@ -40,18 +40,18 @@ describe('route tree', () => {
  * to arrive at a bad one, so the schema must land the reader on the queue
  * rather than on an error boundary.
  */
-describe('queue paging', () => {
-  function parsedSearch(url: string): Record<string, unknown> {
-    const [pathname, search] = url.split('?');
-    const router = createRouter({ routeTree, context: { queryClient: {} as never, auth: {} as never } });
-    const matches = router.matchRoutes({
-      pathname,
-      search: Object.fromEntries(new URLSearchParams(search ?? '')),
-      searchStr: search ? `?${search}` : '',
-    } as never);
-    return (matches.at(-1) as { search: Record<string, unknown> }).search;
-  }
+function parsedSearch(url: string): Record<string, unknown> {
+  const [pathname, search] = url.split('?');
+  const router = createRouter({ routeTree, context: { queryClient: {} as never, auth: {} as never } });
+  const matches = router.matchRoutes({
+    pathname,
+    search: Object.fromEntries(new URLSearchParams(search ?? '')),
+    searchStr: search ? `?${search}` : '',
+  } as never);
+  return (matches.at(-1) as { search: Record<string, unknown> }).search;
+}
 
+describe('queue paging', () => {
   it('reads the page from the url', () => {
     expect(parsedSearch('/queue?page=3')).toMatchObject({ page: 3 });
   });
@@ -62,5 +62,28 @@ describe('queue paging', () => {
 
   it.each(['banana', '0', '-2', '1.5', ''])('falls back to the first page for ?page=%s', (value) => {
     expect(parsedSearch(`/queue?page=${value}`)).toMatchObject({ page: 1 });
+  });
+});
+
+/**
+ * A selected search is a trend run id in the URL, for the same reasons the
+ * page is. A mangled one shows the whole queue rather than an error boundary.
+ */
+describe('queue search param', () => {
+  const id = 'e1f78031-e9a2-4e3b-8383-dc206c22834e';
+
+  it('reads a run id from the url, alongside the page', () => {
+    expect(parsedSearch(`/queue?search=${id}`)).toMatchObject({ search: id, page: 1 });
+    expect(parsedSearch(`/queue?page=2&search=${id}`)).toMatchObject({ search: id, page: 2 });
+  });
+
+  it('is absent by default', () => {
+    expect(parsedSearch('/queue').search).toBeUndefined();
+  });
+
+  it.each(['banana', '', '123'])('drops a mangled ?search=%s and keeps the queue', (value) => {
+    const search = parsedSearch(`/queue?search=${value}`);
+    expect(search.search).toBeUndefined();
+    expect(search).toMatchObject({ page: 1 });
   });
 });

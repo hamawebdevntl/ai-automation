@@ -42,6 +42,7 @@ class TestSubmitRenderRetriesOnlyWhatCostsNothing:
             "FalRateLimited",
             "HeyGenRateLimited",
             "HeyGenInProgress",
+            "HeyGenUnreachable",
         }
 
     def test_it_is_the_only_retry_policy_on_the_step(self):

@@ -8,9 +8,11 @@ import {
   isAtScriptGate,
   isRenderInFlight,
   isScriptEditable,
+  isUnclaimed,
   rewindableSteps,
   scriptLockReason,
   stoppedAtStep,
+  WORKER_GRACE_MS,
 } from './pipeline-steps';
 
 type Prod = Parameters<typeof buildTimeline>[0];
@@ -324,5 +326,47 @@ describe('whether the script is still an input to anything', () => {
 
   it('gives no reason when there is nothing to explain', () => {
     expect(scriptLockReason(production({ status: 'awaiting_script', run_state: { step: 'await_script' } }))).toBeNull();
+  });
+});
+
+describe('a production nothing has picked up', () => {
+  const opened = Date.parse('2026-09-07T10:00:00Z');
+  const fresh = production({ status: 'queued', run_state: {}, created_at: '2026-09-07T10:00:00Z' });
+
+  it('is still starting inside the grace period', () => {
+    expect(isUnclaimed(fresh, opened + 5_000)).toBe(false);
+    expect(describeProduction(fresh, opened + 5_000).headline).toBe('Starting');
+  });
+
+  it('stops promising a start once the grace has passed', () => {
+    // The dispatcher polls every five seconds. Thirty seconds with no claim is
+    // not a slow start; it is a worker that is not running, and saying
+    // "within a few seconds" for hours is the bug this exists to prevent.
+    const later = opened + WORKER_GRACE_MS + 1;
+
+    expect(isUnclaimed(fresh, later)).toBe(true);
+    const verdict = describeProduction(fresh, later);
+    expect(verdict.headline).toBe('Waiting for a worker');
+    expect(verdict.tone).toBe('waiting');
+    expect(verdict.detail).toContain('not running');
+  });
+
+  it('does not count a row the worker has already touched', () => {
+    const started = production({
+      status: 'running',
+      run_state: { step: 'write_script' },
+      created_at: '2026-09-07T10:00:00Z',
+    });
+    expect(isUnclaimed(started, opened + 999_999)).toBe(false);
+  });
+
+  it('does not count a paused row, which is waiting on purpose', () => {
+    const paused = production({
+      status: 'queued',
+      run_state: {},
+      created_at: '2026-09-07T10:00:00Z',
+      paused_at: '2026-09-07T10:00:01Z',
+    });
+    expect(isUnclaimed(paused, opened + 999_999)).toBe(false);
   });
 });

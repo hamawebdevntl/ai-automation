@@ -64,7 +64,9 @@ class TestAStepAnnouncesItself:
         assert supa.event_trail[0] == ("write_script", "started")
 
     def test_the_detail_says_what_the_step_did(self, monkeypatch):
-        stub(monkeypatch, "render.submit_render", lambda e, s: {"task_id": "t1", "backend": "heygen"})
+        stub(
+            monkeypatch, "render.submit_render", lambda e, s: {"task_id": "t1", "backend": "heygen"}
+        )
         supa = FakeSupa()
 
         engine.advance(row("submit_render"), supa)
@@ -73,7 +75,11 @@ class TestAStepAnnouncesItself:
         assert "heygen" in succeeded["detail"]
 
     def test_the_payload_carries_the_technical_record_but_not_driver_bookkeeping(self, monkeypatch):
-        stub(monkeypatch, "render.submit_render", lambda e, s: {"task_id": "t1", "heygen_video_id": "v9"})
+        stub(
+            monkeypatch,
+            "render.submit_render",
+            lambda e, s: {"task_id": "t1", "heygen_video_id": "v9"},
+        )
         supa = FakeSupa()
 
         engine.advance(row("submit_render", run_state={"attempts": {"submit_render": 1}}), supa)
@@ -240,7 +246,11 @@ class TestPollingDoesNotDrownTheLog:
         state = {"step": "poll_render"}
 
         for pct in (10, 40, 80):
-            stub(monkeypatch, "render.poll_render", lambda e, s, p=pct: {"state": "running", "progress": p})
+            stub(
+                monkeypatch,
+                "render.poll_render",
+                lambda e, s, p=pct: {"state": "running", "progress": p},
+            )
             engine.advance({"id": "p1", "status": "running", "run_state": state}, supa)
             state = {k: v for k, v in supa.last_saved.items() if k != "due_at"}
 
@@ -303,3 +313,67 @@ class TestTerminalsExplainThemselves:
         engine.advance(row("await_gate2", status="rejected"), supa)
 
         assert ("rejected", "terminal") in supa.event_trail
+
+
+class TestInfrastructureBouncesDoNotFloodTheLog:
+    def _bounce(self, monkeypatch, supa, times: int):
+        def unreachable(event, supa):
+            raise SupaError("connection reset")
+
+        stub(monkeypatch, "render.poll_render", unreachable)
+        state = {"step": "poll_render"}
+        for _ in range(times):
+            engine.advance({"id": "p1", "status": "running", "run_state": state}, supa)
+            state = {k: v for k, v in supa.last_saved.items() if k != "due_at"}
+        return state
+
+    def test_the_first_bounce_is_recorded(self, monkeypatch):
+        supa = FakeSupa()
+        self._bounce(monkeypatch, supa, 1)
+        assert len(supa.events_of("infra_retry")) == 1
+
+    def test_eleven_more_are_not(self, monkeypatch):
+        # A row bouncing every five seconds would otherwise write 720 entries an
+        # hour, burying the one event that explains what it is waiting on.
+        supa = FakeSupa()
+        self._bounce(monkeypatch, supa, engine.INFRA_EVENT_EVERY - 1)
+        assert len(supa.events_of("infra_retry")) == 1
+
+    def test_the_twelfth_says_it_is_still_happening(self, monkeypatch):
+        supa = FakeSupa()
+        state = self._bounce(monkeypatch, supa, engine.INFRA_EVENT_EVERY)
+
+        events = supa.events_of("infra_retry")
+        assert len(events) == 2
+        assert events[1]["attempt"] == engine.INFRA_EVENT_EVERY
+        assert "in a row" in events[1]["detail"]
+        assert state["infra_retries"] == engine.INFRA_EVENT_EVERY
+
+    def test_a_success_clears_the_count(self, monkeypatch):
+        supa = FakeSupa()
+        state = self._bounce(monkeypatch, supa, 3)
+        assert state["infra_retries"] == 3
+
+        stub(monkeypatch, "render.poll_render", lambda e, s: {"state": "running", "progress": 10})
+        engine.advance({"id": "p1", "status": "running", "run_state": state}, supa)
+
+        assert "infra_retries" not in supa.last_saved
+
+    def test_the_count_never_reaches_an_activity(self, monkeypatch):
+        seen = {}
+
+        def capture(event, supa):
+            seen.update(event)
+            return {"state": "running"}
+
+        stub(monkeypatch, "render.poll_render", capture)
+        supa = FakeSupa()
+        engine.advance(
+            {
+                "id": "p1",
+                "status": "running",
+                "run_state": {"step": "poll_render", "infra_retries": 4},
+            },
+            supa,
+        )
+        assert "infra_retries" not in seen

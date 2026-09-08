@@ -224,6 +224,14 @@ GRAPH: dict[str, Step] = {
                     "FalRateLimited",
                     "HeyGenRateLimited",
                     "HeyGenInProgress",
+                    # A submit that never got an answer. Safe for the same
+                    # reason as the 409 above it: the request carries an
+                    # `Idempotency-Key`, so if it did reach HeyGen the retry
+                    # replays it and returns the same video id, and if it did
+                    # not, nothing was billed. Without this line a transport
+                    # error is not a HeyGen failure at all but an engine-level
+                    # "infrastructure" retry -- every five seconds, forever.
+                    "HeyGenUnreachable",
                 ),
                 interval_seconds=60,
                 max_attempts=10,

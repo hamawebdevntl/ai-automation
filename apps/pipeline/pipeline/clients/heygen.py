@@ -90,6 +90,19 @@ class HeyGenInProgress(HeyGenError):
     """
 
 
+class HeyGenUnreachable(HeyGenError):
+    """The request never got an answer: DNS, connection refused, reset, timeout.
+
+    Raised as a HeyGen error on purpose rather than letting `httpx`'s own
+    exception escape. The engine treats a bare `httpx.TransportError` as *our*
+    plumbing failing -- a Supabase blip -- and retries it every five seconds
+    without ever consuming an attempt. A provider outage wearing that label
+    spins forever and logs on every tick. Wearing this one, the graph decides:
+    `submit_render` retries it (the idempotency key makes a resubmit safe),
+    `poll_render` retries it a few times, and then it parks, visibly.
+    """
+
+
 class HeyGenRejected(HeyGenError):
     """A terminal configuration error: unknown avatar, unknown voice, bad field.
 
@@ -135,7 +148,12 @@ class HeyGenClient:
             headers["Idempotency-Key"] = idempotency_key
 
         with httpx.Client(timeout=self._timeout) as client:
-            resp = client.request(method, f"{API_BASE}{path}", headers=headers, **kw)
+            try:
+                resp = client.request(method, f"{API_BASE}{path}", headers=headers, **kw)
+            except httpx.TransportError as exc:
+                raise HeyGenUnreachable(
+                    f"HeyGen {method} {path} unreachable: {type(exc).__name__}: {exc}"
+                ) from exc
 
         if resp.status_code == 429:
             after = resp.headers.get("Retry-After")
@@ -197,7 +215,9 @@ class HeyGenClient:
         """
         return self._request("GET", "/v3/users/me")
 
-    def looks(self, *, ownership: str = "private", limit: int = MAX_LOOKS_PAGE) -> list[dict[str, Any]]:
+    def looks(
+        self, *, ownership: str = "private", limit: int = MAX_LOOKS_PAGE
+    ) -> list[dict[str, Any]]:
         """The avatar looks this account can actually use.
 
         The check DEPLOY.md section 5a asks an operator to curl before the
@@ -273,7 +293,8 @@ class HeyGenClient:
             # the alternative is a 400 that throws away the whole production.
             log.warning(
                 "script is %d chars, over HeyGen's %d limit; truncating",
-                len(text), MAX_SCRIPT_CHARS,
+                len(text),
+                MAX_SCRIPT_CHARS,
             )
             text = text[:MAX_SCRIPT_CHARS].rsplit(".", 1)[0] + "."
 
@@ -307,9 +328,7 @@ class HeyGenClient:
             # produced and the rendered video carries no captions at all.
             payload["caption"] = {"file_format": "srt", "style": "default"}
 
-        data = self._request(
-            "POST", "/v3/videos", idempotency_key=idempotency_key, json=payload
-        )
+        data = self._request("POST", "/v3/videos", idempotency_key=idempotency_key, json=payload)
         video_id = data.get("video_id")
         if not video_id:
             raise HeyGenError(f"HeyGen accepted the request but returned no video_id: {data}")

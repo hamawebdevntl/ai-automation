@@ -100,4 +100,18 @@ describe('refreshing the queue when a run ends', () => {
     // Nothing has been inserted yet: the ideas land at the end of the run.
     expect(invalidate).not.toHaveBeenCalled();
   });
+
+  it('refreshes the recent searches and remembers the finished row by id', async () => {
+    // The recent list shows each search's status and count, which are what
+    // just changed; and a search that stops being the latest a moment later
+    // should be read from the cache, not fetched again.
+    client.setQueryData(trendKeys.latestRun(), row({ id: 'search-1', status: 'running' }));
+    render(<Probe />, { wrapper });
+
+    const finished = row({ id: 'search-1', status: 'succeeded', finished_at: '2026-09-06T11:00:00Z', inserted: 3 });
+    await poll(finished);
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: trendKeys.recentSearches() }));
+    expect(client.getQueryData(trendKeys.run('search-1'))).toEqual(finished);
+  });
 });

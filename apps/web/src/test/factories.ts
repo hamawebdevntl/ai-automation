@@ -8,7 +8,7 @@
  * compile error rather than an `undefined` that quietly reaches a component.
  */
 
-import type { ProductionRow } from '@/lib/database.types';
+import type { IdeaRow, ProductionRow } from '@/lib/database.types';
 
 export function makeProduction(overrides: Partial<ProductionRow> = {}): ProductionRow {
   return {
@@ -45,6 +45,33 @@ export function makeProduction(overrides: Partial<ProductionRow> = {}): Producti
     postiz_media_path: null,
     paused_at: null,
     superseded_by: null,
+    ...overrides,
+  };
+}
+
+/** A pending idea from an ordinary run. The described-search columns are null unless asked for. */
+export function makeIdea(overrides: Partial<IdeaRow> = {}): IdeaRow {
+  return {
+    id: 'idea-1',
+    title: 'Why your quotes lose the job',
+    hook: 'You sent the quote. They went quiet.',
+    angle: 'Follow-up timing is the whole game.',
+    rationale: 'quoting software is rising 3.4x against its own recent history.',
+    source: 'google_trends',
+    source_url: 'https://trends.google.com/trends/explore?q=quoting%20software',
+    trend_keyword: 'quoting software',
+    velocity_ratio: 3.4,
+    velocity_label: 'rising',
+    target_platforms: ['instagram', 'tiktok'],
+    status: 'pending',
+    approved_style_id: null,
+    decided_by: null,
+    decided_at: null,
+    decision_note: null,
+    created_at: '2026-09-07T10:00:00Z',
+    trend_run_id: null,
+    relevance: null,
+    connection: null,
     ...overrides,
   };
 }

@@ -24,7 +24,14 @@ import {
   SearchLength,
   type SearchLengthChoice,
 } from '@/features/trends/components/search-length';
+import {
+  FewRelevant,
+  NothingRelevant,
+  NotInterpreted,
+  SearchInterpretation,
+} from '@/features/trends/components/search-states';
 import { diagnoseRun, estimateSearchLength } from '@/features/trends/controls';
+import { isSearchRun, searchOutcome, truncatePrompt } from '@/features/trends/search';
 import { isTrendRunInFlight, type TrendRunRow } from '@/lib/database.types';
 import { formatMinutes, formatRelative } from '@/lib/format';
 import { toError } from '@/lib/supabase-error';
@@ -109,14 +116,49 @@ export function GenerateIdeasButton() {
  * bar above them saying so is clutter. It speaks while a run is going, because
  * an hour of nothing looks identical to a broken button, and when a run failed
  * or found nothing, because both leave the queue looking untouched.
+ *
+ * `exceptRunId` is the run the search panel is already describing. The panel
+ * and this banner read the same polled row, and saying the same thing twice on
+ * one page is how the second copy stops being read.
  */
-export function TrendRunBanner() {
+export function TrendRunBanner({ exceptRunId = null }: { exceptRunId?: string | null }) {
   const { data: run } = useQuery(latestTrendRunQueryOptions());
-  if (!run) return null;
+  if (!run || run.id === exceptRunId) return null;
+  return <RunBanner run={run} />;
+}
 
+/**
+ * The state of one run, whichever run it is.
+ *
+ * Pure: `TrendRunBanner` feeds it the latest row and the search panel feeds it
+ * the selected one, so every state has a single implementation and a described
+ * search differs only where it has something more to say.
+ *
+ * `onRefine` and `onRetry` are the two affordances a described search adds,
+ * and they only make sense next to the box. Without them the same states offer
+ * a link into the search instead.
+ */
+export function RunBanner({
+  run,
+  onRefine,
+  onRetry,
+}: {
+  run: TrendRunRow;
+  /** Focus the box with the words still in it. Spends nothing. */
+  onRefine?: (prompt: string) => void;
+  /** Send the same description again. This one spends, and the button says so. */
+  onRetry?: (prompt: string) => void;
+}) {
   if (isTrendRunInFlight(run)) return <InFlight run={run} />;
   if (run.status === 'cancelled') return <Stopped run={run} />;
-  if (run.status === 'failed') return <Failed run={run} />;
+  if (run.status === 'failed') return <Failed run={run} onRetry={onRetry} />;
+  if (run.status === 'succeeded' && isSearchRun(run)) {
+    if (run.interpretation === null) return <NotInterpreted run={run} />;
+    const outcome = searchOutcome(run);
+    if (outcome === 'none') return <NothingRelevant run={run} onRefine={onRefine} />;
+    if (outcome === 'few') return <FewRelevant run={run} onRefine={onRefine} />;
+    return null;
+  }
   if (run.status === 'succeeded' && run.inserted === 0) return <FoundNothing run={run} />;
   return null;
 }
@@ -202,17 +244,32 @@ function InFlight({ run }: { run: TrendRunRow }) {
   // look like a working one.
   if (run.status === 'requested' && isUnclaimed(run)) return <NobodyPickedItUp run={run} />;
 
+  // A described search has two more things to say while it runs: what it is
+  // for, and -- once the worker has read the description -- how it understood
+  // it. That line is the whole reason the interpretation is written before
+  // scouting: a misreading is cheapest to correct while the scout is going.
+  const searching = isSearchRun(run);
+
   return (
     <Alert>
       <Spinner className="size-4" />
-      <AlertTitle>Scouting for ideas</AlertTitle>
+      <AlertTitle>{searching ? 'Searching for ideas' : 'Scouting for ideas'}</AlertTitle>
       <AlertDescription>
-        {run.trigger === 'schedule' && 'This is the scheduled run. '}
-        {run.status === 'requested'
-          ? `Queued for the next scout, which runs about every ${formatMinutes(SCOUT_CADENCE_MINUTES)} — so this may wait a while before it starts.`
-          : `Started ${formatRelative(started)}.`}{' '}
-        A full pass takes about {formatMinutes(TREND_RUN_MINUTES)}, and new ideas appear here as soon as it finishes.
-        You do not need to stay on this page.
+        {searching && <span>For: “{truncatePrompt(run.prompt, 120)}”</span>}
+        {searching &&
+          (run.interpretation ? (
+            <SearchInterpretation interpretation={run.interpretation} />
+          ) : (
+            <span>Reading your description and working out what to look for — that takes a minute or so.</span>
+          ))}
+        <span>
+          {run.trigger === 'schedule' && 'This is the scheduled run. '}
+          {run.status === 'requested'
+            ? `Queued for the next scout, which runs about every ${formatMinutes(SCOUT_CADENCE_MINUTES)} — so this may wait a while before it starts.`
+            : `Started ${formatRelative(started)}.`}{' '}
+          A full pass takes about {formatMinutes(TREND_RUN_MINUTES)}, and new ideas appear here as soon as it finishes.
+          You do not need to stay on this page.
+        </span>
         <StopRunButton run={run} />
       </AlertDescription>
     </Alert>
@@ -246,7 +303,40 @@ function NobodyPickedItUp({ run }: { run: TrendRunRow }) {
   );
 }
 
-function Failed({ run }: { run: TrendRunRow }) {
+function Failed({ run, onRetry }: { run: TrendRunRow; onRetry?: (prompt: string) => void }) {
+  if (isSearchRun(run)) {
+    // A description the worker could not turn into anything to search for
+    // fails here with the nudge already in its error text. Shown separately
+    // only when it is not.
+    const nudge = run.interpretation?.nudge ?? null;
+    const showNudge = nudge !== null && !(run.error ?? '').includes(nudge);
+    return (
+      <Alert variant="destructive">
+        <CircleAlertIcon className="size-4" />
+        <AlertTitle>The search did not finish</AlertTitle>
+        <AlertDescription>
+          <span className="break-words">{run.error ?? 'It stopped without saying why.'}</span>
+          {showNudge && <span>Worth adding: {nudge}</span>}
+          <span>
+            Nothing was added. You can try the same search again, or use the trend search inputs below to run a manual
+            scout.
+          </span>
+          {onRetry ? (
+            <Button variant="outline" size="sm" className="w-fit" onClick={() => onRetry(run.prompt)}>
+              Try this search again
+            </Button>
+          ) : (
+            <Button asChild variant="outline" size="sm" className="w-fit">
+              <Link to="/queue" search={{ search: run.id }}>
+                Open this search
+              </Link>
+            </Button>
+          )}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
   return (
     <Alert variant="destructive">
       <CircleAlertIcon className="size-4" />

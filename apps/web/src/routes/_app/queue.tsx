@@ -1,21 +1,18 @@
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute, Link } from '@tanstack/react-router';
-import { ArrowRightIcon } from 'lucide-react';
 import { z } from 'zod';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { ideaPageQueryOptions } from '@/features/queue/api';
-import { DismissIdeaButton } from '@/features/queue/components/dismiss-idea-button';
+import { ideaPageQueryOptions, searchIdeasQueryOptions } from '@/features/queue/api';
+import { IdeaCard } from '@/features/queue/components/idea-card';
 import { InProductionPanel } from '@/features/queue/components/in-production-panel';
 import { PageHeader } from '@/features/queue/components/page-header';
 import { EmptyQueue, ListSkeleton, QueryError } from '@/features/queue/components/query-state';
 import { QueuePagination } from '@/features/queue/components/queue-pagination';
-import { VelocityBadge } from '@/features/queue/components/velocity-badge';
-import { useRefreshQueueWhenRunEnds } from '@/features/trends/api';
+import { SearchResults } from '@/features/queue/components/search-results';
+import { trendRunQueryOptions, useRefreshQueueWhenRunEnds } from '@/features/trends/api';
+import { AiSearchPanel } from '@/features/trends/components/ai-search-panel';
 import { GenerateIdeasButton, TrendRunBanner } from '@/features/trends/components/generate-ideas';
 import { TrendInputsCard } from '@/features/trends/components/trend-inputs-card';
-import { formatRelative, titleCase } from '@/lib/format';
 
 /**
  * The page is a search param rather than component state so it survives the
@@ -24,20 +21,34 @@ import { formatRelative, titleCase } from '@/lib/format';
  *
  * `catch` rather than a validation error: `?page=banana` in a pasted link
  * should land on the queue, not on an error boundary.
+ *
+ * `search` is a trend run id and narrows the list to the ideas that run
+ * drafted. In the URL for the same reason as the page: a search someone
+ * started should survive Review-and-back and be linkable. Same `catch`
+ * convention -- a mangled id shows the whole queue rather than an error.
  */
 const searchSchema = z.object({
   page: z.coerce.number().int().min(1).catch(1).default(1),
+  search: z.uuid().optional().catch(undefined),
 });
 
 export const Route = createFileRoute('/_app/queue')({
   validateSearch: searchSchema,
-  loaderDeps: ({ search: { page } }) => ({ page }),
-  loader: ({ context, deps }) => context.queryClient.ensureQueryData(ideaPageQueryOptions('pending', deps.page)),
+  loaderDeps: ({ search: { page, search } }) => ({ page, search }),
+  loader: ({ context, deps }) =>
+    deps.search
+      ? Promise.all([
+          context.queryClient.ensureQueryData(trendRunQueryOptions(deps.search)),
+          context.queryClient.ensureQueryData(searchIdeasQueryOptions(deps.search)),
+        ])
+      : context.queryClient.ensureQueryData(ideaPageQueryOptions('pending', deps.page)),
   component: IdeaQueuePage,
 });
 
 function IdeaQueuePage() {
-  const { page } = Route.useSearch();
+  const { page, search: selectedRunId = null } = Route.useSearch();
+  // Read in both modes, so the header count stays "the whole queue" while a
+  // search is selected: it is the size of the decision, not of the filter.
   const { data, isPending, error } = useQuery(ideaPageQueryOptions('pending', page));
 
   // A run finishing is the one thing that fills this list without anybody
@@ -59,12 +70,20 @@ function IdeaQueuePage() {
         actions={<GenerateIdeasButton />}
       />
 
-      <TrendRunBanner />
+      {/* The page's first call to action. Describing what you are working on
+          is the way in for someone who does not know which keywords to set;
+          the saved inputs below are the standing brief. */}
+      <AiSearchPanel selectedRunId={selectedRunId} />
 
-      {/* Directly under the button that spends it. These are the inputs
-          that decide what the next run finds, and until now they lived on
-          another page — so the one question this page raises ("why is
-          nothing coming through?") was answered somewhere else. Shut by
+      {/* Cause above effect: the banner reports on whichever run the header
+          button or the panel started, so it sits under both. It skips the
+          selected search, which the panel is already describing. */}
+      <TrendRunBanner exceptRunId={selectedRunId} />
+
+      {/* Directly under the controls that spend it. These are the inputs
+          that decide what the next ordinary run finds, and until now they
+          lived on another page — so the one question this page raises ("why
+          is nothing coming through?") was answered somewhere else. Shut by
           default: the ideas are what this page is for. */}
       <TrendInputsCard collapsible />
 
@@ -72,78 +91,47 @@ function IdeaQueuePage() {
           possibly stuck, matters more than the next decision to make. */}
       <InProductionPanel />
 
-      {error && <QueryError error={error} />}
-      {isPending && <ListSkeleton />}
+      {selectedRunId ? (
+        <SearchResults runId={selectedRunId} />
+      ) : (
+        <>
+          {error && <QueryError error={error} />}
+          {isPending && <ListSkeleton />}
 
-      {pastTheEnd && (
-        <EmptyQueue
-          title="Nothing on this page"
-          description="The queue is shorter than it was — ideas here have since been decided."
-          action={
-            <Button asChild variant="outline" size="sm">
-              <Link to="/queue" search={{ page: 1 }}>
-                Back to the first page
-              </Link>
-            </Button>
-          }
-        />
+          {pastTheEnd && (
+            <EmptyQueue
+              title="Nothing on this page"
+              description="The queue is shorter than it was — ideas here have since been decided."
+              action={
+                <Button asChild variant="outline" size="sm">
+                  <Link to="/queue" search={{ page: 1 }}>
+                    Back to the first page
+                  </Link>
+                </Button>
+              }
+            />
+          )}
+
+          {data && data.total === 0 && (
+            <EmptyQueue
+              title="Nothing waiting"
+              description="Trend research has not proposed any new ideas since the last time you looked. Describe what you want above, or generate more with whatever is set under Trend search inputs."
+            />
+          )}
+
+          {ideas.length > 0 && (
+            <ul className="space-y-3">
+              {ideas.map((idea) => (
+                <li key={idea.id}>
+                  <IdeaCard idea={idea} />
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <QueuePagination page={page} pageCount={pageCount} />
+        </>
       )}
-
-      {data && data.total === 0 && (
-        <EmptyQueue
-          title="Nothing waiting"
-          description="Trend research has not proposed any new ideas since the last time you looked. Generating more searches whatever is set under Trend search inputs above."
-        />
-      )}
-
-      {ideas.length > 0 && (
-        <ul className="space-y-3">
-          {ideas.map((idea) => (
-            <li key={idea.id}>
-              <Card className="transition-colors hover:border-primary/40">
-                <CardHeader>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <VelocityBadge label={idea.velocity_label} ratio={idea.velocity_ratio} />
-                    {idea.trend_keyword && (
-                      <Badge variant="outline" className="max-w-full truncate font-normal text-muted-foreground">
-                        {idea.trend_keyword}
-                      </Badge>
-                    )}
-                    <span className="text-xs text-muted-foreground">{formatRelative(idea.created_at)}</span>
-                  </div>
-                  <CardTitle className="text-base break-words">{idea.title}</CardTitle>
-                  {idea.hook && <CardDescription className="break-words">{idea.hook}</CardDescription>}
-                  {/* Top right rather than beside Review: the two are opposite
-                      decisions, and on a phone Review takes the full width. */}
-                  <CardAction>
-                    <DismissIdeaButton ideaId={idea.id} title={idea.title} />
-                  </CardAction>
-                </CardHeader>
-                {/* Stacked on a phone, one row from `sm` up: the platform
-                    badges and the button both need their full width below
-                    that, and a half-width button is a poor tap target. */}
-                <CardContent className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="flex flex-wrap gap-1.5">
-                    {idea.target_platforms.map((platform) => (
-                      <Badge key={platform} variant="secondary" className="font-normal">
-                        {titleCase(platform)}
-                      </Badge>
-                    ))}
-                  </div>
-                  <Button asChild size="sm" className="w-full sm:w-auto">
-                    <Link to="/queue/$ideaId" params={{ ideaId: idea.id }}>
-                      Review
-                      <ArrowRightIcon className="size-4" />
-                    </Link>
-                  </Button>
-                </CardContent>
-              </Card>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      <QueuePagination page={page} pageCount={pageCount} />
     </div>
   );
 }

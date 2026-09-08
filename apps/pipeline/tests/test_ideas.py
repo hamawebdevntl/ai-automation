@@ -18,10 +18,16 @@ from pipeline.trends.ideas import (
     CLAUDE,
     CLAUDE_MODEL,
     GEMINI,
+    SEARCH_ADDENDUM,
+    SYSTEM,
     IdeaBatch,
     ReelIdea,
+    RelevantIdeaBatch,
+    RelevantReelIdea,
     generate_ideas,
     resolve_provider,
+    split_relevant,
+    to_rows,
 )
 from pipeline.trends.velocity import Signal
 
@@ -251,3 +257,81 @@ class TestClaudeResponsesThatAreNotABatch:
             ideas = generate_ideas([signal()], BRIEF, provider=CLAUDE, client=client)
         assert ideas == []
         assert "max_tokens" in caplog.text
+
+
+class TestDraftingAgainstADescription:
+    """A described run asks for a score and a connection.
+
+    The ordinary run must not change by a character -- its schema and prompt
+    are what every idea in the queue so far was drafted with -- so the extra
+    ask is a second schema and an addendum, switched on by the description.
+    """
+
+    DESCRIPTION = "I want to start a small home fitness brand for busy parents"
+
+    def relevant(self, *scores: int) -> RelevantIdeaBatch:
+        return RelevantIdeaBatch(
+            ideas=[
+                RelevantReelIdea(
+                    title=f"Idea {i}",
+                    hook=f"Hook {i}",
+                    angle="a",
+                    rationale="r",
+                    relevance=score,
+                    connection=f"For the parents you mentioned ({i}).",
+                )
+                for i, score in enumerate(scores)
+            ]
+        )
+
+    def test_the_schema_and_the_prompt_change_with_a_description(self):
+        client = FakeGemini(self.relevant(80))
+        generate_ideas(
+            [signal()], BRIEF, provider=GEMINI, model="m", client=client,
+            description=self.DESCRIPTION,
+        )
+        call = client.calls[0]
+        assert call["config"]["response_schema"] is RelevantIdeaBatch
+        assert call["config"]["system_instruction"].endswith(SEARCH_ADDENDUM)
+        assert "# What the person is working on\n" + self.DESCRIPTION in call["contents"]
+
+    def test_without_a_description_nothing_changes(self):
+        client = FakeGemini(batch())
+        generate_ideas([signal()], BRIEF, provider=GEMINI, model="m", client=client)
+        call = client.calls[0]
+        assert call["config"]["response_schema"] is IdeaBatch
+        assert call["config"]["system_instruction"] == SYSTEM
+        assert "working on" not in call["contents"]
+
+    def test_ideas_come_back_best_fit_first_within_the_count(self):
+        client = FakeGemini(self.relevant(40, 95, 70))
+        ideas = generate_ideas(
+            [signal()], BRIEF, count=2, provider=GEMINI, model="m", client=client,
+            description=self.DESCRIPTION,
+        )
+        assert [i.relevance for i in ideas] == [95, 70]
+
+    def test_split_relevant_drops_below_the_floor_and_keeps_the_unscored(self):
+        scored = self.relevant(90, 39, 40).ideas
+        plain = batch(1).ideas
+        kept, dropped = split_relevant(scored + plain)
+        assert [getattr(i, "relevance", None) for i in kept] == [90, 40, None]
+        assert [i.relevance for i in dropped] == [39]
+
+    def test_rows_carry_the_run_the_score_and_the_connection(self):
+        rows = to_rows(self.relevant(85).ideas, [signal()], ["instagram"], run_id="run-1")
+        assert rows[0]["trend_run_id"] == "run-1"
+        assert rows[0]["relevance"] == 85
+        assert rows[0]["connection"] == "For the parents you mentioned (0)."
+
+    def test_plain_ideas_under_a_run_carry_null_scores(self):
+        rows = to_rows(batch(1).ideas, [signal()], ["instagram"], run_id="run-1")
+        assert rows[0]["trend_run_id"] == "run-1"
+        assert rows[0]["relevance"] is None
+        assert rows[0]["connection"] is None
+
+    def test_without_a_run_the_row_is_shaped_as_it_always_was(self):
+        rows = to_rows(batch(1).ideas, [signal()], ["instagram"])
+        assert "trend_run_id" not in rows[0]
+        assert "relevance" not in rows[0]
+        assert "connection" not in rows[0]

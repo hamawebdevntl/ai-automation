@@ -26,12 +26,18 @@ and would have quietly changed what a signal means: a large account posting a
 mediocre video beats a hashtag's median comfortably, which is precisely the
 false positive `outlier_ratio` exists to prevent.
 
-One caveat stated plainly, because it cannot be tested from here: the field
-names below are the documented output of these actors, but we have no
-credentials to verify them against, and an actor's output shape is not a
-contract we control. Every read goes through `_pick`, which tries the plausible
-names and records a rejection when none of them match. A renamed field costs
-this source its signals and says so in the run breakdown; it does not raise.
+One caveat stated plainly: an actor's output shape is not a contract we
+control. The field names below were checked against live output from all three
+actors on 2026-09-08 and every first candidate matched, but that is a snapshot,
+not a promise. Every read goes through `_pick`, which tries the plausible names
+and records a rejection when none of them match. A renamed field costs this
+source its signals and says so in the run breakdown; it does not raise.
+
+Two things the same check corrected. The TikTok actor's date filter applies to
+profile and search scrapes only -- on a hashtag scrape it is ignored without
+charge, so recency is enforced locally by `too_old` and old videos are paid for.
+And a profile scrape leads with the author's pinned videos, which are their
+showcase rather than their norm, so the baseline asks for them to be left out.
 """
 
 from __future__ import annotations
@@ -41,9 +47,11 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 
+from pipeline.clients.apify import TERMINAL_STATES, ApifyClient, ApifyError, ApifyRefused
 from pipeline.trends import velocity as vel
 from pipeline.trends.base import (
     Budget,
@@ -73,6 +81,28 @@ POLL_INTERVAL_S = 5.0
 # conclude that one actor is stuck". Without it, one wedged hashtag absorbs the
 # entire budget and the remaining hashtags are never scouted.
 RUN_TIMEOUT_S = 600.0
+
+# The ceiling Apify itself puts on a run, passed when the run is started.
+#
+# Longer than RUN_TIMEOUT_S on purpose: the local deadline is the normal way a
+# stuck run ends, and it records why in the report. This one exists for the case
+# where nobody is left to enforce the local deadline -- a worker restarted
+# mid-scout -- because the actors' own defaults are unlimited (TikTok) and seven
+# days (Instagram profiles), and a run keeps billing until it ends.
+REMOTE_TIMEOUT_S = RUN_TIMEOUT_S + 60.0
+
+# How many times to ask again when a poll or a dataset read fails for a reason
+# that waiting can fix.
+#
+# A poll asks about a run that carries on regardless, and a dataset read fetches
+# results already paid for, so one 429 or one dropped connection should cost
+# seconds rather than a hashtag. Past this the API is down rather than blinking,
+# and giving up is the honest answer.
+TRANSIENT_ATTEMPTS = 3
+
+# Terminal states other than success. Derived rather than re-listed so that a
+# state added to the client is not silently polled forever here.
+FAILED_STATES = TERMINAL_STATES - {"SUCCEEDED"}
 
 # How many of an author's recent posts to ask for when building their baseline.
 #
@@ -105,12 +135,14 @@ class PlatformSpec:
     url: tuple[str, ...]
     author: tuple[str, ...]
 
-    def hashtag_input(self, hashtag: str, limit: int, oldest: str = "") -> dict[str, Any]:
+    def hashtag_input(self, hashtag: str, limit: int) -> dict[str, Any]:
         """The actor's input for one hashtag.
 
-        `oldest` is an ISO date, passed only by platforms whose actor can filter
-        by it. Instagram's hashtag scraper has no date field in its schema, so
-        it pays for old posts and drops them locally.
+        No date bound on either platform. Instagram's hashtag scraper has no
+        date field in its schema, and TikTok's documents its date filter for
+        profile and search scrapes only -- a live check confirmed it is ignored
+        on a hashtag scrape, neither applied nor charged. So both pay for old
+        posts and `too_old` drops them locally.
         """
         raise NotImplementedError
 
@@ -123,8 +155,13 @@ class PlatformSpec:
 
 @dataclass
 class _TikTok(PlatformSpec):
-    def hashtag_input(self, hashtag: str, limit: int, oldest: str = "") -> dict[str, Any]:
-        payload: dict[str, Any] = {
+    def hashtag_input(self, hashtag: str, limit: int) -> dict[str, Any]:
+        # No `oldestPostDateUnified` here. It reads as though it would apply the
+        # recency bar before we are charged, and an earlier version sent it for
+        # that reason; the actor documents it for profile scrapes and a live
+        # run confirmed it is ignored on hashtags. Sending it would mislead the
+        # next reader about where `too_old` is enforced.
+        return {
             "hashtags": [hashtag.lstrip("#")],
             "resultsPerPage": limit,
             # Every download flag off, explicitly. This actor bills per result
@@ -135,39 +172,57 @@ class _TikTok(PlatformSpec):
             "shouldDownloadSlideshowImages": False,
             "shouldDownloadAvatars": False,
         }
-        if oldest:
-            # The actor filters by date server-side, so this is the same bar as
-            # `max_video_age_days` applied before we are charged for the result
-            # rather than after. The local `too_old` check stays as the backstop
-            # and should read close to zero while this works.
-            payload["oldestPostDateUnified"] = oldest
-        return payload
 
     def profile_input(self, authors: list[str], limit: int) -> dict[str, Any]:
         return {
             "profiles": authors,
             "resultsPerPage": limit,
+            # A profile page leads with the author's pinned videos, and with a
+            # sample this small they were most of it: three of five for two of
+            # three authors in the live check, one of them two 1.3M-view videos
+            # from a year earlier. Pinned posts are the author's showcase, not
+            # their norm, and a median built from them hides the next hit --
+            # the exact opposite of what the baseline is for. Free to exclude.
+            "excludePinnedPosts": True,
+            # The same four as the hashtag scrape, for the same reason.
             "shouldDownloadVideos": False,
             "shouldDownloadCovers": False,
+            "shouldDownloadSlideshowImages": False,
+            "shouldDownloadAvatars": False,
         }
 
     def profile_url(self, author: str) -> str:
         return f"https://www.tiktok.com/@{author}"
 
 
+# Reels, not posts, on both Instagram scrapes.
+#
+# "posts" is a hashtag page's top posts, and on a live check ten of ten were
+# images or carousels: no play count, so every one was paid for and then
+# dropped as `no_metrics`. "reels" returned ten videos, each with a play count.
+# The scout measures views, so the only results worth being billed for are the
+# ones that have them. The same holds for the baseline: an author's images
+# cannot contribute to a median of view counts, so a "posts" profile scrape
+# pays for items the median then skips.
+INSTAGRAM_RESULTS_TYPE = "reels"
+
+
 @dataclass
 class _Instagram(PlatformSpec):
-    def hashtag_input(self, hashtag: str, limit: int, oldest: str = "") -> dict[str, Any]:
+    def hashtag_input(self, hashtag: str, limit: int) -> dict[str, Any]:
         # `resultsLimit`, not `resultsPerPage`. The two actors genuinely differ,
         # which is the strongest available hint that they will differ again --
         # and the reason these inputs are a table rather than written inline.
-        # No date field exists in this actor's schema, so `oldest` is ignored.
-        return {"hashtags": [hashtag.lstrip("#")], "resultsType": "posts", "resultsLimit": limit}
+        return {
+            "hashtags": [hashtag.lstrip("#")],
+            "resultsType": INSTAGRAM_RESULTS_TYPE,
+            "resultsLimit": limit,
+        }
 
     def profile_input(self, authors: list[str], limit: int) -> dict[str, Any]:
         return {
             "directUrls": [self.profile_url(a) for a in authors],
-            "resultsType": "posts",
+            "resultsType": INSTAGRAM_RESULTS_TYPE,
             "resultsLimit": limit,
         }
 
@@ -226,8 +281,6 @@ class ApifyConfig:
 def _client(config: ApifyConfig) -> Any:
     if config.client is not None:
         return config.client
-    from pipeline.clients.apify import ApifyClient
-
     return ApifyClient()
 
 
@@ -349,6 +402,32 @@ def _stopped(config: ApifyConfig, report: ScoutReport) -> bool:
     return False
 
 
+def _retry(call: Callable[[], Any], *, what: str) -> Any:
+    """`call()`, repeated through the failures that waiting can fix.
+
+    A 429 waits as long as the server asked, anything else one poll interval.
+    `ApifyRefused` is re-raised at once: a bad token does not become good by
+    waiting. The last error is re-raised when the attempts are spent, so the
+    caller decides what giving up means -- for a run in flight, aborting it.
+
+    Not used for starting a run. A POST that times out is ambiguous about
+    whether a run was created, and retrying it could start -- and bill -- two.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return call()
+        except ApifyRefused:
+            raise
+        except ApifyError as exc:
+            if attempt >= TRANSIENT_ATTEMPTS:
+                raise
+            wait = getattr(exc, "retry_after", None) or POLL_INTERVAL_S
+            log.warning("%s failed (%s); asking again in %.0fs", what, exc, wait)
+            time.sleep(wait)
+
+
 def _collect(
     client: Any,
     actor: str,
@@ -367,10 +446,8 @@ def _collect(
     stop waiting for it, so the only way Stop actually stops the spending is to
     say so.
     """
-    from pipeline.clients.apify import ApifyError
-
     try:
-        run = client.start_run(actor, payload)
+        run = client.start_run(actor, payload, timeout_s=REMOTE_TIMEOUT_S)
     except ApifyError as exc:
         log.warning("could not start %s for %s: %s", actor, label, exc)
         report.failed_hashtags.append({"hashtag": label, "error": f"{type(exc).__name__}: {exc}"[:300]})
@@ -392,8 +469,11 @@ def _collect(
             return []
 
         try:
-            status = client.run_status(run_id)
+            status = _retry(partial(client.run_status, run_id), what=f"polling {label}")
         except ApifyError as exc:
+            # The run is still going on Apify's side. Giving up on reading it
+            # is not the same as stopping it, and only the second stops the bill.
+            client.abort_run(run_id)
             report.failed_hashtags.append({"hashtag": label, "error": f"{type(exc).__name__}: {exc}"[:300]})
             return []
 
@@ -404,13 +484,16 @@ def _collect(
                 report.failed_hashtags.append({"hashtag": label, "error": "the run produced no dataset"})
                 return []
             try:
-                return client.dataset_items(dataset_id, limit=limit)
+                return _retry(
+                    partial(client.dataset_items, dataset_id, limit=limit),
+                    what=f"fetching {label}",
+                )
             except ApifyError as exc:
                 report.failed_hashtags.append(
                     {"hashtag": label, "error": f"{type(exc).__name__}: {exc}"[:300]}
                 )
                 return []
-        if state in {"FAILED", "ABORTED", "TIMED-OUT", "TIMING-OUT"}:
+        if state in FAILED_STATES:
             log.warning("%s for %s ended %s", actor, label, state)
             report.failed_hashtags.append({"hashtag": label, "error": f"the scraper ended {state}"})
             return []
@@ -484,11 +567,6 @@ def scout(config: ApifyConfig) -> ScoutOutcome:
     report = ScoutReport()
     client = _client(config)
 
-    # The recency bar as a date, for the actors that can apply it themselves.
-    oldest_wanted = (
-        datetime.now(timezone.utc) - timedelta(days=controls.max_video_age_days)
-    ).date().isoformat()
-
     platforms = [p for p in config.platforms if p in PLATFORMS]
     if not platforms:
         # `controls._platforms` already refuses to produce this, so reaching it
@@ -536,7 +614,7 @@ def scout(config: ApifyConfig) -> ScoutOutcome:
             raw_items = _collect(
                 client,
                 spec.hashtag_actor,
-                spec.hashtag_input(tag, controls.videos_per_hashtag, oldest=oldest_wanted),
+                spec.hashtag_input(tag, controls.videos_per_hashtag),
                 limit=controls.videos_per_hashtag,
                 config=config,
                 budget=budget,

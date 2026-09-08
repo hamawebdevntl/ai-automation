@@ -1,11 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
-import { ArrowRightIcon } from 'lucide-react';
+import { ArrowRightIcon, CircleAlertIcon } from 'lucide-react';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Spinner } from '@/components/ui/spinner';
+import { formatRelative } from '@/lib/format';
 import { productionEventsQueryOptions, productionForIdeaQueryOptions } from '../api';
-import { describeProduction, isAtScriptGate } from '../pipeline-steps';
+import { describeProduction, hasStarted, isAtScriptGate, WORKER_GRACE_MS } from '../pipeline-steps';
 import { useProductionStream } from '../use-production-stream';
 import { ProductionStatusBadge } from './production-status';
 import { ProductionTimeline } from './production-timeline';
@@ -34,10 +36,14 @@ import { ScriptEditor } from './script-editor';
  */
 const STARTING_POLL_MS = 2000;
 
-export function IdeaProductionPanel({ ideaId }: { ideaId: string }) {
+export function IdeaProductionPanel({ ideaId, decidedAt }: { ideaId: string; decidedAt: string | null }) {
   const productionQuery = useQuery({
     ...productionForIdeaQueryOptions(ideaId),
-    refetchInterval: (query) => (query.state.data ? false : STARTING_POLL_MS),
+    // Keep polling until the worker has actually touched the row, not merely
+    // until the row exists. A row that is never claimed is the case this
+    // panel most needs to notice, and the re-render is what lets "Starting"
+    // become "Waiting for a worker" without anyone reloading.
+    refetchInterval: (query) => (query.state.data && hasStarted(query.state.data) ? false : STARTING_POLL_MS),
   });
 
   const production = productionQuery.data ?? null;
@@ -63,6 +69,9 @@ export function IdeaProductionPanel({ ideaId }: { ideaId: string }) {
   }
 
   if (!production) {
+    const waitedMs = decidedAt ? Date.now() - new Date(decidedAt).getTime() : 0;
+    if (waitedMs > WORKER_GRACE_MS) return <NobodyPickedItUp decidedAt={decidedAt} />;
+
     return (
       <Card>
         <CardHeader>
@@ -120,5 +129,34 @@ export function IdeaProductionPanel({ ideaId }: { ideaId: string }) {
       {record}
       {!atGate && production.script && script}
     </div>
+  );
+}
+
+/**
+ * The honest version of "Starting", once starting has clearly not happened.
+ *
+ * Same shape as the trend runner's `NobodyPickedItUp`, for the same reason: a
+ * spinner that runs for hours is a lie, and the person looking at it has no
+ * way to tell "slow" from "nothing is running". Nothing on this page can clear
+ * the state — a dispatcher that is not running is not sweeping either — so
+ * the only useful thing to say is what to go and start.
+ */
+function NobodyPickedItUp({ decidedAt }: { decidedAt: string | null }) {
+  return (
+    <Alert variant="destructive">
+      <CircleAlertIcon className="size-4" />
+      <AlertTitle>Nothing has picked this up</AlertTitle>
+      <AlertDescription className="space-y-2">
+        <p>
+          This idea was approved {formatRelative(decidedAt)}. A worker normally opens its production within a few
+          seconds; none has, which means the pipeline worker is not running or cannot reach the database.
+        </p>
+        <p>
+          Start it and this page updates on its own — <code>python -m pipeline.driver.worker</code> in{' '}
+          <code>apps/pipeline</code>, or <code>docker compose up -d worker</code> on the box. Its logs are where a crash
+          loop or bad credentials show; from here they all look identical.
+        </p>
+      </AlertDescription>
+    </Alert>
   );
 }

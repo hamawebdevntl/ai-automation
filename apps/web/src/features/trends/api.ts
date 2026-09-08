@@ -1,7 +1,8 @@
-import { queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { type QueryClient, queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef } from 'react';
 import { queueKeys } from '@/features/queue/api';
 import { BLOCKLIST_MAX_ENTRIES, blocklistEntryError, normaliseBlockedWord } from '@/features/trends/controls';
+import { RECENT_SEARCHES_LIMIT } from '@/features/trends/search';
 import { isTrendRunInFlight, type TrendRunRow, type TrendSettingsRow } from '@/lib/database.types';
 import { supabase } from '@/lib/supabase';
 import { codeOf, toError } from '@/lib/supabase-error';
@@ -10,6 +11,8 @@ export const trendKeys = {
   all: ['trends'] as const,
   settings: () => [...trendKeys.all, 'settings'] as const,
   latestRun: () => [...trendKeys.all, 'latest-run'] as const,
+  run: (id: string) => [...trendKeys.all, 'run', id] as const,
+  recentSearches: () => [...trendKeys.all, 'recent-searches'] as const,
 };
 
 /**
@@ -249,6 +252,89 @@ export function latestTrendRunQueryOptions() {
 }
 
 /**
+ * One run by id, for a selected search that is no longer the latest.
+ *
+ * No polling. The run that is in flight is always the latest one, because at
+ * most one can be, and `latestTrendRunQueryOptions` already polls that. By the
+ * time a run is fetched by id it has finished, and a finished run is a fact.
+ */
+export function trendRunQueryOptions(id: string) {
+  return queryOptions({
+    queryKey: trendKeys.run(id),
+    staleTime: 5 * 60_000,
+    queryFn: async (): Promise<TrendRunRow | null> => {
+      const { data, error } = await supabase.from('trend_runs').select('*').eq('id', id).maybeSingle();
+      if (error) {
+        if (error.code === '42P01') return null;
+        throw toError(error);
+      }
+      return data;
+    },
+  });
+}
+
+/**
+ * The last few runs started from a description, newest first.
+ *
+ * `42703` is the missing column: the bundle has reached a database that has
+ * not had the described-search migration applied. The honest answer to "what
+ * has been searched for?" against such a schema is "nothing", for the same
+ * reason the latest-run query answers "there hasn't been" to a missing table.
+ */
+export function recentSearchesQueryOptions() {
+  return queryOptions({
+    queryKey: trendKeys.recentSearches(),
+    queryFn: async (): Promise<TrendRunRow[]> => {
+      const { data, error } = await supabase
+        .from('trend_runs')
+        .select('*')
+        .not('prompt', 'is', null)
+        .order('requested_at', { ascending: false })
+        .limit(RECENT_SEARCHES_LIMIT);
+      if (error) {
+        if (error.code === '42P01' || error.code === '42703') return [];
+        throw toError(error);
+      }
+      return data ?? [];
+    },
+    refetchOnWindowFocus: true,
+  });
+}
+
+/**
+ * The run a `?search=` param names.
+ *
+ * Read from the polled latest row when the ids match, so a search that is
+ * still going updates every fifteen seconds without a second poll. Fetched by
+ * id only once it is no longer the latest, by which point it has finished.
+ */
+export function useSelectedTrendRun(runId: string | null): {
+  run: TrendRunRow | null;
+  isPending: boolean;
+  error: Error | null;
+} {
+  const latest = useQuery(latestTrendRunQueryOptions());
+  const isLatest = runId !== null && latest.data?.id === runId;
+  const byId = useQuery({ ...trendRunQueryOptions(runId ?? ''), enabled: runId !== null && !isLatest });
+  if (runId === null) return { run: null, isPending: false, error: null };
+  if (isLatest) return { run: latest.data ?? null, isPending: false, error: null };
+  return { run: byId.data ?? null, isPending: byId.isPending, error: byId.error };
+}
+
+/**
+ * Put a run row where every reader of it looks.
+ *
+ * The latest-run poll, the by-id cache a selected search reads from, and the
+ * recent list -- invalidated rather than patched, because a new row changes
+ * its order and an old one may have dropped off the end.
+ */
+function rememberRun(queryClient: QueryClient, run: TrendRunRow) {
+  queryClient.setQueryData(trendKeys.latestRun(), run);
+  queryClient.setQueryData(trendKeys.run(run.id), run);
+  void queryClient.invalidateQueries({ queryKey: trendKeys.recentSearches() });
+}
+
+/**
  * Ask for a trend run, optionally saying how long it should take.
  *
  * The length rides on the row and applies to this run only -- the saved
@@ -265,15 +351,26 @@ export interface RequestTrendRunInput {
   budgetMinutes?: number | null;
   /** Hashtags to scout for this run only. Null uses the saved setting. */
   hashtagsPerRun?: number | null;
+  /**
+   * What to look for, in the owner's words. Makes this a described search:
+   * the worker reads it into terms for this run only and scores every idea
+   * against it. Null, or omitted, scouts the saved list as before.
+   */
+  prompt?: string | null;
 }
 
 export function useRequestTrendRun() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (input: RequestTrendRunInput = {}): Promise<TrendRunRow> => {
+      const prompt = input.prompt?.trim() || null;
+      // The prompt is named only when given, so the ordinary request is the
+      // same call it always was -- and still matches a database that has not
+      // had the described-search migration applied.
       const { data, error } = await supabase.rpc('request_trend_run', {
         p_budget_minutes: input.budgetMinutes ?? null,
         p_hashtags_per_run: input.hashtagsPerRun ?? null,
+        ...(prompt ? { p_prompt: prompt } : {}),
       });
       // `toError` and not a bare `throw`: supabase-js hands back a plain object
       // here, and every display path in this app narrows on `instanceof Error`.
@@ -281,7 +378,7 @@ export function useRequestTrendRun() {
       return data;
     },
     onSuccess: (run) => {
-      queryClient.setQueryData(trendKeys.latestRun(), run);
+      rememberRun(queryClient, run);
     },
     onError: () => {
       // Whatever refused it, the row this page is showing is now out of date:
@@ -321,9 +418,15 @@ export function useRefreshQueueWhenRunEnds() {
   useEffect(() => {
     if (wasInFlight.current && !inFlight) {
       void queryClient.invalidateQueries({ queryKey: queueKeys.all });
+      // The recent list shows each search's status and count, which are
+      // exactly what changed. The finished row goes into the by-id cache too,
+      // so a search that stops being the latest a moment later is not fetched
+      // again when it is already held.
+      void queryClient.invalidateQueries({ queryKey: trendKeys.recentSearches() });
+      if (run) queryClient.setQueryData(trendKeys.run(run.id), run);
     }
     wasInFlight.current = inFlight;
-  }, [inFlight, queryClient]);
+  }, [inFlight, queryClient, run]);
 }
 
 /** `55006` is object_in_use: a run is already going. Anything else is real. */
@@ -355,7 +458,7 @@ export function useCancelTrendRun() {
       return data;
     },
     onSuccess: (run) => {
-      queryClient.setQueryData(trendKeys.latestRun(), run);
+      rememberRun(queryClient, run);
     },
     onError: () => {
       // Whatever refused it, the row on screen is out of date -- most often

@@ -173,6 +173,7 @@ type ProductionLike = Pick<
   | 'paused_at'
   | 'superseded_by'
   | 'lease_expires_at'
+  | 'created_at'
 >;
 
 function runState(production: ProductionLike): Record<string, unknown> {
@@ -207,6 +208,31 @@ export function stoppedAtStep(production: ProductionLike): GraphStep {
 /** Has the worker actually started on this row, or is it still waiting? */
 export function hasStarted(production: ProductionLike): boolean {
   return readString(runState(production), 'step') !== null;
+}
+
+/**
+ * How long a fresh row may sit untouched before that means something.
+ *
+ * The dispatcher polls every `driver_poll_seconds` — five by default — so a
+ * row that nothing has claimed after this long is not "about to start". It is
+ * evidence that no worker is running, and the UI has to say so rather than
+ * promise a start that is not coming. Found the hard way: two approved ideas
+ * sat at "Starting… within a few seconds" for hours while no worker existed.
+ */
+export const WORKER_GRACE_MS = 30_000;
+
+/**
+ * Approved, opened, and never picked up.
+ *
+ * The production equivalent of `isUnclaimed` for trend runs. A queued row with
+ * no step whose `created_at` is past the grace has been waiting on a worker
+ * that has not come, and nothing on the row will change until one does.
+ */
+export function isUnclaimed(production: ProductionLike, now: number = Date.now()): boolean {
+  if (hasStarted(production)) return false;
+  if (production.status !== 'queued' || production.paused_at !== null) return false;
+  if (!production.created_at) return false;
+  return now - new Date(production.created_at).getTime() > WORKER_GRACE_MS;
 }
 
 export function isPaused(production: ProductionLike): boolean {
@@ -393,7 +419,7 @@ export interface ProductionVerdict {
   tone: 'working' | 'waiting' | 'good' | 'bad' | 'held';
 }
 
-export function describeProduction(production: ProductionLike): ProductionVerdict {
+export function describeProduction(production: ProductionLike, now: number = Date.now()): ProductionVerdict {
   const step = currentGraphStep(production);
   const stage = production.stage?.trim() || null;
 
@@ -451,6 +477,14 @@ export function describeProduction(production: ProductionLike): ProductionVerdic
         production.status === 'qc_failed'
           ? 'The cut is ready but failed its quality check. You can still approve it.'
           : 'The finished cut is waiting for your sign-off.',
+      tone: 'waiting',
+    };
+  }
+  if (isUnclaimed(production, now)) {
+    return {
+      headline: 'Waiting for a worker',
+      detail:
+        'Approved, but no pipeline worker has picked this up. The worker is probably not running — nothing here changes until it is.',
       tone: 'waiting',
     };
   }

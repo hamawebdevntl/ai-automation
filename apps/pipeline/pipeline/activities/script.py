@@ -24,8 +24,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from pipeline.clients.mpt import MptClient
 from pipeline.clients.supa import Supa
+from pipeline.llm import TextGenerator, text_client
 from pipeline.models import ProductionStatus
 
 log = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ def _paragraphs(preset: dict[str, Any]) -> int:
 
 
 def write_script(
-    event: dict[str, Any], supa: Supa | None = None, mpt: MptClient | None = None
+    event: dict[str, Any], supa: Supa | None = None, mpt: TextGenerator | None = None
 ) -> dict[str, Any]:
     """Draft the narration, unless there already is one.
 
@@ -119,7 +119,11 @@ def write_script(
             "redraft": requested,
         }
 
-    mpt = mpt or MptClient()
+    # Gemini or Claude directly when a key is configured, MoneyPrinterTurbo
+    # otherwise -- see `llm.text_client`. The parameter keeps its old name so
+    # every caller and test that injects a drafter is untouched; what it is
+    # given only has to write text.
+    mpt = mpt or text_client()
     subject = _subject(idea)
 
     # Not caught. A failure here routes by the graph to `parked`, which is the

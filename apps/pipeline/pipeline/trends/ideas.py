@@ -9,6 +9,16 @@ output schema and the row mapping below are shared between them, so the setting
 changes which model drafts and nothing else -- which is the only reason ideas
 from the two are comparable, and the only reason switching mid-week does not
 make last week's queue mean something different.
+
+The call itself goes through `pipeline.llm.structured`, which is the one place
+that knows how to ask either provider to fill a schema. This module owns what
+is asked -- the prompt, the schema, and how the answer becomes queue rows.
+
+A run started from a description (see `interpret`) asks for a little more: each
+idea also says how well it serves that description and how it connects to it.
+That is a separate schema and an addendum to the prompt rather than two
+optional fields, so the ordinary run's request is byte-identical to what it
+was before descriptions existed.
 """
 
 from __future__ import annotations
@@ -18,18 +28,18 @@ import os
 from itertools import zip_longest
 from typing import Any
 
-import anthropic
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
+from pipeline import llm
 from pipeline.trends.velocity import Signal
 
 log = logging.getLogger(__name__)
 
-CLAUDE = "claude"
-GEMINI = "gemini"
+CLAUDE = llm.CLAUDE
+GEMINI = llm.GEMINI
 PROVIDERS = (CLAUDE, GEMINI)
 
-CLAUDE_MODEL = "claude-opus-5"
+CLAUDE_MODEL = llm.CLAUDE_MODEL
 
 # How many scored signals reach the model. Enough to choose between, few
 # enough that the strongest are not buried in the middle of a long list.
@@ -39,6 +49,12 @@ MAX_SIGNALS = 40
 # before answering and the thinking is billed against this budget; a batch of
 # ten ideas is nowhere near it.
 MAX_TOKENS = 16000
+
+# Below this, an idea drafted against a description is dropped rather than
+# queued. The model is told the same number, so this is the backstop behind an
+# instruction rather than the primary filter -- and it is what makes the drop
+# countable in the run's breakdown.
+MIN_RELEVANCE = 40
 
 
 class ReelIdea(BaseModel):
@@ -58,6 +74,30 @@ class ReelIdea(BaseModel):
 
 class IdeaBatch(BaseModel):
     ideas: list[ReelIdea]
+
+
+class RelevantReelIdea(ReelIdea):
+    """A `ReelIdea` drafted against a description, and scored against it.
+
+    A subclass rather than two optional fields on `ReelIdea`, so that the
+    ordinary run's schema is unchanged and a described run cannot come back
+    with the score missing.
+    """
+
+    relevance: int = Field(
+        ge=0,
+        le=100,
+        description="How directly this idea serves what the person described. 100 means "
+        f"exactly what they asked for. Below {MIN_RELEVANCE} must not be proposed.",
+    )
+    connection: str = Field(
+        description="One sentence, addressed to the person, saying how this idea connects "
+        "to what they described. Name the thing they mentioned."
+    )
+
+
+class RelevantIdeaBatch(BaseModel):
+    ideas: list[RelevantReelIdea]
 
 
 SYSTEM = """You generate short-form video ideas for an organisation's own social channels.
@@ -90,6 +130,15 @@ Rules:
 - Hooks must be specific. "You won't believe" and "Here's why" are not hooks.
   The strongest ones name the viewer's own situation back to them.
 - Prefer fewer strong ideas over filling a quota."""
+
+# Appended to SYSTEM only when a run was started from a description. Kept apart
+# so that the ordinary run's request does not change by a character.
+SEARCH_ADDENDUM = f"""This run was started by a person describing what they are working on. Their description is given below the brief.
+
+- Every idea must serve that description, not merely the organisation's brief. The brief says what we may credibly speak to; the description says what this person wants right now.
+- Score each idea's relevance from 0 to 100: how directly it serves what they described. Do not propose anything below {MIN_RELEVANCE}.
+- Write `connection` to the person, in one sentence, naming the thing they mentioned that this idea speaks to.
+- Fewer ideas, or none, is the right answer when the signals do not connect to the description. Say nothing rather than stretch."""
 
 
 def _spread(signals: list[Signal], limit: int) -> list[Signal]:
@@ -151,6 +200,7 @@ def generate_ideas(
     provider: str = CLAUDE,
     model: str | None = None,
     client: Any | None = None,
+    description: str | None = None,
 ) -> list[ReelIdea]:
     """Draft ideas from signals.
 
@@ -161,6 +211,12 @@ def generate_ideas(
 
     `client` is the provider's own client, injected by tests. Which type it must
     be depends on `provider`, which is the price of one entry point for both.
+
+    `description` is what the person who started this run said they were
+    working on, when it was started that way. It changes the request in two
+    ways: the model is told to serve it and to score each idea against it, and
+    the answer comes back as `RelevantReelIdea`s, best fit first. Without it
+    the request is exactly what it was before descriptions existed.
     """
     if not niche_brief.strip():
         raise ValueError(
@@ -170,141 +226,120 @@ def generate_ideas(
     if not signals:
         return []
 
+    # Explicit rather than an else-falls-back-to-Claude: a typo in the provider
+    # name should not quietly draft with the other model, which would surface
+    # as an unexpected bill rather than as an error.
+    if provider not in PROVIDERS:
+        raise ValueError(
+            f"unknown idea provider {provider!r}. Expected one of: {', '.join(PROVIDERS)}."
+        )
+
     observed = "\n".join(
         f"- [{s.source}] ratio {s.ratio}x its author's median, engagement {s.engagement}, "
         f"{s.age_days:.1f} days old, keyword {s.keyword!r}: {s.title[:200]} ({s.source_url})"
         for s in _spread(signals, MAX_SIGNALS)
     )
-    prompt = (
-        f"# What we do\n{niche_brief}\n\n"
-        f"# Observed signals\n{observed}\n\n"
-        f"Propose at most {count} reel ideas. Fewer is fine if the signals "
-        f"do not support more."
+    described = (description or "").strip()
+    sections = [f"# What we do\n{niche_brief}"]
+    if described:
+        sections.append(f"# What the person is working on\n{described}")
+    sections.append(f"# Observed signals\n{observed}")
+    sections.append(
+        f"Propose at most {count} reel ideas. Fewer is fine if the signals do not support more."
     )
+    prompt = "\n\n".join(sections)
 
-    # Explicit rather than an else-falls-back-to-Claude: a typo in the provider
-    # name should not quietly draft with the other model, which would surface
-    # as an unexpected bill rather than as an error.
-    if provider == GEMINI:
-        batch = _draft_gemini(prompt, model=model, client=client)
-    elif provider == CLAUDE:
-        batch = _draft_claude(prompt, model=model, client=client)
-    else:
-        raise ValueError(
-            f"unknown idea provider {provider!r}. Expected one of: {', '.join(PROVIDERS)}."
-        )
+    system = SYSTEM + "\n\n" + SEARCH_ADDENDUM if described else SYSTEM
+    schema: type[BaseModel] = RelevantIdeaBatch if described else IdeaBatch
 
+    batch = _draft(prompt, system=system, schema=schema, provider=provider, model=model, client=client)
     if batch is None:
         return []
+
+    ideas: list[ReelIdea] = list(batch.ideas)
+    if described:
+        # Best fit first, so the ceiling below keeps the strongest matches
+        # rather than the first ones the model happened to write down.
+        ideas.sort(key=lambda idea: getattr(idea, "relevance", 0), reverse=True)
+
     log.info(
-        "generated %d ideas from %d signals via %s",
-        len(batch.ideas),
+        "generated %d ideas from %d signals via %s%s",
+        len(ideas),
         len(signals),
         provider,
+        " against a description" if described else "",
     )
-    return batch.ideas[:count]
+    return ideas[:count]
 
 
-def _draft_claude(prompt: str, *, model: str | None, client: Any | None) -> IdeaBatch | None:
-    client = client or anthropic.Anthropic()
-    response = client.messages.parse(
-        model=model or CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        thinking={"type": "adaptive"},
-        system=SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-        output_format=IdeaBatch,
-    )
-    batch = response.parsed_output
-    if batch is None:
-        log.error(
-            "idea generation returned no parseable batch (stop_reason=%s)",
-            response.stop_reason,
-        )
-    return batch
+def _draft(
+    prompt: str,
+    *,
+    system: str,
+    schema: type[BaseModel],
+    provider: str,
+    model: str | None,
+    client: Any | None,
+) -> Any | None:
+    """One structured call, or None with the reason logged.
 
-
-def _draft_gemini(prompt: str, *, model: str | None, client: Any | None) -> IdeaBatch | None:
-    """Draft with Gemini.
-
-    The SDK import and the settings lookup are both function-local. Only this
-    lane needs `google-genai`, and a test injecting a fake client should not
-    need the SDK installed or a key set to exercise the parsing below.
-
-    `config` is passed as a plain dict rather than a `types.GenerateContentConfig`
-    for the same reason: the SDK coerces it, and building one would drag the
-    import back to module scope.
+    `llm.structured` raises when the model returns nothing usable. Here that
+    becomes an empty batch rather than a failed run, as it always has: a safety
+    stop on a batch of scraped titles is a real possibility, and it should
+    cost the run its ideas, not its report. It is logged at error rather than
+    returned silently, because a silent empty queue looks identical to a quiet
+    trend week.
     """
-    if client is None or model is None:
-        from pipeline.config import settings
-
-        cfg = settings()
-        model = model or cfg.gemini_model
-        if client is None:
-            from google import genai
-
-            client = genai.Client(api_key=cfg.gemini_api_key)
-
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config={
-            "system_instruction": SYSTEM,
-            "max_output_tokens": MAX_TOKENS,
-            "response_mime_type": "application/json",
-            "response_schema": IdeaBatch,
-            # We pass no tools, so automatic function calling has nothing to
-            # do -- but the SDK enables it by default and warns about it on
-            # every call, which is noise in the trend task's logs and a false
-            # lead for anyone reading them during an incident.
-            "automatic_function_calling": {"disable": True},
-        },
-    )
-    return _coerce_gemini(response)
-
-
-def _coerce_gemini(response: Any) -> IdeaBatch | None:
-    """Get an `IdeaBatch` out of a Gemini response, or log why there isn't one.
-
-    `response.parsed` is the schema-validated object when the SDK could build
-    one, but it is `None` whenever generation stopped early -- and a safety
-    stop is a real possibility here, because the prompt carries scraped TikTok
-    titles nobody vetted. That case must be logged rather than returned as an
-    empty batch: a silent empty queue looks identical to a quiet trend week.
-    """
-    parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, IdeaBatch):
-        return parsed
-    if isinstance(parsed, dict):
-        try:
-            return IdeaBatch.model_validate(parsed)
-        except ValidationError as exc:
-            log.error("gemini returned a batch that does not fit the schema: %s", exc)
-            return None
-
-    text = getattr(response, "text", None)
-    if not text:
-        log.error("gemini returned no content (finish_reason=%s)", _finish_reason(response))
-        return None
     try:
-        return IdeaBatch.model_validate_json(text)
-    except ValidationError as exc:
-        log.error("gemini returned unparseable JSON: %s", exc)
+        return llm.structured(
+            provider,
+            system,
+            prompt,
+            schema,
+            client=client,
+            model=model,
+            max_tokens=MAX_TOKENS,
+            thinking=True,
+        )
+    except llm.LlmError as exc:
+        log.error("idea generation returned nothing usable: %s", exc)
         return None
 
 
-def _finish_reason(response: Any) -> str:
-    candidates = getattr(response, "candidates", None) or []
-    if candidates:
-        return str(getattr(candidates[0], "finish_reason", "unknown"))
-    return str(getattr(response, "prompt_feedback", "unknown"))
+def split_relevant(
+    ideas: list[ReelIdea], *, floor: int = MIN_RELEVANCE
+) -> tuple[list[ReelIdea], list[ReelIdea]]:
+    """(kept, dropped), by the relevance floor.
+
+    An idea without a score is always kept: it was drafted against no
+    description, so there is nothing to judge it against. The dropped list is
+    returned rather than discarded so the run can count it as its own stage.
+    """
+    kept: list[ReelIdea] = []
+    dropped: list[ReelIdea] = []
+    for idea in ideas:
+        relevance = getattr(idea, "relevance", None)
+        (kept if relevance is None or relevance >= floor else dropped).append(idea)
+    return kept, dropped
 
 
-def to_rows(ideas: list[ReelIdea], signals: list[Signal], platforms: list[str]) -> list[dict]:
+def to_rows(
+    ideas: list[ReelIdea],
+    signals: list[Signal],
+    platforms: list[str],
+    *,
+    run_id: str | None = None,
+) -> list[dict]:
     """Map ideas onto `ideas` table rows.
 
     Each idea is attributed to the strongest signal that shares its keyword, so
     the queue can show the reviewer what prompted it and link out to the source.
+
+    `run_id` is the run that drafted them. When given, each row carries it,
+    with the relevance score and connection sentence for ideas that have one.
+    When it is not, the rows are shaped exactly as they were before those
+    columns existed -- which is what lets a worker ahead of its database keep
+    inserting rather than fail on a column PostgREST has never heard of.
     """
     by_keyword: dict[str, Signal] = {}
     for signal in sorted(signals, key=lambda s: s.ratio, reverse=True):
@@ -317,21 +352,24 @@ def to_rows(ideas: list[ReelIdea], signals: list[Signal], platforms: list[str]) 
             (sig for kw, sig in by_keyword.items() if kw in haystack),
             signals[0] if signals else None,
         )
-        rows.append(
-            {
-                "title": idea.title[:200],
-                "hook": idea.hook,
-                "angle": idea.angle,
-                "rationale": idea.rationale,
-                "source": match.source if match else None,
-                "source_url": match.source_url if match else None,
-                "trend_keyword": match.keyword if match else None,
-                "velocity_ratio": match.ratio if match else None,
-                "velocity_label": _label(match.ratio) if match else None,
-                "target_platforms": platforms,
-                "status": "pending",
-            }
-        )
+        row = {
+            "title": idea.title[:200],
+            "hook": idea.hook,
+            "angle": idea.angle,
+            "rationale": idea.rationale,
+            "source": match.source if match else None,
+            "source_url": match.source_url if match else None,
+            "trend_keyword": match.keyword if match else None,
+            "velocity_ratio": match.ratio if match else None,
+            "velocity_label": _label(match.ratio) if match else None,
+            "target_platforms": platforms,
+            "status": "pending",
+        }
+        if run_id is not None:
+            row["trend_run_id"] = run_id
+            row["relevance"] = getattr(idea, "relevance", None)
+            row["connection"] = (getattr(idea, "connection", None) or "").strip() or None
+        rows.append(row)
     return rows
 
 

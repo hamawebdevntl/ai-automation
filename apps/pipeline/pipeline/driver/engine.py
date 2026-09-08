@@ -43,6 +43,13 @@ ACTIVITIES = {
 # nothing is wrong with the production itself.
 INFRA_BACKOFF_SECONDS = 5
 
+# An infrastructure error does not consume an attempt, so a row can bounce on
+# one indefinitely. The first bounce is worth a log entry; the next eleven are
+# not, and the twelfth -- about a minute later at the backoff above -- is worth
+# one again, so the log says "still" rather than saying nothing or saying it
+# 720 times an hour.
+INFRA_EVENT_EVERY = 12
+
 # Reserved keys. Everything else in `run_state` is activity payload.
 _CONTROL_KEYS = (
     "step",
@@ -60,6 +67,10 @@ _CONTROL_KEYS = (
     # `poll_render` can tick 400 times against MAX_RENDER_POLLS; the log should
     # say what changed, not how often we asked.
     "event_fingerprint",
+    # Consecutive infrastructure retries on the current step. Cleared the
+    # moment the step succeeds. Exists so the log records that a row has been
+    # bouncing, without recording every bounce.
+    "infra_retries",
 )
 
 
@@ -115,7 +126,11 @@ def _describe(step_name: str, state: dict[str, Any]) -> str | None:
             return f"Kept the script this production already had{size}. Nothing was rewritten."
         if state.get("script_source") == "redrafted":
             return f"Wrote a fresh draft{size}, replacing the previous one as asked."
-        cut = " It came back over the 5000 character limit and was cut." if state.get("script_truncated") else ""
+        cut = (
+            " It came back over the 5000 character limit and was cut."
+            if state.get("script_truncated")
+            else ""
+        )
         return f"Drafted the narration{size}.{cut}"
     if step_name == "open_script_gate":
         return "The script gate is open. Nothing is rendered until a person approves the words."
@@ -137,7 +152,9 @@ def _describe(step_name: str, state: dict[str, Any]) -> str | None:
         # `missing` has never been surfaced anywhere before: the activity
         # returns it and the publish step silently skips those platforms.
         first = f"Wrote copy for {', '.join(wrote)}." if wrote else "No platform copy was written."
-        return first + (f" No copy for {', '.join(missing)} — those will be skipped." if missing else "")
+        return first + (
+            f" No copy for {', '.join(missing)} — those will be skipped." if missing else ""
+        )
     if step_name == "open_gate2":
         return "Gate 2 is open. The cut is waiting for a person."
     if step_name == "publish":
@@ -260,20 +277,30 @@ def advance(row: dict[str, Any], supa: Supa) -> dict[str, Any]:
         log.warning("infrastructure error on %s/%s: %s", production_id, name, exc)
         # This used to be the one thing that left no trace at all: a row could
         # bounce on a PostgREST or DNS blip indefinitely and look, from the
-        # outside, exactly like a row that was making progress.
-        supa.record_event(
-            production_id,
-            name,
-            "infra_retry",
-            detail=f"Our own plumbing failed, not the step. Trying again in {INFRA_BACKOFF_SECONDS}s.",
-            error=str(exc),
-        )
+        # outside, exactly like a row that was making progress. Recorded on the
+        # first bounce and then once a minute or so, not on every one.
+        repeats = int(run_state.get("infra_retries") or 0) + 1
+        run_state["infra_retries"] = repeats
+        if repeats == 1 or repeats % INFRA_EVENT_EVERY == 0:
+            still = f" This is the {repeats}th time in a row." if repeats > 1 else ""
+            supa.record_event(
+                production_id,
+                name,
+                "infra_retry",
+                detail=f"Our own plumbing failed, not the step. Trying again in {INFRA_BACKOFF_SECONDS}s.{still}",
+                error=str(exc),
+                attempt=repeats,
+            )
         run_state["due_at"] = _due(INFRA_BACKOFF_SECONDS)
         supa.save_run_state(production_id, run_state)
         return {"production_id": production_id, "step": name, "outcome": "infra_retry"}
     except Exception as exc:  # noqa: BLE001 - routed by the graph, not swallowed
         return _handle_failure(production_id, step, run_state, exc, supa)
 
+    # The step got through, so the bounce count it may have been carrying is
+    # over. Cleared here rather than in `_enter`, because a poll-again arc
+    # never enters anything and its next infrastructure hiccup is a new run.
+    run_state.pop("infra_retries", None)
     merged = {**run_state, **(result or {})}
     return _route(production_id, step, merged, merged, supa)
 
@@ -327,7 +354,11 @@ def _handle_failure(
         )
         log.info(
             "retrying %s on %s after %s (attempt %d/%d)",
-            step.name, production_id, type(exc).__name__, used + 1, policy.max_attempts,
+            step.name,
+            production_id,
+            type(exc).__name__,
+            used + 1,
+            policy.max_attempts,
         )
         return {
             "production_id": production_id,

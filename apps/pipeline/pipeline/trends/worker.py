@@ -117,7 +117,11 @@ def main(supa: Supa | None = None) -> int:
         return 0
 
     run_id = str(run["id"])
-    log.info("claimed run %s (%s)", run_id, run.get("trigger", "manual"))
+    log.info(
+        "claimed run %s (%s)",
+        run_id,
+        "described search" if run.get("prompt") else run.get("trigger", "manual"),
+    )
 
     # The run id is passed as an argument and never through the environment.
     # It used to be set here as `os.environ["TREND_RUN_ID"]`, which was wrong in

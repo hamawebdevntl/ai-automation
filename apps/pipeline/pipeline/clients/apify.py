@@ -38,6 +38,16 @@ log = logging.getLogger(__name__)
 
 API_BASE = "https://api.apify.com/v2"
 
+# How long to wait for a TCP connection before trying the next address.
+#
+# Shorter than the request timeout on purpose. api.apify.com answers on two
+# addresses, and a SYN the network drops on the first one is not answered at
+# all -- so the connect phase waits its full allowance before falling over to
+# the second. Measured at a full minute with the default; the request itself
+# then took under a second. Ten seconds turns that stall into a hiccup the
+# scout's retry absorbs, and a genuinely unreachable API still fails fast.
+CONNECT_TIMEOUT_S = 10.0
+
 # The run states that mean "stop waiting". Apify documents these as the
 # terminal set; anything else (READY, RUNNING) means keep polling.
 TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT", "TIMING-OUT"})
@@ -82,13 +92,23 @@ class ApifyClient:
         if not key:
             raise ApifyError("APIFY_TOKEN is not configured")
         self._headers = {"Authorization": f"Bearer {key}"}
-        self._timeout = timeout
+        self._timeout = httpx.Timeout(timeout, connect=min(timeout, CONNECT_TIMEOUT_S))
 
     # -- plumbing ----------------------------------------------------------
 
     def _request(self, method: str, path: str, **kw: Any) -> Any:
         with httpx.Client(timeout=self._timeout) as client:
-            resp = client.request(method, f"{API_BASE}{path}", headers=self._headers, **kw)
+            try:
+                resp = client.request(method, f"{API_BASE}{path}", headers=self._headers, **kw)
+            except httpx.HTTPError as exc:
+                # A dropped connection is Apify being unreachable, not an httpx
+                # matter for the caller. Everything above catches `ApifyError`
+                # and decides what giving up means -- for a run in flight,
+                # aborting it -- and a raw httpx exception skipping that
+                # decision is how a run gets left scraping and billing.
+                raise ApifyError(
+                    f"Apify {method} {path} did not answer: {type(exc).__name__}: {exc}"
+                ) from exc
 
         if resp.status_code == 429:
             after = resp.headers.get("Retry-After")
@@ -124,16 +144,26 @@ class ApifyClient:
 
     # -- runs --------------------------------------------------------------
 
-    def start_run(self, actor_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def start_run(
+        self, actor_id: str, payload: dict[str, Any], *, timeout_s: float | None = None
+    ) -> dict[str, Any]:
         """Queue an actor run. Returns the run record, including its id.
 
         The actor id is path-encoded with a tilde, which is Apify's own
         convention and the single easiest thing to get wrong: `clockworks/…`
         404s where `clockworks~…` works.
+
+        `timeout_s` is the ceiling Apify itself enforces on the run. The actors'
+        own defaults are unlimited (TikTok) and seven days (Instagram profiles),
+        so without it a run whose poller has died -- a worker restarted
+        mid-scout -- keeps scraping and billing until it finishes on its own.
+        The caller's local deadline is the normal way a run ends early; this is
+        the backstop for when nobody is left to abort.
         """
-        run = self._request(
-            "POST", f"/acts/{actor_id.replace('/', '~')}/runs", json=payload
-        )
+        kw: dict[str, Any] = {"json": payload}
+        if timeout_s is not None:
+            kw["params"] = {"timeout": int(timeout_s)}
+        run = self._request("POST", f"/acts/{actor_id.replace('/', '~')}/runs", **kw)
         if not isinstance(run, dict) or not run.get("id"):
             raise ApifyError(f"Apify accepted a run of {actor_id} but named no run id")
         return run

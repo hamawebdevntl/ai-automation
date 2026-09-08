@@ -566,6 +566,27 @@ class Supa:
         rows = res.data or []
         return rows[0] if rows else None
 
+    def record_interpretation(self, run_id: str, interpretation: dict[str, Any]) -> None:
+        """Write how a described run's prompt was read, before scouting starts.
+
+        By id only, with no status filter: this is a diagnostic column, not the
+        outcome, and a run stopped from the app during the two seconds the
+        model takes should still show how it was understood. Never raises --
+        losing the write costs the banner a sentence; failing the run over it
+        would cost the scout that was about to happen.
+        """
+        try:
+            (
+                self._c.table("trend_runs")
+                .update(
+                    {"interpretation": _jsonable(interpretation), "interpreted_at": _now_iso()}
+                )
+                .eq("id", run_id)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            log.warning("could not record the interpretation for run %s: %s", run_id, exc)
+
     def trend_run_is_cancelled(self, run_id: str) -> bool:
         """Whether an owner has stopped this run out from under us.
 
