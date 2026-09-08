@@ -81,6 +81,7 @@ class SourceSupa(FakeSupa):
                 "fal": {
                     "model": "fal-ai/ltx-2.3/video-to-video",
                     "resolution": "1080p",
+                    "aspect_ratio": "9:16",
                     "strength": 0.65,
                     "max_duration_seconds": 40,
                 }
@@ -317,6 +318,54 @@ class TestWhatIsSentToFal:
             render._submit_fal_video(
                 "p1", dict(supa.row), {"slug": "broken", "params": {}}, supa, FakeFal()
             )
+
+    def test_nine_by_sixteen_is_asked_for(self, cfg):
+        # The quality check *fails* a render that is not 9:16, and the source
+        # here is whatever the owner had on their phone -- so the one lever we
+        # have is asking the model for portrait output.
+        supa = SourceSupa()
+        fal = FakeFal()
+
+        render._submit_fal_video("p1", dict(supa.row), supa.style_preset("s1"), supa, fal)
+
+        assert fal.submitted[0][1]["aspect_ratio"] == "9:16"
+
+    def test_a_storage_failure_releases_the_claim_rather_than_stranding_the_row(self, cfg):
+        # Signing the URL is a Supabase Storage call, and Storage can be down.
+        # Nothing has been billed at that point, so the claim must go back --
+        # otherwise a blip leaves a production nobody can ever edit again.
+        supa = SourceSupa()
+
+        def boom(key, expires_in=3600):
+            raise RuntimeError("storage is unavailable")
+
+        supa.signed_render_url = boom  # type: ignore[method-assign]
+
+        with pytest.raises(RuntimeError, match="storage is unavailable"):
+            render._submit_fal_video("p1", dict(supa.row), supa.style_preset("s1"), supa, FakeFal())
+
+        assert any(
+            u.get("task_id") is None and u.get("status") == "queued" for u in supa.updates
+        ), "the claim was not given back, so this production can never be edited again"
+
+    def test_an_ambiguous_submit_keeps_the_claim_because_it_may_have_been_billed(self, cfg):
+        # The opposite rule, one line later in the same function. fal has no
+        # idempotency key, so a resubmit is a second billed generation -- and
+        # keeping the claim is what stops one. Being uneditable afterwards is
+        # correct here: a paid render may exist against exactly this request.
+        supa = SourceSupa()
+
+        class Broken:
+            def submit(self, model, payload):
+                raise RuntimeError("connection reset mid-request")
+
+        with pytest.raises(RuntimeError, match="connection reset"):
+            render._submit_fal_video("p1", dict(supa.row), supa.style_preset("s1"), supa, Broken())
+
+        assert not any("task_id" in u for u in supa.updates), (
+            "an ambiguous fal submit must not release the claim: a retry would be a "
+            "second billed generation"
+        )
 
     def test_the_duration_ceiling_is_sent(self, cfg):
         # The only lever on the bill: the rate is per second of *output*, and on

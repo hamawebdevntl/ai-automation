@@ -714,6 +714,12 @@ values
         'model', 'fal-ai/ltx-2.3/video-to-video',
         'usd_per_second', 0.20,
         'resolution', '1080p',
+        -- Asked for, because the quality check *fails* anything that is not
+        -- 9:16 and the source is whatever the owner had on their phone. A model
+        -- that honours it turns a landscape upload into a publishable reel; one
+        -- that ignores it produces a landscape render that reaches Gate 2
+        -- flagged, having been paid for.
+        'aspect_ratio', '9:16',
         -- A ceiling on the bill as well as on the runtime: the cost is
         -- per-second of *output*, so this is the only number standing between a
         -- ten-minute upload and a ten-minute charge.

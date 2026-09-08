@@ -123,7 +123,14 @@ export function SourceFootagePanel({ production }: { production: ProductionRow }
           <Alert>
             <LockIcon className="size-4" />
             <AlertTitle>Locked</AlertTitle>
-            <AlertDescription>{lockReason}</AlertDescription>
+            <AlertDescription>
+              <p>{lockReason}</p>
+              {/* `assert_script_editable` says "re-run the idea to change the
+                  words", which is true and incomplete on this lane: a re-run
+                  opens an empty production, so it carries none of this over.
+                  Better said here than discovered. */}
+              <p>A re-run starts a fresh production, so the video and the instruction have to be supplied again.</p>
+            </AlertDescription>
           </Alert>
         )}
 
@@ -234,8 +241,9 @@ function FootageField({
       </div>
 
       <p className="text-sm text-muted-foreground">
-        MP4, QuickTime .mov or WebM, up to 500 MB. Uploading a different file clears your approval and your consent
-        record, because both were about the file it replaces.
+        MP4, QuickTime .mov or WebM, up to 500 MB. Shoot it portrait if you can: the quality check fails anything that
+        is not 9:16, and a landscape source reaches Gate 2 flagged after it has been paid for. Uploading a different
+        file clears your approval and your consent record, because both were about the file it replaces.
       </p>
     </div>
   );

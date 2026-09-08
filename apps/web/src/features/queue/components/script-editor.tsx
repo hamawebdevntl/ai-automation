@@ -155,12 +155,12 @@ export function ScriptEditor({ production }: { production: ProductionRow }) {
 
   // On the footage lane, approving is a statement about the upload and the
   // instruction as well as the words -- so it is refused here for the same
-  // reason `approve_script` refuses it in Postgres. `isLoading` blocks too: the
+  // reason `approve_script` refuses it in Postgres. `isUnknown` blocks too: the
   // style is what says whether this lane applies at all, and enabling the one
-  // button that spends money before that answer arrives would be the wrong way
-  // to be wrong.
+  // button that spends money before that answer arrives -- or after the read
+  // for it failed -- would be the wrong way to be wrong.
   const lane = useSourceLane(production);
-  const canApprove = canWrite && !leased && validity.ok && !lane.isLoading && lane.gap === null;
+  const canApprove = canWrite && !leased && validity.ok && !lane.isUnknown && lane.gap === null;
 
   const runSave = async () => {
     try {

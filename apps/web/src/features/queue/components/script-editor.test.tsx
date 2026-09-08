@@ -50,7 +50,7 @@ const mockLane = vi.fn<() => SourceLane>(() => ({
   style: null,
   needsSource: false,
   gap: null,
-  isLoading: false,
+  isUnknown: false,
 }));
 vi.mock('@/features/queue/use-source-lane', () => ({ useSourceLane: () => mockLane() }));
 
@@ -83,7 +83,7 @@ async function confirmDialog(user: ReturnType<typeof userEvent.setup>, name: Reg
 beforeEach(() => {
   vi.clearAllMocks();
   mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
-  mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isLoading: false });
+  mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isUnknown: false });
 });
 
 // ---------------------------------------------------------------------------
@@ -323,7 +323,7 @@ describe('the footage lane cannot be approved half-finished', () => {
     // The same refusal `approve_script` makes in Postgres, shown before the
     // click rather than after it. On this lane approving is a statement about
     // the footage and the instruction as well as the words.
-    mockLane.mockReturnValue({ style: null, needsSource: true, gap: 'footage', isLoading: false });
+    mockLane.mockReturnValue({ style: null, needsSource: true, gap: 'footage', isUnknown: false });
     show(atGate());
 
     expect(button('Approve and start the render')).toBeDisabled();
@@ -331,7 +331,7 @@ describe('the footage lane cannot be approved half-finished', () => {
   });
 
   it('still refuses when only the consent record is missing', () => {
-    mockLane.mockReturnValue({ style: null, needsSource: true, gap: 'consent', isLoading: false });
+    mockLane.mockReturnValue({ style: null, needsSource: true, gap: 'consent', isUnknown: false });
     show(atGate());
 
     expect(button('Approve and start the render')).toBeDisabled();
@@ -339,16 +339,18 @@ describe('the footage lane cannot be approved half-finished', () => {
   });
 
   it('allows approval once nothing is missing', () => {
-    mockLane.mockReturnValue({ style: null, needsSource: true, gap: null, isLoading: false });
+    mockLane.mockReturnValue({ style: null, needsSource: true, gap: null, isUnknown: false });
     show(atGate());
 
     expect(button('Approve and start the render')).toBeEnabled();
   });
 
   it('waits rather than enabling the one button that spends money', () => {
-    // Until the preset has been read we do not know whether this lane applies.
-    // Enabling approve during that window is the wrong way to be wrong.
-    mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isLoading: true });
+    // Until the preset has been read we do not know whether this lane applies,
+    // and `isUnknown` covers a read that *failed* as well as one still in
+    // flight. Either way, letting a network error enable approve would turn it
+    // into a spend.
+    mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isUnknown: true });
     show(atGate());
 
     expect(button('Approve and start the render')).toBeDisabled();
@@ -357,7 +359,7 @@ describe('the footage lane cannot be approved half-finished', () => {
   });
 
   it('leaves the four text lanes exactly as they were', () => {
-    mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isLoading: false });
+    mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isUnknown: false });
     show(atGate());
 
     expect(button('Approve and start the render')).toBeEnabled();

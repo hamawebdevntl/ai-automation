@@ -323,6 +323,41 @@ def _source_lane_config_problem(preset: dict[str, Any]) -> str | None:
     return None
 
 
+def _fal_video_payload(cfg: dict[str, Any], url: str, instruction: str) -> dict[str, Any]:
+    """The request body, built from the preset and the two things the owner gave.
+
+    Split out from the submit so that everything which can raise on a malformed
+    preset -- `float()`, `int()` -- happens in the block that releases the claim
+    rather than in the one that keeps it.
+    """
+    payload: dict[str, Any] = {
+        "video_url": url,
+        "prompt": instruction.strip()[:MAX_INSTRUCTION_CHARS],
+    }
+    # Asked for explicitly, because the quality check *fails* a render that is
+    # not 9:16 and the source here is whatever the owner had on their phone. A
+    # model that honours this turns a landscape upload into a publishable reel;
+    # one that ignores it produces a landscape render that arrives at Gate 2
+    # flagged, which is the honest outcome but a paid one. The plainest fix is
+    # upstream of all of this -- the panel says portrait works best.
+    if cfg.get("aspect_ratio"):
+        payload["aspect_ratio"] = cfg["aspect_ratio"]
+    if cfg.get("resolution"):
+        payload["resolution"] = cfg["resolution"]
+    if cfg.get("strength") is not None:
+        payload["strength"] = float(cfg["strength"])
+    if cfg.get("fps"):
+        payload["fps"] = int(cfg["fps"])
+    # A ceiling on the bill as much as on the runtime, and the only one there
+    # is: the rate is per second of output, and on this lane the length comes
+    # from a file the owner chose rather than from a preset. Models that ignore
+    # the field follow the upload instead, so this is a request and not yet a
+    # cap -- which is one of the two reasons the preset ships inactive.
+    if cfg.get("max_duration_seconds"):
+        payload["duration"] = int(cfg["max_duration_seconds"])
+    return payload
+
+
 def _submit_fal_video(
     production_id: str,
     production: dict[str, Any],
@@ -337,19 +372,28 @@ def _submit_fal_video(
     narration, they are the thing the model is told to do, and nothing else in
     the request is a human decision.
 
-    Everything that could refuse this submit has already been checked by
+    Everything that could *refuse* this submit has already been checked by
     `submit_render`, before the render claim was taken. That ordering is not
     tidiness: `task_id` cannot be unset by anything an owner can reach, so a row
-    that parks holding one is stranded rather than retryable.
+    that parks holding one can never have its script or its footage edited
+    again. It is stranded rather than retryable.
 
-    fal fetches the footage from a signed URL rather than being handed bytes,
-    which turns out to matter for the failure mode `docs/GAPS.md` B6 warns about.
-    fal has no idempotency key, so an ambiguous submit still parks rather than
-    resubmitting -- but it parks having uploaded nothing: the owner's file is
-    already in our bucket, put there by their own browser before the gate, so a
-    resubmit would cost a signature and a second generation, not a second
-    upload. The claim is still not released, because that second generation is
-    still billed.
+    The two blocks below divide on exactly that line, and the division is the
+    most important thing in this function:
+
+      * **Before `fal.submit`** nothing has been billed, so a failure releases
+        the claim and the production is picked up again. Minting the signed URL
+        is a Supabase Storage call and Storage can be down; a blip there is not
+        in `submit_render`'s retry list, so without this it would strand the row.
+      * **At `fal.submit`** it has, or may have. fal has no idempotency key --
+        `docs/GAPS.md` B6 -- so an ambiguous failure must not become a second
+        billed generation. The claim is kept and the production parks. Being
+        uneditable afterwards is the correct outcome there: a render may exist
+        that was paid for against exactly this footage and these words.
+
+    Note what a resubmit here would *not* cost, against what B6 feared: the
+    owner's file is already in our bucket, put there by their own browser before
+    the gate, so nothing is re-uploaded. Only the generation is at stake.
     """
     fal = fal or FalClient()
 
@@ -362,38 +406,25 @@ def _submit_fal_video(
 
     cfg = (preset.get("params") or {}).get("fal") or {}
     model = cfg["model"]
-    ttl = int(settings().source_video_url_ttl_seconds)
 
-    url = supa.signed_render_url(production["source_video_key"], expires_in=ttl)
-    instruction = (production.get("render_instruction") or "").strip()
-
-    payload: dict[str, Any] = {
-        "video_url": url,
-        "prompt": instruction[:MAX_INSTRUCTION_CHARS],
-    }
-    if cfg.get("resolution"):
-        payload["resolution"] = cfg["resolution"]
-    if cfg.get("strength") is not None:
-        payload["strength"] = float(cfg["strength"])
-    if cfg.get("fps"):
-        payload["fps"] = int(cfg["fps"])
-    # A ceiling on the bill as much as on the runtime, and the only one there
-    # is: the rate is per second of output, and on this lane the length comes
-    # from a file the owner chose rather than from a preset. Models that ignore
-    # the field follow the upload instead, so this is a request and not yet a
-    # cap -- which is one of the two reasons the preset ships inactive.
-    if cfg.get("max_duration_seconds"):
-        payload["duration"] = int(cfg["max_duration_seconds"])
+    try:
+        url = supa.signed_render_url(
+            production["source_video_key"],
+            expires_in=int(settings().source_video_url_ttl_seconds),
+        )
+        payload = _fal_video_payload(cfg, url, production.get("render_instruction") or "")
+    except Exception:
+        # Nothing billed yet. Releasing the claim is what keeps this a fault a
+        # person can retry rather than a production nobody can touch.
+        supa.update_production(production_id, task_id=None, status=ProductionStatus.QUEUED.value)
+        raise
 
     try:
         handles = fal.submit(model, payload)
     except FalRefused as exc:
-        # A refusal here is about the footage or the instruction, not a fault.
-        # It parks, and it must never be retried or routed to another backend.
+        # A refusal is about the footage or the instruction, not a fault. It
+        # parks, and it must never be retried or routed to another backend.
         return _fail(supa, production_id, f"fal declined this footage or instruction: {exc}")
-    except Exception:
-        supa.update_production(production_id, task_id=None, status=ProductionStatus.QUEUED.value)
-        raise
 
     supa.update_production(production_id, stage=f"fal transforming your footage ({model})")
     return {
