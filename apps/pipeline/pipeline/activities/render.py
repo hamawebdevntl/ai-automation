@@ -20,7 +20,7 @@ from pipeline.clients.heygen import HeyGenClient, HeyGenError, HeyGenRejected
 from pipeline.clients.mpt import MptClient, MptError, MptQueueFull, MptTaskStateLost
 from pipeline.clients.supa import Supa
 from pipeline.config import settings
-from pipeline.models import ProductionStatus, VideoParams
+from pipeline.models import ProductionStatus, Transcript, VideoParams
 from pipeline.qc import probe as probe_mod
 from pipeline.qc import slideshow
 
@@ -36,6 +36,7 @@ FAL_VISUALS = "fal_visuals"  # fal generates clips, MPT assembles them
 FAL_FULL = "fal_full"        # fal generates visuals and voice, we assemble
 HEYGEN = "heygen"            # HeyGen delivers a finished presenter reel
 FAL_VIDEO = "fal_video"      # fal transforms footage the owner uploaded
+CLIP = "clip"                # no provider: cut a range out of an uploaded recording
 
 FAL_MODES = (FAL_VISUALS, FAL_FULL, FAL_VIDEO)
 
@@ -55,7 +56,10 @@ MAX_INSTRUCTION_CHARS = 1500
 # perfectly good source video -- so warning that it has no cuts would be
 # reporting on their footage rather than on our render. Frozen fraction still
 # applies to both: a render that stalled looks like a still either way.
-NO_CUTS_EXPECTED = (HEYGEN, FAL_VIDEO)
+# A clip is a continuous excerpt of one recording, so it has as many cuts as the
+# owner's camera did -- usually none. Counting them against it would warn on
+# every clip of a person talking, which is the whole intended input.
+NO_CUTS_EXPECTED = (HEYGEN, FAL_VIDEO, CLIP)
 
 
 def _phase_for(mode: str) -> str:
@@ -69,6 +73,10 @@ def _phase_for(mode: str) -> str:
         return "fal"
     if mode == HEYGEN:
         return HEYGEN
+    if mode == CLIP:
+        # Never anywhere else. The clipping lane's work is ffmpeg on a file we
+        # already hold, so there is no provider for the phase to name.
+        return CLIP
     return MPT
 
 
@@ -77,7 +85,6 @@ def submit_render(
 ) -> dict[str, Any]:
     """Start exactly one render for this production."""
     supa = supa or Supa()
-    mpt = mpt or MptClient()
     production_id = event["production_id"]
 
     production = supa.production(production_id)
@@ -128,6 +135,24 @@ def submit_render(
         if problem:
             return _fail(supa, production_id, f"no render was submitted: {problem}")
 
+    # MoneyPrinterTurbo, but only on the lane that uses it.
+    #
+    # `MptClient.__init__` refuses to be constructed without `MPT_BASE_URL` and
+    # says why: "nothing reaches this constructor unless a render is actually
+    # about to be submitted". That was not true -- this function built one
+    # eagerly for every lane -- so a deployment that renders only with HeyGen,
+    # only with fal, or (now) only by clipping had to invent credentials for a
+    # service it never contacts. The same argument `llm.text_client` makes for
+    # not routing scripts through MPT.
+    #
+    # Constructed *before* the claim rather than in the branch below, which is
+    # the ordering that matters: a misconfigured base URL discovered after
+    # `claim_render_slot` would park the row holding a `task_id` that nothing an
+    # owner can reach is able to unset, and its script and footage would be
+    # uneditable forever.
+    if mode == MPT:
+        mpt = mpt or MptClient()
+
     task_id = production_id
 
     # Claim the right to submit. Only one caller can win, so a duplicated
@@ -151,6 +176,9 @@ def submit_render(
         }
 
     supa.update_production(production_id, render_backend=mode)
+
+    if mode == CLIP:
+        return _submit_clip(production_id, idea, supa)
 
     if mode == FAL_VIDEO:
         return _submit_fal_video(production_id, production, preset, supa)
@@ -441,6 +469,76 @@ def _submit_fal_video(
     }
 
 
+def _clip_plan(idea: dict[str, Any], supa: Supa) -> tuple[dict[str, Any], float, float]:
+    """The recording, and the range of it this production is.
+
+    Read from the *idea* rather than the candidate, and that is deliberate.
+    `accept_clip_candidate` copies the range onto the idea at the moment the
+    owner accepts it, so this reproduces exactly what they said yes to even if
+    the candidate row were later corrected -- the same reason
+    `productions.render_backend` records the mode that was in force rather than
+    the preset's current one.
+    """
+    source_id = idea.get("clip_source_id")
+    start = idea.get("clip_start_seconds")
+    end = idea.get("clip_end_seconds")
+    if not source_id or start is None or end is None:
+        raise ValueError(
+            "this style cuts a clip out of an uploaded recording, and this idea "
+            "does not name one. It was not created by accepting a clip candidate."
+        )
+
+    source = supa.clip_source(str(source_id))
+    if not (source.get("storage_key") or "").strip():
+        raise ValueError(f"clip source {source_id} has no stored recording")
+
+    start, end = float(start), float(end)
+    if end <= start:
+        raise ValueError(f"this clip does not run forwards: {start}s to {end}s")
+    return source, start, end
+
+
+def _submit_clip(production_id: str, idea: dict[str, Any], supa: Supa) -> dict[str, Any]:
+    """Begin a clip. Nothing is submitted anywhere, because there is nowhere.
+
+    The only lane with no provider and therefore no bill. Everything it needs is
+    a file in our own bucket and a range on the idea, so this step is a
+    validation and a handoff: it confirms the recording is still there and the
+    range is sane, and leaves the work to `fetch_and_qc`, which is where the
+    hour-long lease and ffmpeg are.
+
+    A failure here releases the render claim. On every other lane that would be
+    unsafe -- releasing a claim after a provider may have started billing is how
+    you pay twice -- and here it is simply correct: nothing has been spent, so
+    the production should be retryable rather than stranded holding a `task_id`
+    nothing can unset.
+    """
+    try:
+        source, start, end = _clip_plan(idea, supa)
+    except Exception:
+        supa.update_production(production_id, task_id=None, status=ProductionStatus.QUEUED.value)
+        raise
+
+    supa.update_production(
+        production_id,
+        stage=f"cutting {end - start:.0f}s from {source.get('filename') or 'your recording'}",
+    )
+    return {
+        "production_id": production_id,
+        "backend": CLIP,
+        "phase": CLIP,
+        "task_id": production_id,
+        # The recording, not the output. `fetch_and_qc` reads this the way every
+        # other lane reads a provider's download URL.
+        "video_ref": source["storage_key"],
+        "clip_source_id": source["id"],
+        "clip_start_seconds": start,
+        "clip_end_seconds": end,
+        "started_at": time.time(),
+        "polls": 0,
+    }
+
+
 def _submit_heygen(
     production_id: str,
     idea: dict[str, Any],
@@ -586,7 +684,6 @@ def poll_render(
     for an ordinary in-progress render.
     """
     supa = supa or Supa()
-    mpt = mpt or MptClient()
     production_id = event["production_id"]
     task_id = event.get("task_id") or production_id
     polls = int(event.get("polls", 0)) + 1
@@ -598,11 +695,30 @@ def poll_render(
     # function serves both backends unchanged -- which is why the state machine
     # does not need to know which one ran.
     if backend in FAL_MODES and event.get("phase") == "fal":
-        return _poll_fal(event, supa, mpt, polls)
+        # The visuals lane hands its clips to MoneyPrinterTurbo when generation
+        # finishes, so this one branch does need a client -- and only this one.
+        return _poll_fal(event, supa, mpt or MptClient(), polls)
 
     if backend == HEYGEN:
         return _poll_heygen(event, supa, polls)
 
+    if backend == CLIP:
+        # Nothing to poll. There is no provider holding this render: the cut
+        # happens in `fetch_and_qc`, where the lease is an hour and ffmpeg is,
+        # so this step exists only because the graph routes submit -> poll ->
+        # fetch and there is no reason to give this lane its own arc.
+        #
+        # The one visible cost is `poll_render`'s `wait_before=30`: a clip waits
+        # half a minute before a free local cut starts. Worth less than a branch
+        # in the graph that every other lane would have to be read around.
+        return {
+            **{k: v for k, v in event.items() if k != "state"},
+            "state": "complete",
+            "polls": polls,
+            "progress": 100,
+        }
+
+    mpt = mpt or MptClient()
     try:
         status = mpt.get_task(task_id)
     except MptTaskStateLost:
@@ -908,7 +1024,6 @@ def fetch_and_qc(
     be ours before anything downstream depends on it.
     """
     supa = supa or Supa()
-    mpt = mpt or MptClient()
     production_id = event["production_id"]
     video_ref = event["video_ref"]
     backend = event.get("backend") or MPT
@@ -929,6 +1044,11 @@ def fetch_and_qc(
             # clips and speech, and everything MPT would have done has to
             # happen here.
             local, has_subtitles = _assemble_fal_full(event, supa, Path(tmp))
+        elif backend == CLIP:
+            # The only lane whose input is a file we already own. Everything
+            # happens here rather than at submit because this is the step with
+            # the hour-long lease -- the download alone can be gigabytes.
+            local, has_subtitles = _assemble_clip(event, supa, Path(tmp))
         elif backend == FAL_VIDEO:
             # The one lane with nothing to assemble and nothing to voice. The
             # model was given a finished video and an instruction, and what it
@@ -943,8 +1063,11 @@ def fetch_and_qc(
             local = FalClient().download(video_ref, Path(tmp) / "final.mp4")
         else:
             # Both the pure-MPT path and the visuals path converge here: the
-            # visuals path's finished file is an ordinary MPT render.
-            local = mpt.download_artifact(video_ref, Path(tmp) / "final.mp4")
+            # visuals path's finished file is an ordinary MPT render. The client
+            # is built here rather than at the top of the function so that a
+            # lane which never touches MoneyPrinterTurbo does not require its
+            # credentials -- see the note in `submit_render`.
+            local = (mpt or MptClient()).download_artifact(video_ref, Path(tmp) / "final.mp4")
 
         info = probe_mod.probe(local)
         key = supa.upload_render(production_id, local, "final.mp4")
@@ -1067,6 +1190,75 @@ def _assemble_fal_full(
         log.warning("fal narration/captions incomplete for %s: %s", production_id, exc)
 
     return voiced, has_subtitles
+
+
+def _assemble_clip(
+    event: dict[str, Any], supa: Supa, tmp: Path
+) -> tuple[Path, bool]:
+    """Cut the clip, reframe it to 9:16 and burn its own captions in.
+
+    Four ffmpeg passes on a file from our own bucket, and no provider call at
+    any point. The order matters: cut first, so every pass after it works on
+    twenty seconds rather than on an hour.
+
+    The captions are the reason the transcript is stored on `clip_sources`
+    rather than recomputed. They come from the very segments the model chose
+    this range from, so a caption cannot claim a word was said at a moment the
+    range does not contain -- and the approved script is what supplies the
+    words, so a correction made at the script gate reaches the burned-in text.
+    See `clips.caption_segments`.
+
+    Captions failing does not discard the clip. Unlike the generative lanes
+    there is nothing paid to protect here, but the argument is the same one
+    `_assemble_fal_full` makes: a reviewer looking at a real clip is more useful
+    than a parked production, and the quality report is what says the captions
+    are missing.
+    """
+    from pipeline import assemble, clips
+
+    production_id = event["production_id"]
+    production = supa.production(production_id)
+    preset = supa.style_preset(production["style_preset_id"])
+    cfg = (preset.get("params") or {}).get("clip") or {}
+
+    start = float(event["clip_start_seconds"])
+    end = float(event["clip_end_seconds"])
+
+    supa.update_production(production_id, stage="fetching your recording")
+    source_file = supa.download_render(event["video_ref"], tmp / "source")
+
+    supa.update_production(production_id, stage=f"cutting {start:.0f}s-{end:.0f}s")
+    piece = assemble.cut(source_file, start, end, tmp / "cut.mp4")
+
+    # The source is deleted as soon as the cut exists. A long recording is the
+    # largest file this pipeline ever handles and every clip from it downloads
+    # its own copy, so holding both while ffmpeg reframes is what would fill the
+    # disk on a host running two production threads.
+    source_file.unlink(missing_ok=True)
+
+    reframe = str(cfg.get("reframe") or assemble.CROP)
+    supa.update_production(production_id, stage=f"reframing to 9:16 ({reframe})")
+    portrait = assemble.reframe_portrait(piece, tmp / "portrait.mp4", mode=reframe)
+
+    if not cfg.get("burn_captions", True):
+        return portrait, False
+
+    try:
+        source = supa.clip_source(str(event["clip_source_id"]))
+        transcript = Transcript.model_validate(source.get("transcript") or {})
+        segments = clips.caption_segments(
+            transcript, start, end, script=production.get("script")
+        )
+        srt = assemble.srt_from_segments(segments, tmp / "captions.srt", offset=start)
+        if not srt:
+            return portrait, False
+        captioned = assemble.burn_subtitles(
+            portrait, srt, tmp / "captioned.mp4", font_size=int(cfg.get("font_size", 60))
+        )
+        return captioned, True
+    except Exception as exc:  # noqa: BLE001 - a missing caption track must not lose the cut
+        log.warning("captions incomplete for clip %s: %s", production_id, exc)
+        return portrait, False
 
 
 def _extract_poster(video: Path, dest: Path) -> Path:

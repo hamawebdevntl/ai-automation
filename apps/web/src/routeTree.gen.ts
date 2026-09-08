@@ -15,6 +15,7 @@ import { Route as ForgotPasswordRouteImport } from './routes/forgot-password';
 import { Route as LoginRouteImport } from './routes/login';
 import { Route as RegisterRouteImport } from './routes/register';
 import { Route as ResetPasswordRouteImport } from './routes/reset-password';
+import { Route as AppClipsRouteImport } from './routes/_app/clips';
 import { Route as AppQueueRouteImport } from './routes/_app/queue';
 import { Route as AppReviewRouteImport } from './routes/_app/review';
 import { Route as AppSettingsRouteImport } from './routes/_app/settings';
@@ -50,6 +51,11 @@ const ResetPasswordRoute = ResetPasswordRouteImport.update({
   id: '/reset-password',
   path: '/reset-password',
   getParentRoute: () => rootRouteImport,
+} as any);
+const AppClipsRoute = AppClipsRouteImport.update({
+  id: '/clips',
+  path: '/clips',
+  getParentRoute: () => AppRoute,
 } as any);
 const AppQueueRoute = AppQueueRouteImport.update({
   id: '/queue',
@@ -89,6 +95,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute;
   '/register': typeof RegisterRoute;
   '/reset-password': typeof ResetPasswordRoute;
+  '/clips': typeof AppClipsRoute;
   '/queue': typeof AppQueueRoute;
   '/review': typeof AppReviewRoute;
   '/settings': typeof AppSettingsRoute;
@@ -102,6 +109,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute;
   '/register': typeof RegisterRoute;
   '/reset-password': typeof ResetPasswordRoute;
+  '/clips': typeof AppClipsRoute;
   '/queue': typeof AppQueueRoute;
   '/review': typeof AppReviewRoute;
   '/settings': typeof AppSettingsRoute;
@@ -117,6 +125,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute;
   '/register': typeof RegisterRoute;
   '/reset-password': typeof ResetPasswordRoute;
+  '/_app/clips': typeof AppClipsRoute;
   '/_app/queue': typeof AppQueueRoute;
   '/_app/review': typeof AppReviewRoute;
   '/_app/settings': typeof AppSettingsRoute;
@@ -132,6 +141,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/register'
     | '/reset-password'
+    | '/clips'
     | '/queue'
     | '/review'
     | '/settings'
@@ -145,6 +155,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/register'
     | '/reset-password'
+    | '/clips'
     | '/queue'
     | '/review'
     | '/settings'
@@ -159,6 +170,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/register'
     | '/reset-password'
+    | '/_app/clips'
     | '/_app/queue'
     | '/_app/review'
     | '/_app/settings'
@@ -220,6 +232,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ResetPasswordRouteImport;
       parentRoute: typeof rootRouteImport;
     };
+    '/_app/clips': {
+      id: '/_app/clips';
+      path: '/clips';
+      fullPath: '/clips';
+      preLoaderRoute: typeof AppClipsRouteImport;
+      parentRoute: typeof AppRoute;
+    };
     '/_app/queue': {
       id: '/_app/queue';
       path: '/queue';
@@ -266,6 +285,7 @@ declare module '@tanstack/react-router' {
 }
 
 interface AppRouteChildren {
+  AppClipsRoute: typeof AppClipsRoute;
   AppQueueRoute: typeof AppQueueRoute;
   AppReviewRoute: typeof AppReviewRoute;
   AppSettingsRoute: typeof AppSettingsRoute;
@@ -275,6 +295,7 @@ interface AppRouteChildren {
 }
 
 const AppRouteChildren: AppRouteChildren = {
+  AppClipsRoute: AppClipsRoute,
   AppQueueRoute: AppQueueRoute,
   AppReviewRoute: AppReviewRoute,
   AppSettingsRoute: AppSettingsRoute,

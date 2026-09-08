@@ -172,3 +172,149 @@ def to_portrait(video: Path, dest: Path) -> Path:
         "-c:a", "copy", "-y", str(dest),
     ])
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Cutting an uploaded recording down -- the `clip` lane
+# ---------------------------------------------------------------------------
+#
+# Nothing below calls a provider. The whole of this lane is ffmpeg on a file we
+# already hold, which is why it is the one lane where a failed render has cost
+# nothing but CPU.
+
+CROP = "crop"
+PAD = "pad"
+
+
+def cut(source: Path, start: float, end: float, dest: Path) -> Path:
+    """Extract [start, end] from a longer recording.
+
+    Re-encodes rather than stream-copying, and this is the important choice
+    here. `-c copy` can only cut on a keyframe, so it silently moves the cut to
+    the nearest one -- up to several seconds away on a screen recording with a
+    long GOP. On a clip whose first line *is* the hook, losing the first two
+    seconds loses the reason the clip was chosen. Re-encoding puts the cut where
+    it was asked for.
+
+    `-ss` before `-i` so the decoder seeks rather than decoding and discarding
+    everything up to the start; on an hour-long source that is the difference
+    between seconds and minutes. Accurate seek is still guaranteed, because the
+    re-encode that follows resolves the frame exactly.
+    """
+    if end <= start:
+        raise AssemblyError(f"a clip must run forwards: {start}s to {end}s")
+
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+        "-i", str(source),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        # The output timeline starts at zero. Without this the cut keeps the
+        # source's timestamps, and every caption -- whose times are relative to
+        # the clip -- would be offset by however far in the clip began.
+        "-avoid_negative_ts", "make_zero",
+        "-y", str(dest),
+    ])
+    return dest
+
+
+def reframe_portrait(source: Path, dest: Path, mode: str = CROP) -> Path:
+    """Make a 1080x1920 reel out of whatever shape the recording was.
+
+    Two modes, because there is no answer that is right for both kinds of
+    source, and the preset chooses:
+
+      `crop`  Centre-crop to 9:16, then scale. What every clipping tool does,
+              and right for the intended input -- a person talking, framed in
+              the middle of a 16:9 frame. It fills the screen, and it does
+              remove the sides. That is the honest cost of a full-bleed reel.
+
+      `pad`   Pillarbox instead, which is what `to_portrait` does for the
+              generative lanes and for the reason recorded there: padding is
+              visible where cropping is silent. Right when the sides carry the
+              content -- a slide, a screen recording, a two-shot -- where a
+              centre crop would cut away half of what the clip is about.
+
+    Speaker tracking is deliberately absent. Following a face would need
+    per-frame detection and a smoothed crop path, which is a different size of
+    feature and a new dependency; a fixed centre crop is what this lane ships
+    with.
+
+    An unknown mode pads rather than raising. It comes from `style_presets.params`,
+    which is raw JSON a person edits, and the failure mode of a typo should be a
+    reel with black bars rather than a production that parks after the owner
+    approved it.
+    """
+    if mode == CROP:
+        # `min(iw,ih*9/16)` is what makes this safe on a source that is already
+        # portrait, or square: the crop window can never be wider or taller than
+        # the frame it is taken from, so a 9:16 upload passes through untouched
+        # rather than being cropped to a sliver.
+        vf = (
+            "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)':x='(iw-ow)/2':y='(ih-oh)/2',"
+            "scale=1080:1920:flags=lanczos,setsar=1"
+        )
+    else:
+        vf = (
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+        )
+
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", str(source),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy", "-y", str(dest),
+    ])
+    return dest
+
+
+def srt_from_segments(
+    segments: list[dict[str, Any]] | list[Any],
+    dest: Path,
+    offset: float = 0.0,
+) -> Path | None:
+    """Build an SRT from transcript segments, rebased onto a clip's timeline.
+
+    `offset` is where the clip starts in the source. The segments' times are
+    absolute -- they describe the whole recording -- and `cut` produces a file
+    whose timeline starts at zero, so every caption has to move back by that
+    much or the whole track sits ahead of the words by however far in the clip
+    began.
+
+    Accepts either dicts or `TranscriptSegment`s so a caller does not have to
+    round-trip through the model to write a file.
+
+    Returns None when nothing usable survives, matching
+    `srt_from_transcription`: a clip with no captions is still a clip, and the
+    quality report is what says they are missing.
+    """
+    lines: list[str] = []
+    index = 1
+    for segment in segments:
+        if isinstance(segment, dict):
+            text = str(segment.get("text") or "").strip()
+            start, end = _f(segment.get("start")), _f(segment.get("end"))
+        else:
+            text = str(getattr(segment, "text", "") or "").strip()
+            start, end = _f(getattr(segment, "start", None)), _f(getattr(segment, "end", None))
+
+        if not text or start is None or end is None:
+            continue
+        start, end = start - offset, end - offset
+        # A segment that ends at or before zero belongs to the part of the
+        # recording this clip does not contain.
+        if end <= 0 or end <= start:
+            continue
+        lines.append(f"{index}\n{_ts(max(0.0, start))} --> {_ts(end)}\n{text}\n")
+        index += 1
+
+    if not lines:
+        log.warning("no usable caption timings for this clip; shipping it without captions")
+        return None
+    dest.write_text("\n".join(lines), encoding="utf-8")
+    return dest

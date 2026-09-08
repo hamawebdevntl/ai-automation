@@ -15,10 +15,17 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import httpx
 from supabase import Client, create_client
 
 from pipeline.config import settings
-from pipeline.models import LIVE_STATUSES, Platform, ProductionStatus, QcReport
+from pipeline.models import (
+    LIVE_STATUSES,
+    ClipSourceStatus,
+    Platform,
+    ProductionStatus,
+    QcReport,
+)
 
 log = logging.getLogger(__name__)
 
@@ -473,6 +480,124 @@ class Supa:
         if not url:
             raise SupaError(f"could not sign {key}: {res}")
         return url
+
+    def download_render(self, key: str, dest: Path) -> Path:
+        """Stream an object out of the private bucket onto disk.
+
+        Through a signed URL rather than the storage client's own `download`,
+        which returns the whole object as bytes. That is fine for a finished
+        reel and unacceptable for the input to the clipping lane, where the
+        object is the owner's original recording and can be gigabytes -- a
+        worker thread holding one in memory would take the process down.
+        """
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        url = self.signed_render_url(key, expires_in=3600)
+        with (
+            httpx.Client(timeout=None, follow_redirects=True) as client,
+            client.stream("GET", url) as resp,
+        ):
+            if resp.status_code >= 400:
+                raise SupaError(f"could not fetch {key}: {resp.status_code}")
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1 << 20):
+                    fh.write(chunk)
+        return dest
+
+    # -- clip sources and candidates ---------------------------------------
+    #
+    # The clipping lane's own rows. A `clip_sources` row is the upload, the lease
+    # that stops two workers transcribing one file, and the record of the
+    # transcript -- the same three jobs `trend_runs` does for a scout run.
+
+    def clip_source(self, source_id: str) -> dict[str, Any]:
+        res = self._c.table("clip_sources").select("*").eq("id", source_id).single().execute()
+        if not res.data:
+            raise SupaError(f"clip source {source_id} not found")
+        return res.data
+
+    def claim_clip_source(self, worker: str, lease_seconds: int) -> dict[str, Any] | None:
+        """Take one recording that still needs work, or None.
+
+        A security-definer function rather than a conditional UPDATE from here,
+        because the claim has to be `for update skip locked` over three
+        statuses: the status cannot double as the lock the way it can for a
+        trend run, since the review UI reads it to say which phase the source is
+        in. See `claim_clip_source` in the 20260908150000 migration.
+        """
+        res = self._c.rpc(
+            "claim_clip_source",
+            {"p_worker": worker, "p_lease_seconds": lease_seconds},
+        ).execute()
+        row = res.data
+        if isinstance(row, list):
+            row = row[0] if row else None
+        return row or None
+
+    def update_clip_source(self, source_id: str, **fields: Any) -> dict[str, Any]:
+        """Write to a source and release the lease in the same statement.
+
+        The lease is dropped on every write for the reason `save_run_state`
+        drops a production's: the phase that held it has finished, and a row
+        that is unleased for almost all of its life is one an owner's own
+        actions -- `retry_clip_source` -- rarely have to refuse.
+        """
+        payload = {k: _jsonable(v) for k, v in fields.items()}
+        payload.setdefault("leased_by", None)
+        payload.setdefault("lease_expires_at", None)
+        res = (
+            self._c.table("clip_sources")
+            .update(payload)
+            .eq("id", source_id)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            raise SupaError(f"clip source {source_id} vanished mid-update")
+        return rows[0]
+
+    def fail_clip_source(self, source_id: str, error: str) -> dict[str, Any]:
+        """Mark a source failed, with the reason on the row.
+
+        `clip_sources_failure_is_explained` refuses a failed row with no error,
+        so the message is not optional. Truncated because the column is read in
+        a card in the browser and a stack trace there is unreadable.
+        """
+        return self.update_clip_source(
+            source_id, status=ClipSourceStatus.FAILED.value, error=error[:2000]
+        )
+
+    def insert_clip_candidates(
+        self, source_id: str, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Write the proposed candidates for one source.
+
+        One statement, so a partial list is impossible: an owner opening the
+        gate sees the whole proposal or none of it. `pipeline.clips.validate`
+        has already re-ranked from 1, which is what keeps this from colliding
+        with `clip_candidates_rank_unique`.
+        """
+        if not rows:
+            return []
+        payload = [{**row, "source_id": source_id} for row in rows]
+        res = self._c.table("clip_candidates").insert(payload).execute()
+        return res.data or []
+
+    def clip_candidate_for_idea(self, idea_id: str) -> dict[str, Any] | None:
+        """The candidate an idea was accepted from, or None for a non-clip idea.
+
+        Read through `idea_id` rather than the other way around because that is
+        the direction the render has: it holds a production, which names an
+        idea. `ideas_one_per_clip_candidate` is what makes "the" correct here.
+        """
+        res = (
+            self._c.table("clip_candidates")
+            .select("*")
+            .eq("idea_id", idea_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
 
     # -- ideas -------------------------------------------------------------
 

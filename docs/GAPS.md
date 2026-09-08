@@ -103,6 +103,28 @@ Two gates times 10 reels a day is 20 review actions daily, every day. If the
 owner is away for three days the queue is 60 items deep. Needs batch-approve,
 auto-expiry, or a delegated second reviewer — a product decision, not a technical one.
 
+**The clip gate adds a third gate to this count, and it is the first one that
+can add several items from a single act.** One upload proposes up to
+`clip_sources.candidate_cap` candidates, and each accepted candidate becomes an
+idea and a production that then passes the script gate and Gate 2 — so one
+upload of six accepted clips is 6 clip decisions + 6 script approvals + 6
+sign-offs, 18 review actions from one drag-and-drop.
+
+Three things bound it, and none of them is a solution:
+
+- The cap is per upload and defaults to **6**, not 10, and the upload panel says
+  in as many words that every candidate is a review action.
+- `clips.validate` discards near-duplicates before an owner sees them, so the
+  list is not padded with the same moment at three lengths.
+- Accepting a candidate is *one* decision, not two: the idea it creates is
+  already approved, and `accept_clip_candidate` writes a single gate-3 row
+  rather than a gate-3 and a gate-1 row. Counting it twice is precisely the
+  error this section is about.
+
+What is still missing is the same thing as before: batch-approve. Deciding six
+candidates is six round trips, and the natural gesture — "make these three" — has
+no API. That is the first thing to build if this gate is used in anger.
+
 ---
 
 ## C. Deferred, but name them now
