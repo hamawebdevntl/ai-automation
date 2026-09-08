@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   blocklistEntryError,
   clampToBounds,
+  DESCRIBED_SEARCH_PRESETS,
   describeSchedule,
   diagnoseRun,
+  estimateDescribedSearch,
   estimateRunMinutes,
   formatStageValue,
   fromPercent,
@@ -14,6 +16,7 @@ import {
   tagsPerRun,
   toPercent,
 } from '@/features/trends/controls';
+import { SEARCH_TERMS_DEFAULT } from '@/features/trends/search';
 import { trendRejections, trendRun, trendSettings } from '@/features/trends/test-fixtures';
 
 /**
@@ -220,5 +223,42 @@ describe('showing a stage', () => {
     expect(formatStageValue(stage('caption_blocklist', ['a', 'b']))).toBe('2 words');
     expect(formatStageValue(stage('caption_blocklist', []))).toBe('none set');
     expect(formatStageValue(stage(null as unknown as string, null))).toBeNull();
+  });
+});
+
+/**
+ * A described search's length counts terms the worker may read, not a slice of
+ * the saved list, and its minutes follow the source: per term on Google Trends,
+ * per video elsewhere. The numbers below are the ones the control shows.
+ */
+describe('the length of a described search', () => {
+  const settings = trendSettings();
+
+  it('defaults to the number of terms the worker uses, and counts terms rather than the list', () => {
+    const estimate = estimateDescribedSearch(settings);
+    expect(estimate.terms).toBe(SEARCH_TERMS_DEFAULT);
+    expect(estimate.videos).toBeNull();
+    expect(estimate.minutes).toBe(3); // six terms at thirty seconds each
+    expect(estimate.ideaCap).toBe(10);
+  });
+
+  it('pays per video on a video source', () => {
+    const estimate = estimateDescribedSearch({ ...settings, trend_source: 'apify' }, { terms: 4 });
+    expect(estimate.videos).toBe(120); // 4 terms x 30 videos
+    expect(estimate.minutes).toBe(14); // 120 videos x 2 delays x 3.5s
+  });
+
+  it('is held to the bound of the column it rides in', () => {
+    expect(estimateDescribedSearch(settings, { terms: 500 }).terms).toBe(100);
+    expect(estimateDescribedSearch(settings, { terms: 0 }).terms).toBe(1);
+  });
+
+  it('never quotes a run longer than its budget', () => {
+    const estimate = estimateDescribedSearch({ ...settings, trend_source: 'apify' }, { terms: 12, budgetMinutes: 10 });
+    expect(estimate.minutes).toBe(10);
+  });
+
+  it('names the worker default as Standard', () => {
+    expect(DESCRIBED_SEARCH_PRESETS.find((p) => p.key === 'standard')?.terms).toBe(SEARCH_TERMS_DEFAULT);
   });
 });

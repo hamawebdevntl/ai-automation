@@ -132,10 +132,15 @@ describe('sending a description', () => {
     const user = userEvent.setup();
     render(<AiSearchPanel selectedRunId={null} />, { wrapper });
 
-    await user.type(box(), `  ${PROMPT}  `);
+    await screen.findByRole('radiogroup', { name: /search length/i });
+    // Pasted rather than typed: sixty keystrokes each re-render the panel, and
+    // under a parallel test run that is slower than the test timeout. What is
+    // under test is the words that arrive, not the typing.
+    await user.click(box());
+    await user.paste(`  ${PROMPT}  `);
     await user.click(searchButton());
 
-    expect(request).toHaveBeenCalledWith({ prompt: PROMPT, budgetMinutes: null, hashtagsPerRun: null });
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ prompt: PROMPT }));
     expect(toasts.success).toHaveBeenCalled();
     await waitFor(() => expect(navigate).toHaveBeenCalledWith({ to: '/queue', search: { search: 'search-9' } }));
   });
@@ -144,7 +149,8 @@ describe('sending a description', () => {
     const user = userEvent.setup();
     render(<AiSearchPanel selectedRunId={null} />, { wrapper });
 
-    await user.type(box(), PROMPT);
+    await user.click(box());
+    await user.paste(PROMPT);
     await user.keyboard('{Enter}');
     expect(request).not.toHaveBeenCalled();
 
@@ -170,7 +176,8 @@ describe('sending a description', () => {
     const user = userEvent.setup();
     render(<AiSearchPanel selectedRunId={null} />, { wrapper });
 
-    await user.type(box(), PROMPT);
+    await user.click(box());
+    await user.paste(PROMPT);
     await user.click(searchButton());
 
     expect(toasts.info).toHaveBeenCalled();
@@ -187,13 +194,77 @@ describe('sending a description', () => {
     const user = userEvent.setup();
     render(<AiSearchPanel selectedRunId={null} />, { wrapper });
 
-    await user.type(box(), PROMPT);
+    await user.click(box());
+    await user.paste(PROMPT);
     await user.click(searchButton());
 
     const [title, options] = toasts.error.mock.calls[0] as [string, { description: string }];
     expect(title).toMatch(/could not start the search/i);
     expect(options.description).toMatch(/has not been applied/i);
     expect(box()).toHaveValue(PROMPT);
+  });
+});
+
+/**
+ * How long a described search may take.
+ *
+ * The same lever the Generate button offers, with a different meaning: nothing
+ * is sliced from the saved list, the worker reads the description into at most
+ * this many terms. And every described search carries a ceiling, even when no
+ * length is chosen -- the saved budget may be unlimited, and a search is a
+ * question somebody is waiting on.
+ */
+describe('how long a search may take', () => {
+  it('offers the length between the words and the button, counting terms rather than the list', async () => {
+    render(<AiSearchPanel selectedRunId={null} />, { wrapper });
+
+    expect(await screen.findByRole('radiogroup', { name: /search length/i })).toBeInTheDocument();
+    expect(screen.getByText(/6 terms from your description/i)).toBeInTheDocument();
+    // The saved list has three keywords. A described search does not slice it.
+    expect(screen.queryByText(/of 3 hashtags/i)).not.toBeInTheDocument();
+  });
+
+  it('always sends a ceiling, even when nothing was chosen', async () => {
+    const user = userEvent.setup();
+    render(<AiSearchPanel selectedRunId={null} />, { wrapper });
+    await screen.findByRole('radiogroup', { name: /search length/i });
+
+    await user.click(box());
+    await user.paste(PROMPT);
+    await user.click(searchButton());
+
+    // Six terms on Google Trends is about three minutes; the ceiling is held to
+    // the five-minute floor the settings page enforces.
+    expect(request).toHaveBeenCalledWith({ prompt: PROMPT, budgetMinutes: 5, hashtagsPerRun: 6 });
+    const [, options] = toasts.success.mock.calls[0] as [string, { description: string }];
+    expect(options.description).toMatch(/6 terms, stopping by/i);
+  });
+
+  it('sends the chosen length', async () => {
+    const user = userEvent.setup();
+    render(<AiSearchPanel selectedRunId={null} />, { wrapper });
+
+    await user.click(await screen.findByRole('radio', { name: 'Deep' }));
+    expect(screen.getByText(/12 terms from your description/i)).toBeInTheDocument();
+    await user.click(box());
+    await user.paste(PROMPT);
+    await user.click(searchButton());
+
+    expect(request).toHaveBeenCalledWith({ prompt: PROMPT, budgetMinutes: 6, hashtagsPerRun: 12 });
+  });
+
+  it('is hidden from a viewer and while a run is going', async () => {
+    mockOwner.mockReturnValue({ isOwner: false, isLoading: false, role: 'viewer', displayName: null });
+    const { unmount } = render(<AiSearchPanel selectedRunId={null} />, { wrapper });
+    await screen.findByText(/only an owner can start a search/i);
+    expect(screen.queryByRole('radiogroup', { name: /search length/i })).not.toBeInTheDocument();
+    unmount();
+
+    mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
+    latest = trendRun({ status: 'running' });
+    render(<AiSearchPanel selectedRunId={null} />, { wrapper });
+    await screen.findByText(/a run is already going/i);
+    expect(screen.queryByRole('radiogroup', { name: /search length/i })).not.toBeInTheDocument();
   });
 });
 

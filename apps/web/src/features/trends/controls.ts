@@ -1,3 +1,4 @@
+import { SEARCH_TERMS_DEFAULT } from '@/features/trends/search';
 import type {
   ApifyPlatform,
   TrendRejectionStage,
@@ -271,11 +272,25 @@ export function runsToCoverEveryTag(settings: Pick<CostFields, 'hashtags' | 'has
  * decide whether a session is too long.
  */
 export function estimateRunMinutes(settings: CostFields): number {
+  return minutesForTags(tagsPerRun(settings), settings);
+}
+
+/**
+ * Minutes for scouting `tags` things at this depth and pace, under this budget.
+ *
+ * The arithmetic `estimateRunMinutes` does, with the count supplied rather than
+ * read from the list. A described search scouts terms read from a sentence,
+ * and how many is a choice made at the box, not a slice of anything saved.
+ */
+export function minutesForTags(
+  tags: number,
+  settings: Pick<CostFields, 'videos_per_hashtag' | 'pacing_min_seconds' | 'pacing_max_seconds' | 'run_budget_minutes'>,
+): number {
   const averagePace = (settings.pacing_min_seconds + settings.pacing_max_seconds) / 2;
   // Two delays per video in the worst case: one for its author's baseline, one
   // for the video itself having survived.
   const perHashtagSeconds = settings.videos_per_hashtag * 2 * averagePace;
-  const estimate = Math.round((tagsPerRun(settings) * perHashtagSeconds) / 60);
+  const estimate = Math.round((tags * perHashtagSeconds) / 60);
 
   // A budget is a ceiling on exactly this number, so quoting anything above it
   // would be quoting a run that cannot happen.
@@ -542,6 +557,98 @@ export function estimateSearchLength(
  */
 export function budgetForEstimate(minutes: number): number {
   return clampToBounds('run_budget_minutes', Math.ceil(minutes));
+}
+
+// ---------------------------------------------------------------------------
+// The length of a described search
+// ---------------------------------------------------------------------------
+
+/**
+ * A named length for a search started from a description.
+ *
+ * The lever is different from the list's. Nothing is sliced or rotated: the
+ * worker reads the description into at most this many terms and scouts exactly
+ * those. So the presets count terms, and "all of them" has nothing to refer to.
+ * The count still rides in `hashtags_per_run` on the row, because to the run
+ * that column has always meant "how many things to scout".
+ */
+export interface DescribedSearchPreset {
+  key: 'quick' | 'standard' | 'deep';
+  label: string;
+  /** Terms the worker may read from the description. */
+  terms: number;
+  description: string;
+}
+
+export const DESCRIBED_SEARCH_PRESETS: readonly DescribedSearchPreset[] = [
+  {
+    key: 'quick',
+    label: 'Quick',
+    terms: 3,
+    description: 'Three terms read from your description. The fastest answer, and the narrowest.',
+  },
+  {
+    key: 'standard',
+    label: 'Standard',
+    terms: SEARCH_TERMS_DEFAULT,
+    description: 'Six terms. What a search uses when no length is chosen.',
+  },
+  {
+    key: 'deep',
+    label: 'Deep',
+    terms: 12,
+    description: 'Twelve terms. The widest reading of the description, and the longest run.',
+  },
+];
+
+/**
+ * Google Trends is paced at five seconds a term and retries a refusal twice
+ * with twenty-second waits, so a term costs anywhere from five to forty-five
+ * seconds. Thirty is above what a live run has averaged, and an estimate that
+ * is an upper bound is the right way round for one deciding whether a search
+ * is too long.
+ */
+export const GOOGLE_TRENDS_SECONDS_PER_TERM = 30;
+
+/** What a described search of this length will do. */
+export interface DescribedSearchEstimate {
+  /** Terms the worker may read from the description. Exact. */
+  terms: number;
+  /** Videos the feeds will be asked for, or null on a source that has none. */
+  videos: number | null;
+  /** Upper bound on run length, in minutes. */
+  minutes: number;
+  /** The ideas-per-run cap. A ceiling, never a forecast. */
+  ideaCap: number;
+}
+
+type DescribedEstimateSettings = EstimateSettings & Pick<TrendSettingsRow, 'trend_source'>;
+
+/**
+ * What a described search of this length means, in numbers that cannot be wrong.
+ *
+ * `terms` defaults to what the worker uses when no length is chosen, and is
+ * held to the bound the settings page holds `hashtags_per_run` to, because that
+ * is the column it rides in. The minutes are source-aware: a video source pays
+ * per video at the configured pace, Google Trends pays per term. Neither says
+ * how many ideas come back.
+ */
+export function estimateDescribedSearch(
+  settings: DescribedEstimateSettings,
+  override: { terms?: number | null; budgetMinutes?: number | null } = {},
+): DescribedSearchEstimate {
+  const terms = clampToBounds('hashtags_per_run', override.terms ?? SEARCH_TERMS_DEFAULT);
+  const budget = override.budgetMinutes === undefined ? settings.run_budget_minutes : override.budgetMinutes;
+  const video = isVideoSource(settings.trend_source);
+  const uncapped = video
+    ? minutesForTags(terms, { ...settings, run_budget_minutes: null })
+    : Math.max(1, Math.round((terms * GOOGLE_TRENDS_SECONDS_PER_TERM) / 60));
+  return {
+    terms,
+    videos: video ? terms * settings.videos_per_hashtag : null,
+    minutes: budget === null ? uncapped : Math.min(uncapped, budget),
+    ideaCap: settings.ideas_per_run,
+  };
 }
 
 // ---------------------------------------------------------------------------

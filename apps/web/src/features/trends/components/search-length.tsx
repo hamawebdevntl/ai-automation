@@ -5,6 +5,8 @@ import { trendSettingsQueryOptions } from '@/features/trends/api';
 import { NumberSetting } from '@/features/trends/components/setting-field';
 import {
   budgetForEstimate,
+  DESCRIBED_SEARCH_PRESETS,
+  estimateDescribedSearch,
   estimateSearchLength,
   LONG_RUN_MINUTES,
   SEARCH_LENGTH_PRESETS,
@@ -90,35 +92,13 @@ export function SearchLength({
 
   return (
     <div className="w-full space-y-2 sm:w-auto">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        <Label htmlFor="search-length" className="text-xs font-normal">
-          Search length
-        </Label>
-        <ToggleGroup
-          id="search-length"
-          // Named here rather than relying on the label's `htmlFor`: a label
-          // does not name a role="group" for assistive tech, and this is the
-          // only thing distinguishing the control from the toggles inside it.
-          aria-label="Search length"
-          type="single"
-          size="sm"
-          variant="outline"
-          value={value.key}
-          disabled={disabled}
-          // A toggle group returns '' when the active item is clicked again.
-          // Re-selecting the same length must not clear the choice.
-          onValueChange={(next) => next && pick(next as SearchLengthChoice['key'])}
-        >
-          {SEARCH_LENGTH_PRESETS.map((preset) => (
-            <ToggleGroupItem key={preset.key} value={preset.key} aria-label={preset.label}>
-              {preset.label}
-            </ToggleGroupItem>
-          ))}
-          <ToggleGroupItem value="custom" aria-label="Custom">
-            Custom
-          </ToggleGroupItem>
-        </ToggleGroup>
-      </div>
+      <LengthToggle
+        id="search-length"
+        presets={SEARCH_LENGTH_PRESETS}
+        value={value.key}
+        disabled={disabled}
+        onPick={pick}
+      />
 
       {value.key === 'custom' && (
         <div className="grid gap-3 rounded-md border p-3 sm:grid-cols-2">
@@ -140,6 +120,154 @@ export function SearchLength({
       )}
 
       <Estimate estimate={estimate} hint={chosen?.description} />
+    </div>
+  );
+}
+
+/**
+ * The same choice, for a search started from a description.
+ *
+ * Same shape on the row -- `hashtagsPerRun` is the column the term cap rides
+ * in -- but a different lever: nothing is sliced or rotated, the worker reads
+ * the description into at most this many terms and scouts exactly those. So the
+ * presets count terms, the estimate is per term on Google Trends and per video
+ * elsewhere, and "covers the whole list" has nothing to refer to.
+ *
+ * Every described search carries a ceiling, even when nothing is chosen: the
+ * saved budget may be unlimited, and a search is a question somebody is
+ * waiting on. The panel resolves the default to a preset's numbers before it
+ * sends, so what the row carries is what this control showed.
+ */
+export function DescribedSearchLength({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: SearchLengthChoice;
+  onChange: (choice: SearchLengthChoice) => void;
+  disabled?: boolean;
+}) {
+  const { data: settings } = useQuery(trendSettingsQueryOptions());
+  if (!settings) return null;
+  const cfg = settings;
+
+  const estimate = estimateDescribedSearch(cfg, { terms: value.hashtagsPerRun, budgetMinutes: value.budgetMinutes });
+
+  function pick(key: SearchLengthChoice['key']) {
+    if (key === 'custom') {
+      onChange({
+        key: 'custom',
+        hashtagsPerRun: estimate.terms,
+        budgetMinutes: budgetForEstimate(estimate.minutes),
+      });
+      return;
+    }
+    const preset = DESCRIBED_SEARCH_PRESETS.find((p) => p.key === key);
+    if (!preset) return;
+    const projected = estimateDescribedSearch(cfg, { terms: preset.terms, budgetMinutes: null });
+    onChange({
+      key,
+      hashtagsPerRun: preset.terms,
+      // A ceiling, so a preset cannot overrun the length it just promised.
+      budgetMinutes: budgetForEstimate(projected.minutes),
+    });
+  }
+
+  const chosen = DESCRIBED_SEARCH_PRESETS.find((p) => p.key === value.key);
+  const parts = [
+    `stops by ${formatMinutes(estimate.minutes)}`,
+    `${estimate.terms} term${estimate.terms === 1 ? '' : 's'} from your description`,
+  ];
+  if (estimate.videos !== null) parts.push(`~${estimate.videos.toLocaleString()} videos`);
+
+  return (
+    <div className="w-full space-y-2">
+      <LengthToggle
+        id="described-search-length"
+        presets={DESCRIBED_SEARCH_PRESETS}
+        value={value.key}
+        disabled={disabled}
+        onPick={pick}
+      />
+
+      {value.key === 'custom' && (
+        <div className="grid gap-3 rounded-md border p-3 sm:grid-cols-2">
+          <NumberSetting
+            field="hashtags_per_run"
+            label="Terms"
+            value={value.hashtagsPerRun ?? estimate.terms}
+            disabled={disabled}
+            onChange={(v) => onChange({ ...value, key: 'custom', hashtagsPerRun: v })}
+          />
+          <NumberSetting
+            field="run_budget_minutes"
+            label="Stop after"
+            value={value.budgetMinutes ?? budgetForEstimate(estimate.minutes)}
+            disabled={disabled}
+            onChange={(v) => onChange({ ...value, key: 'custom', budgetMinutes: v })}
+          />
+        </div>
+      )}
+
+      <div className="space-y-0.5 text-xs">
+        <p className="text-muted-foreground">
+          {parts.join(' · ')} · <span className="text-foreground">up to {estimate.ideaCap} ideas</span>
+        </p>
+        <p className="text-muted-foreground">
+          {estimate.minutes > LONG_RUN_MINUTES && 'That is a long session against a platform that fights scrapers. '}
+          {chosen?.description}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The preset toggles, shared by both controls.
+ *
+ * Named by `aria-label` rather than relying on the label's `htmlFor`: a label
+ * does not name a role="group" for assistive tech, and this is the only thing
+ * distinguishing the control from the toggles inside it.
+ */
+function LengthToggle({
+  id,
+  presets,
+  value,
+  disabled,
+  onPick,
+}: {
+  id: string;
+  presets: readonly { key: SearchLengthChoice['key']; label: string }[];
+  value: SearchLengthChoice['key'];
+  disabled?: boolean;
+  onPick: (key: SearchLengthChoice['key']) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      <Label htmlFor={id} className="text-xs font-normal">
+        Search length
+      </Label>
+      <ToggleGroup
+        id={id}
+        aria-label="Search length"
+        type="single"
+        size="sm"
+        variant="outline"
+        value={value}
+        disabled={disabled}
+        // A toggle group returns '' when the active item is clicked again.
+        // Re-selecting the same length must not clear the choice.
+        onValueChange={(next) => next && onPick(next as SearchLengthChoice['key'])}
+      >
+        {presets.map((preset) => (
+          <ToggleGroupItem key={preset.key} value={preset.key} aria-label={preset.label}>
+            {preset.label}
+          </ToggleGroupItem>
+        ))}
+        <ToggleGroupItem value="custom" aria-label="Custom">
+          Custom
+        </ToggleGroupItem>
+      </ToggleGroup>
     </div>
   );
 }

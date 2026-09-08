@@ -21,7 +21,12 @@ import {
 } from '@/features/trends/api';
 import { RunBanner } from '@/features/trends/components/generate-ideas';
 import { ExamplePrompts, RecentSearches } from '@/features/trends/components/recent-searches';
-import { estimateSearchLength } from '@/features/trends/controls';
+import {
+  DEFAULT_SEARCH_LENGTH,
+  DescribedSearchLength,
+  type SearchLengthChoice,
+} from '@/features/trends/components/search-length';
+import { budgetForEstimate, estimateDescribedSearch } from '@/features/trends/controls';
 import { PROMPT_MAX_CHARS, promptError, SEARCH_TERMS_DEFAULT } from '@/features/trends/search';
 import { isTrendRunInFlight } from '@/lib/database.types';
 import { formatMinutes } from '@/lib/format';
@@ -51,6 +56,12 @@ export function AiSearchPanel({ selectedRunId }: { selectedRunId: string | null 
   const [draft, setDraft] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // How long this search may take. Reset to the default on every mount, as the
+  // Generate button's is: a length is chosen for a reason that belongs to the
+  // moment, and a stale choice silently applying to the next search is the
+  // surprise this whole design avoids.
+  const [length, setLength] = useState<SearchLengthChoice>(DEFAULT_SEARCH_LENGTH);
+
   // Selecting a search puts its words back in the box. Keyed on the words
   // rather than the row, so a poll that refreshes the same run does not
   // overwrite what someone has started typing.
@@ -76,15 +87,20 @@ export function AiSearchPanel({ selectedRunId }: { selectedRunId: string | null 
   }
 
   async function submit(prompt: string = draft) {
+    // Every described search carries an explicit ceiling, even when no length
+    // was chosen. The default resolves to the Standard preset's numbers rather
+    // than to "whatever the saved settings say", because the saved budget may
+    // be unlimited and a search is a question somebody is waiting on. The
+    // worker enforces both numbers: the term cap and the wall-clock deadline.
+    const terms = length.hashtagsPerRun ?? SEARCH_TERMS_DEFAULT;
+    const minutes = settings
+      ? estimateDescribedSearch(settings, { terms, budgetMinutes: length.budgetMinutes }).minutes
+      : TREND_RUN_MINUTES;
+    const budget = length.budgetMinutes ?? (settings ? budgetForEstimate(minutes) : null);
     try {
-      const run = await request.mutateAsync({ prompt: prompt.trim(), budgetMinutes: null, hashtagsPerRun: null });
-      // The estimate for a run of the default number of terms. An upper bound,
-      // and worded as one, for the same reason the Generate button's is.
-      const minutes = settings
-        ? estimateSearchLength(settings, { hashtagsPerRun: SEARCH_TERMS_DEFAULT, budgetMinutes: null }).minutes
-        : TREND_RUN_MINUTES;
+      const run = await request.mutateAsync({ prompt: prompt.trim(), budgetMinutes: budget, hashtagsPerRun: terms });
       toast.success('Searching for ideas', {
-        description: `This takes up to ${formatMinutes(minutes)}. The ideas appear here when it finishes, and you can leave this page.`,
+        description: `${terms} term${terms === 1 ? '' : 's'}, stopping by ${formatMinutes(budget ?? minutes)}. The ideas appear here when it finishes, and you can leave this page.`,
       });
       await navigate({ to: '/queue', search: { search: run.id } });
     } catch (error) {
@@ -154,6 +170,13 @@ export function AiSearchPanel({ selectedRunId }: { selectedRunId: string | null 
             aria-describedby="ai-search-hint"
             className="min-h-24 max-h-48 overflow-y-auto text-base"
           />
+          {/* Between the words and the button, because it is a decision about
+              the search the button is about to start. Hidden while a run is
+              going -- nothing to configure about one that has begun -- and from
+              a viewer, who cannot start one. */}
+          {isOwner && !inFlight && (
+            <DescribedSearchLength value={length} onChange={setLength} disabled={request.isPending} />
+          )}
           <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
             <p id="ai-search-hint" className="text-xs text-muted-foreground">
               {hint ?? (
