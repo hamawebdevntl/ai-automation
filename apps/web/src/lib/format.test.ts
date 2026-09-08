@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { formatCostRange, formatDuration, formatMinutes, formatUsd, parseQcReport, titleCase } from '@/lib/format';
+import {
+  formatCostRange,
+  formatDuration,
+  formatMeasuredCost,
+  formatMinutes,
+  formatUsd,
+  parseQcReport,
+  titleCase,
+} from '@/lib/format';
 
 describe('formatUsd', () => {
   it('renders an em dash rather than $0.00 for missing costs', () => {
@@ -71,5 +79,26 @@ describe('titleCase', () => {
     expect(titleCase('instagram')).toBe('Instagram');
     expect(titleCase('awaiting_review')).toBe('Awaiting Review');
     expect(titleCase('youtube-shorts')).toBe('Youtube Shorts');
+  });
+});
+
+describe('formatMeasuredCost', () => {
+  it('reads as a measurement rather than a figure, because that is the point of it', () => {
+    expect(formatMeasuredCost({ render_count: 4, measured_avg_usd: 1.42 })).toBe('$1.42 over 4 renders');
+  });
+
+  it('says "1 render" rather than "1 renders"', () => {
+    expect(formatMeasuredCost({ render_count: 1, measured_avg_usd: 0.4 })).toBe('$0.40 over 1 render');
+  });
+
+  it('is null before anything has been billed, so the estimate is what shows', () => {
+    // "No renders yet" and "renders that cost nothing" are different facts and
+    // only the second is worth showing as a measurement.
+    expect(formatMeasuredCost({ render_count: 0, measured_avg_usd: null })).toBeNull();
+    expect(formatMeasuredCost(undefined)).toBeNull();
+  });
+
+  it('shows a genuine zero, which is what the stock lane measures at', () => {
+    expect(formatMeasuredCost({ render_count: 12, measured_avg_usd: 0 })).toBe('$0.00 over 12 renders');
   });
 });

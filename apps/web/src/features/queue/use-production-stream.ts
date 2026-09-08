@@ -1,5 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
+import { spendKeys } from '@/features/spend/api';
 import type { ProductionEventRow, ProductionRow } from '@/lib/database.types';
 import { supabase } from '@/lib/supabase';
 import type { ProductionWithContext } from './api';
@@ -51,6 +52,13 @@ export function useProductionStream(productionId: string | null | undefined) {
           // rather than patched -- and a status change is what moves a
           // production between them.
           void queryClient.invalidateQueries({ queryKey: queueKeys.live() });
+
+          // `cost_actual_usd` is a projection of `render_spend`, maintained by
+          // trigger -- so an UPDATE arriving here is exactly the signal that a
+          // charge has landed. Without this the breakdown beside the video
+          // renders nothing until the page is reloaded, since it is empty right
+          // up to the moment the render is submitted.
+          void queryClient.invalidateQueries({ queryKey: spendKeys.production(productionId) });
         },
       )
       .on(

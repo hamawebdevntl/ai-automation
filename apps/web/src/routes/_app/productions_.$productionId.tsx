@@ -16,6 +16,7 @@ import { QueryError } from '@/features/queue/components/query-state';
 import { ScriptEditor } from '@/features/queue/components/script-editor';
 import { describeProduction, hasStarted, isAtGate2, isAtScriptGate } from '@/features/queue/pipeline-steps';
 import { useProductionStream } from '@/features/queue/use-production-stream';
+import { ProductionSpend } from '@/features/spend/components/production-spend';
 import { RENDER_MODE_LABELS } from '@/lib/database.types';
 import { formatDuration, formatRelative, formatUsd, parseQcReport } from '@/lib/format';
 
@@ -180,6 +181,10 @@ function ProductionProcessPage() {
                 Estimated cost for this style is {formatUsd(production.cost_estimate_usd)}.
               </p>
             )}
+            {/* What it actually cost, charge by charge. Renders nothing until
+                something has been billed, which is every production before its
+                render is submitted. */}
+            <ProductionSpend productionId={production.id} />
           </CardContent>
         </Card>
 

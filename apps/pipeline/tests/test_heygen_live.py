@@ -73,6 +73,7 @@ from pipeline.clients.heygen import (
     HeyGenError,
     HeyGenInProgress,
     HeyGenRateLimited,
+    _find_balance,
 )
 from pipeline.models import HeyGenVideo
 from pipeline.qc.probe import ProbeError, frozen_seconds, mean_volume_db, probe
@@ -517,34 +518,13 @@ def configured_look(heygen: HeyGenClient, preset_config: dict[str, Any]) -> dict
     return owned[avatar_id]
 
 
-def _wallet_balance(account: dict[str, Any]) -> float | None:
-    """The remaining balance, wherever this account's plan reports it.
-
-    It sits at `wallet.remaining_balance` on this pay-as-you-go account, but a
-    plan change is not a reason for the check to start calling a funded account
-    empty, so it is searched for rather than read from a fixed path.
-    """
-    for key in ("remaining_balance", "balance", "remaining_credit", "remaining_quota"):
-        found = _find_number(account, key)
-        if found is not None:
-            return found
-    return None
-
-
-def _find_number(payload: Any, key: str) -> float | None:
-    if isinstance(payload, dict):
-        for k, v in payload.items():
-            if k == key and isinstance(v, (int, float)) and not isinstance(v, bool):
-                return float(v)
-            found = _find_number(v, key)
-            if found is not None:
-                return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = _find_number(item, key)
-            if found is not None:
-                return found
-    return None
+# `_wallet_balance` and its recursive search used to live here. They are
+# `heygen._find_balance` now, because `submit_render` needs the same answer
+# before it spends: a presenter render whose wallet cannot fund it is refused
+# rather than submitted. Two copies of "where does this plan keep its balance"
+# is one copy that stops being updated, so this test now checks the same code
+# the pipeline runs.
+_wallet_balance = _find_balance
 
 
 def _idempotency_key(cfg: dict[str, Any]) -> str:

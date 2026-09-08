@@ -100,10 +100,16 @@ auto-expiry, or a delegated second reviewer — a product decision, not a techni
 
 ## C. Deferred, but name them now
 Observability and alerting; a retention policy for the Supabase Storage
-renders bucket; fleet-level cost ceiling
-(OpenMontage's cost_tracker is per-project, not per-month); voice-cloning
-consent if a real person's voice is used; music licensing for organizational
-use; analytics-to-idea-scoring loop (already known custom).
+renders bucket; voice-cloning consent if a real person's voice is used; music
+licensing for organizational use; analytics-to-idea-scoring loop (already known
+custom).
+
+**The fleet-level cost ceiling is no longer deferred.** It was named here as
+missing -- "OpenMontage's cost_tracker is per-project, not per-month" -- and
+`20260908140000_spend_caps.sql` closes it: a USD ceiling per provider and per
+model, on a daily *and* a monthly window, with a ledger recording what every
+render actually cost behind it. Enforced twice, at Gate 1 and again at the
+render step, from one verdict function so the two cannot disagree.
 
 ---
 

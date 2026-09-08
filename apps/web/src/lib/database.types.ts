@@ -116,6 +116,134 @@ export type StylePresetRow = {
   created_at: string;
 };
 
+// ---------------------------------------------------------------------------
+// Spend
+// ---------------------------------------------------------------------------
+//
+// Nothing capped spend before `20260908140000_spend_caps.sql`. Cost existed
+// only as the estimate range on a preset, shown to a human at Gate 1, with no
+// row anywhere recording what a render actually cost.
+//
+// Three tables and two views carry it, and the split matters when reading
+// these: `spend_rates` is what a provider charges, `spend_caps` is what we
+// allow, and `render_spend` is what happened. Only the third is a fact.
+
+/** Which billing provider is behind a render. Derived in SQL from `render_mode`. */
+export type SpendProvider = 'heygen' | 'fal' | 'mpt';
+
+/** What a rate is per. */
+export type SpendUnit = 'second' | 'character' | 'clip' | 'render';
+
+/** What was billed. A fal end-to-end reel bills twice, so a production is not one charge. */
+export type SpendKind = 'render' | 'tts' | 'transcribe' | 'source';
+
+/**
+ * A ceiling in dollars, for a provider or for one model on it.
+ *
+ * A row rather than a column on a settings singleton, which is what makes a
+ * new model's ceiling an INSERT an owner can make from Settings rather than a
+ * migration.
+ */
+export type SpendCapRow = {
+  provider: string;
+  /** Empty means the provider as a whole, counting every model on it. */
+  model: string;
+  /** Null is "no ceiling on this window". Zero is a real value meaning "spend nothing". */
+  daily_limit_usd: number | null;
+  monthly_limit_usd: number | null;
+  /** False keeps the numbers on record while letting spend through. Preferred over deleting. */
+  is_active: boolean;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+  updated_by: string | null;
+};
+
+/** What a provider charges, per model. Owner-editable, because a published price changes. */
+export type SpendRateRow = {
+  provider: string;
+  model: string;
+  unit: SpendUnit;
+  rate_usd: number;
+  note: string | null;
+  updated_at: string;
+  updated_by: string | null;
+};
+
+/**
+ * One billed thing. The only record of what a render actually cost.
+ *
+ * Read-only from here: there is no insert policy, so a signed-in session
+ * structurally cannot invent or erase a charge. The worker writes it with the
+ * service-role key, exactly as it writes `production_events`.
+ */
+export type RenderSpendRow = {
+  id: string;
+  production_id: string;
+  provider: string;
+  model: string;
+  kind: SpendKind;
+  amount_usd: number;
+  /** `reported` is the provider's own figure and always wins; `derived` is ours. */
+  source: 'reported' | 'derived';
+  /** The provider's own id for this charge. Empty except on fal, whose
+   *  `request_id` is what tells two billed generations on one production
+   *  apart — it is the only backend that deduplicates a resubmit not at all. */
+  external_ref: string;
+  detail: Json;
+  spent_at: string;
+  created_at: string;
+};
+
+/** A cap with what has been spent against it, and whether it is reached. */
+export type SpendCapStatusRow = {
+  provider: string;
+  model: string;
+  daily_limit_usd: number | null;
+  monthly_limit_usd: number | null;
+  is_active: boolean;
+  note: string | null;
+  day_spent_usd: number;
+  month_spent_usd: number;
+  daily_reached: boolean;
+  monthly_reached: boolean;
+  daily_resets_at: string;
+  monthly_resets_at: string;
+  updated_at: string;
+  updated_by: string | null;
+};
+
+/**
+ * Each style with the cap governing it and what its renders have really cost.
+ *
+ * `block_reason` is the whole of Gate 1's spend check: a sentence when the
+ * style cannot be paid for, null when it can. It is composed by
+ * `spend_block_reason()` in Postgres, which is the same function the render
+ * step calls -- so the button being disabled here and the worker refusing to
+ * submit cannot disagree.
+ *
+ * `measured_avg_usd` is what replaces the estimate range once real renders
+ * exist. Until then `render_count` is zero and the preset's own figures are all
+ * there is: the presenter lane's $1-2 is, in its own migration's words, "an
+ * estimate and not yet a measurement".
+ *
+ * These count only productions that produced a file. A cap counts *committed*
+ * spend, which deliberately includes a render that was submitted and then
+ * failed; "what does a reel in this style cost?" is a different question, and
+ * a generation that delivered nothing is not an answer to it.
+ */
+export type StylePresetSpendRow = {
+  style_preset_id: string;
+  slug: string;
+  provider: string;
+  model: string;
+  block_reason: string | null;
+  render_count: number;
+  measured_avg_usd: number | null;
+  measured_min_usd: number | null;
+  measured_max_usd: number | null;
+};
+
 /**
  * Everything the trend scout is told to do.
  *
@@ -426,8 +554,9 @@ export type ProductionRow = {
   qc: Json;
   platform_copy: Json;
   cost_estimate_usd: number | null;
-  /** Never written by the pipeline today. Rendered in the review UI, so it is
-   *  reliably null — real spend is not tracked anywhere yet. */
+  /** The sum of this production's `render_spend` rows, maintained by trigger
+   *  rather than written by anyone — so the total and the charges behind it
+   *  cannot disagree. Null until something is billed. */
   cost_actual_usd: number | null;
   error: string | null;
   decided_by: string | null;
@@ -519,6 +648,47 @@ export interface Database {
         Row: StylePresetRow;
         Insert: Omit<StylePresetRow, 'id' | 'created_at'> & { id?: string; created_at?: string };
         Update: Writable<StylePresetRow>;
+        Relationships: [];
+      };
+      // Spend. Caps and rates are owner-editable rows -- INSERT and DELETE
+      // included, because "a ceiling per model without a migration" is the
+      // point of them being rows. The ledger is read-only from the browser.
+      spend_caps: {
+        Row: SpendCapRow;
+        Insert: Omit<SpendCapRow, 'created_at' | 'updated_at' | 'model'> & {
+          model?: string;
+          created_at?: string;
+          updated_at?: string;
+        };
+        Update: Partial<Omit<SpendCapRow, 'provider' | 'model' | 'created_at' | 'updated_at'>>;
+        Relationships: [];
+      };
+      spend_rates: {
+        Row: SpendRateRow;
+        Insert: Omit<SpendRateRow, 'updated_at' | 'model'> & { model?: string; updated_at?: string };
+        Update: Partial<Omit<SpendRateRow, 'provider' | 'model' | 'updated_at'>>;
+        Relationships: [];
+      };
+      render_spend: {
+        Row: RenderSpendRow;
+        // Written by the service-role worker. There is no insert policy, so
+        // the browser structurally cannot record or erase a charge.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      // Views. Read-only by construction, and `security_invoker` so the row
+      // policies on the tables underneath still apply.
+      spend_cap_status: {
+        Row: SpendCapStatusRow;
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      style_preset_spend: {
+        Row: StylePresetSpendRow;
+        Insert: never;
+        Update: never;
         Relationships: [];
       };
       trend_settings: {

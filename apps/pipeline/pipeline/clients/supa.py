@@ -232,6 +232,138 @@ class Supa:
         except Exception as exc:  # noqa: BLE001 - never take a production down
             log.warning("could not record %s/%s event on %s: %s", step, outcome, production_id, exc)
 
+    # -- spend -------------------------------------------------------------
+    #
+    # The ledger and the ceilings. Note what is *not* here: any arithmetic
+    # deciding whether a cap has been reached. That verdict is
+    # `spend_block_reason()` in Postgres, called below, because Gate 1 in the
+    # browser calls the same function -- and the one failure this feature
+    # cannot have is the app and the worker disagreeing about whether a render
+    # can be paid for.
+    #
+    # These four are also the exception to "swallow nothing": a failure to read
+    # a cap must propagate, unlike `record_event`, which swallows. A missing
+    # step log is a gap in an explanation; a cap read that silently returned
+    # "nothing to worry about" would be a ceiling that quietly stopped
+    # existing.
+
+    def style_preset_spend(self, preset_id: str) -> dict[str, Any]:
+        """Which provider and model a style spends on, and whether it may.
+
+        Read back rather than computed here. `spend_provider()` and
+        `spend_model()` in SQL own the mapping from a preset to a billing key,
+        and a second copy of it in Python is a copy that can disagree -- which
+        would cap the wrong thing without anything looking wrong.
+        """
+        res = (
+            self._c.table("style_preset_spend")
+            .select("*")
+            .eq("style_preset_id", preset_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            raise SupaError(f"no spend key for style preset {preset_id}")
+        return rows[0]
+
+    def spend_block_reason(self, provider: str, model: str = "") -> str | None:
+        """Null when a render may be paid for, otherwise the sentence saying why not."""
+        res = self._c.rpc(
+            "spend_block_reason", {"p_provider": provider, "p_model": model or ""}
+        ).execute()
+        reason = res.data
+        return str(reason) if reason else None
+
+    def spend_rate(self, provider: str, model: str = "") -> dict[str, Any] | None:
+        """The rate for a model, falling back to the provider's own row.
+
+        One round trip for both, and the more specific row wins. The fallback
+        is what lets a provider be priced once -- HeyGen's rate does not vary
+        per preset -- without a row per model that would only ever repeat it.
+        """
+        res = (
+            self._c.table("spend_rates")
+            .select("*")
+            .eq("provider", provider)
+            .in_("model", list({model or "", ""}))
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return None
+        rows.sort(key=lambda row: (row.get("model") or "") == "")
+        return rows[0]
+
+    def record_spend(
+        self,
+        production_id: str,
+        *,
+        provider: str,
+        model: str,
+        kind: str,
+        amount_usd: float,
+        source: str,
+        external_ref: str = "",
+        detail: dict[str, Any] | None = None,
+        replace: bool = False,
+    ) -> None:
+        """Write one charge to the ledger.
+
+        Idempotent on (production, provider, model, kind, external_ref), which
+        is what makes a retried step safe: the driver retries every step, and a
+        ledger that double-counted a retry would close a cap that had not been
+        reached. `external_ref` is empty on every lane whose provider
+        deduplicates a resubmit, and carries fal's `request_id` on the one lane
+        where a production can owe for two generations -- see
+        `spend.PROVIDER_DEDUPES_A_RESUBMIT`.
+
+        `replace` is the difference between the two moments a charge is
+        written. At submit the figure is an estimate and must not overwrite
+        anything, so a duplicate is ignored. At completion the render is
+        finished and the figure is the final word -- the provider's own number
+        where there is one, otherwise the same arithmetic against a real
+        duration instead of a guessed one -- so it replaces. The ordering is
+        what makes that safe: completion always follows submit, and the graph
+        does not route back into a poll once it has reported `complete`.
+        """
+        row = {
+            "production_id": production_id,
+            "provider": provider,
+            "model": model or "",
+            "kind": kind,
+            "amount_usd": round(float(amount_usd), 4),
+            "source": source,
+            "external_ref": external_ref or "",
+            "detail": _jsonable(detail or {}),
+        }
+        self._c.table("render_spend").upsert(
+            row,
+            on_conflict="production_id,provider,model,kind,external_ref",
+            ignore_duplicates=not replace,
+        ).execute()
+
+    def render_charges(
+        self, production_id: str, provider: str, model: str, kind: str
+    ) -> list[dict[str, Any]]:
+        """The charges already on the ledger for one production and one thing.
+
+        Read by the fal lane and nowhere else. fal deduplicates nothing, so the
+        pipeline has to be able to ask "have I already recorded this
+        generation?" -- and the answer is what separates a resubmit that fal
+        billed again from a step the driver simply re-entered.
+        """
+        res = (
+            self._c.table("render_spend")
+            .select("*")
+            .eq("production_id", production_id)
+            .eq("provider", provider)
+            .eq("model", model or "")
+            .eq("kind", kind)
+            .execute()
+        )
+        return res.data or []
+
     # -- audit -------------------------------------------------------------
     #
     # `record_system_decision` used to live here, and `park()` was its only

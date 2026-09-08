@@ -9,6 +9,8 @@ import { Separator } from '@/components/ui/separator';
 import { useAuth } from '@/features/auth/auth-context';
 import { useOwner } from '@/features/auth/use-owner';
 import { PageHeader } from '@/features/queue/components/page-header';
+import { SpendCapsCard } from '@/features/spend/components/spend-caps-card';
+import { SpendRatesCard } from '@/features/spend/components/spend-rates-card';
 import { TrendFiltersCard } from '@/features/trends/components/trend-filters-card';
 import { TrendInputsCard } from '@/features/trends/components/trend-inputs-card';
 import { TrendRunCostCard } from '@/features/trends/components/trend-run-cost-card';
@@ -62,6 +64,16 @@ function SettingsPage() {
           </AlertDescription>
         </Alert>
       )}
+
+      {/* Before the trend cards on purpose. Those decide what reaches the
+          queue; this decides what the queue is allowed to cost, which is the
+          question an owner arriving at this page after a surprising bill came
+          here to answer. */}
+      <SpendCapsCard />
+      {/* After the caps, because a rate is what makes a cap countable rather
+          than a policy of its own -- and because a parked production telling
+          an owner to add a rate sends them here. */}
+      <SpendRatesCard />
 
       <TrendSettingsCard />
       <TrendInputsCard />
