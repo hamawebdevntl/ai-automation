@@ -388,6 +388,13 @@ export type IdeaRow = {
   relevance: number | null;
   /** One sentence on how the idea connects to that description. Null unless the run had a prompt. */
   connection: string | null;
+  /** The avatar and voice chosen for this one production at Gate 1, overriding
+   *  the preset. Null uses the preset's pair.
+   *
+   *  It rides on the idea rather than on the production because at the moment
+   *  the owner picks, the production does not exist — `start_approved_productions`
+   *  opens it seconds later. Where it is *recorded* is `productions.presenter`. */
+  presenter_override: PresenterChoice | null;
 };
 
 export type ProductionRow = {
@@ -406,6 +413,12 @@ export type ProductionRow = {
   lease_expires_at: string | null;
   /** The render_mode in force when this ran, kept even if the preset later changes. */
   render_backend: RenderMode | null;
+  /** Who presented this reel, on the presenter lane. Recorded for the same
+   *  reason `render_backend` is: the preset is editable and the override is
+   *  deleted with its idea, so nothing about it is reconstructable afterwards.
+   *  Null on every other lane, and on presenter reels that ran before this
+   *  was recorded. */
+  presenter: PresenterRecord | null;
   /** The narration, and the source of truth for it. Drafted by `write_script`,
    *  edited and approved by an owner, then handed to whichever backend renders:
    *  `video_script` for MoneyPrinterTurbo, the script body for HeyGen, the TTS
@@ -504,6 +517,109 @@ export type ApprovalRow = {
 export const REWIND_STEPS = ['fetch_and_qc', 'generate_copy', 'open_gate2'] as const;
 export type RewindStep = (typeof REWIND_STEPS)[number];
 
+// ---------------------------------------------------------------------------
+// The HeyGen catalogue
+// ---------------------------------------------------------------------------
+//
+// This app is a static bundle holding no secrets, which is what makes shipping
+// it safe and what makes it unable to ask HeyGen anything. So the worker asks
+// on its behalf and writes the answers here; the picker reads these three
+// tables and never sees an API key.
+
+/** How a look is framed. `unknown` is honest rather than a guess — the warning
+ *  it suppresses matters most on exactly the looks we know least about. */
+export type LookOrientation = 'portrait' | 'landscape' | 'square' | 'unknown';
+
+export type HeyGenLookRow = {
+  avatar_id: string;
+  name: string | null;
+  preview_image_url: string | null;
+  preview_video_url: string | null;
+  orientation: LookOrientation;
+  /** The engines this look advertises, lower-cased. Empty means the response
+   *  said nothing, which is treated as "no opinion" rather than "supports
+   *  none": a field HeyGen renames must cost a check, not the whole picker. */
+  engines: string[];
+  default_voice_id: string | null;
+  gender: string | null;
+  ownership: string;
+  seen_at: string;
+};
+
+/**
+ * Where a voice id has got to.
+ *
+ * Voices are resolved one at a time rather than listed: `GET /v3/voices` is
+ * 3,089 entries over 62 pages on this account and does not contain the cloned
+ * voice the preset names, while `GET /v3/voices/{id}` answers directly.
+ */
+export type VoiceStatus = 'pending' | 'ok' | 'unknown';
+
+export type HeyGenVoiceRow = {
+  voice_id: string;
+  status: VoiceStatus;
+  name: string | null;
+  language: string | null;
+  gender: string | null;
+  preview_audio_url: string | null;
+  error: string | null;
+  requested_at: string;
+  resolved_at: string | null;
+};
+
+export type CatalogueStatus = 'idle' | 'requested' | 'running' | 'failed';
+
+/** The single row that asks the worker to refill the caches and records how
+ *  the refill went. Same shape of thing as `trend_runs`, and for the same
+ *  reason: the app cannot reach an external API itself. */
+export type HeyGenCatalogueRow = {
+  id: boolean;
+  status: CatalogueStatus;
+  requested_at: string | null;
+  requested_by: string | null;
+  started_at: string | null;
+  refreshed_at: string | null;
+  looks: number | null;
+  voices: number | null;
+  error: string | null;
+};
+
+/** True while the worker owes an answer, which is what the Refresh button
+ *  disables itself on. */
+export function isCatalogueRefreshing(row: HeyGenCatalogueRow | null): boolean {
+  return row?.status === 'requested' || row?.status === 'running';
+}
+
+/**
+ * A validated avatar/voice pair, as `presenter_choice` in Postgres returns it.
+ *
+ * Names are carried alongside the ids so a stored override reads as words
+ * rather than as two hex strings — the look it came from may since have been
+ * deleted from the account.
+ */
+export interface PresenterChoice {
+  avatar_id: string;
+  avatar_name?: string | null;
+  orientation?: LookOrientation;
+  voice_id: string;
+  voice_name?: string | null;
+  /** Absent means Avatar IV, which is what omitting it at submit time selects. */
+  engine?: string;
+}
+
+/** What actually rendered, written to the production by the render step. */
+export interface PresenterRecord {
+  avatar_id: string | null;
+  voice_id: string | null;
+  avatar_name?: string;
+  voice_name?: string;
+  engine?: string;
+  /** Not derivable afterwards: the override is deleted with its idea and the
+   *  preset can be edited, so without this a reel made by an override and one
+   *  made by a preset that has since changed are indistinguishable. */
+  source: 'preset' | 'override';
+}
+
 type Writable<T> = Partial<T>;
 
 export interface Database {
@@ -600,6 +716,27 @@ export interface Database {
         Update: Writable<ApprovalRow>;
         Relationships: [];
       };
+      // All three are filled by the worker with a service-role key and read
+      // from here. None has an INSERT, UPDATE or DELETE policy, so the browser
+      // structurally cannot write one — every change goes through a function.
+      heygen_looks: {
+        Row: HeyGenLookRow;
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      heygen_voices: {
+        Row: HeyGenVoiceRow;
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      heygen_catalogue: {
+        Row: HeyGenCatalogueRow;
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
     };
     Views: Record<never, never>;
     Functions: {
@@ -624,8 +761,36 @@ export interface Database {
         Returns: TrendRunRow;
       };
       approve_idea: {
-        Args: { p_idea_id: string; p_style_id: string; p_note?: string | null };
+        // `p_presenter` is the Gate 1 override, and only the presenter lane
+        // accepts one. Null keeps the preset's pair. It is validated against
+        // the cached catalogue inside the function, because an avatar this
+        // account cannot use fails terminally — after the gate, having already
+        // spent the review.
+        Args: {
+          p_idea_id: string;
+          p_style_id: string;
+          p_note?: string | null;
+          p_presenter?: PresenterChoice | null;
+        };
         Returns: IdeaRow;
+      };
+      // The preset default. A function rather than the owner's existing UPDATE
+      // on style_presets: `params` is one jsonb column holding the whole lane
+      // configuration, and a browser sending a replacement object built from a
+      // stale read would silently drop aspect_ratio, resolution and captions.
+      set_preset_presenter: {
+        Args: { p_preset_id: string; p_avatar_id: string; p_voice_id: string; p_engine?: string | null };
+        Returns: StylePresetRow;
+      };
+      // Both of these record an intention and return; the worker's sweep acts
+      // on it within a minute, exactly as `request_trend_run` works.
+      request_heygen_catalogue_refresh: {
+        Args: Record<never, never>;
+        Returns: HeyGenCatalogueRow;
+      };
+      request_heygen_voice: {
+        Args: { p_voice_id: string };
+        Returns: HeyGenVoiceRow;
       };
       reject_idea: {
         Args: { p_idea_id: string; p_note?: string | null };

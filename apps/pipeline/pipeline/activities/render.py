@@ -264,7 +264,7 @@ def _submit_heygen(
     """
     heygen = heygen or HeyGenClient()
 
-    cfg = (preset.get("params") or {}).get("heygen") or {}
+    cfg = _presenter_config(idea, preset)
     avatar_id = cfg.get("avatar_id")
     if not avatar_id:
         raise ValueError(
@@ -308,7 +308,16 @@ def _submit_heygen(
         supa.update_production(production_id, task_id=None, status=ProductionStatus.QUEUED.value)
         raise
 
-    supa.update_production(production_id, stage="presenter rendering")
+    # Recorded the way `render_backend` is, and for the same reason: the preset
+    # is editable and the override lives on the idea, so a finished reel that
+    # did not say who presented it could only be explained by reconstructing
+    # rows that may since have changed. Written after the submit, so it names
+    # the pair HeyGen actually accepted.
+    supa.update_production(
+        production_id,
+        stage="presenter rendering",
+        presenter=_presenter_record(idea, cfg),
+    )
     return {
         "production_id": production_id,
         "backend": HEYGEN,
@@ -319,6 +328,73 @@ def _submit_heygen(
         "started_at": time.time(),
         "polls": 0,
     }
+
+
+# The keys a Gate 1 override may replace. Everything else in `params.heygen` --
+# aspect_ratio, resolution, burn_captions, paragraphs -- stays the preset's,
+# because the override is a choice about who speaks and not about how the reel
+# is cut. `presenter_choice` in Postgres writes exactly these, so a value
+# arriving here has already been checked against the account's own catalogue.
+PRESENTER_KEYS = ("avatar_id", "voice_id", "engine")
+
+
+def _presenter_config(idea: dict[str, Any], preset: dict[str, Any]) -> dict[str, Any]:
+    """The preset's HeyGen configuration, with this production's override on top.
+
+    The override rides on the idea because Gate 1 is passed before the
+    production exists -- `start_approved_productions` opens it seconds later.
+
+    A partial override is honoured as a partial one: a row naming an avatar and
+    no voice keeps the preset's narrator rather than falling back to HeyGen's
+    default for that avatar, which would make the narrator a property of
+    HeyGen's catalogue exactly as sending no `voice_id` does.
+
+    The exception is `engine`, which belongs to the avatar rather than standing
+    beside it. An override that names a look advertising Avatar IV carries no
+    engine at all -- omitting the key is what selects it -- and merging that
+    against a preset naming `avatar_iii` would submit a pair no validation ever
+    saw, failing terminally on an engine the new look never claimed. So an
+    override naming an avatar replaces the engine outright, present or absent.
+    """
+    cfg = dict((preset.get("params") or {}).get("heygen") or {})
+    override = idea.get("presenter_override") or {}
+    if not isinstance(override, dict):
+        return cfg
+    if override.get("avatar_id"):
+        cfg["avatar_id"] = override["avatar_id"]
+        engine = override.get("engine")
+        if engine:
+            cfg["engine"] = engine
+        else:
+            cfg.pop("engine", None)
+    if override.get("voice_id"):
+        cfg["voice_id"] = override["voice_id"]
+    return cfg
+
+
+def _presenter_record(idea: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    """What to store on the production: the pair that rendered, and where it
+    came from.
+
+    `source` is not derivable afterwards. The override is deleted with its idea
+    and the preset can be edited, so without it a reel rendered by an override
+    and one rendered by a preset that has since changed are indistinguishable.
+    """
+    override = idea.get("presenter_override") or {}
+    override = override if isinstance(override, dict) else {}
+    record: dict[str, Any] = {
+        "avatar_id": cfg.get("avatar_id"),
+        "voice_id": cfg.get("voice_id"),
+        "source": "override" if any(override.get(k) for k in PRESENTER_KEYS) else "preset",
+    }
+    if cfg.get("engine"):
+        record["engine"] = cfg["engine"]
+    # Carried through from the override so the record reads as names rather
+    # than as two hex strings. The preset holds no names to carry.
+    for key in ("avatar_name", "voice_name"):
+        if override.get(key):
+            record[key] = override[key]
+    return record
 
 
 def _build_params(

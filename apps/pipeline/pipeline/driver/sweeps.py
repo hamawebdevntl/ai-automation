@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from pipeline.activities import analytics, gates
+from pipeline.activities import analytics, gates, presenter
 from pipeline.activities import reconcile as recon
 from pipeline.clients.supa import Supa
 from pipeline.config import settings
@@ -38,6 +38,11 @@ DAY = 24 * HOUR
 
 def _publishing() -> bool:
     return settings().publishing_enabled
+
+
+def _presenter() -> bool:
+    """Whether this deployment renders with HeyGen at all."""
+    return bool(settings().heygen_api_key)
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,13 @@ SWEEPS: tuple[Sweep, ...] = (
     Sweep("reconcile_publishes", recon.reconcile_publishes, 5 * MINUTE, _publishing),
     Sweep("flush_publishing_backlog", gates.flush_publishing_backlog, 5 * MINUTE, _publishing),
     Sweep("collect_analytics", analytics.collect_analytics, 12 * HOUR, _publishing),
+    # Every minute, and almost always a no-op: the sweep reads one row and
+    # stops unless something asked for a refresh or the cache has gone stale.
+    # The period is set by the button in Settings rather than by the six-hourly
+    # refill -- an owner who has just created an avatar in HeyGen wants it in
+    # the picker now, and a sweep on the refill's own period would make that
+    # button a lie.
+    Sweep("refresh_presenter_catalogue", presenter.refresh_catalogue, MINUTE, _presenter),
     Sweep("reap_mpt_tasks", recon.reap_mpt_tasks, DAY),
     Sweep("expire_ideas", recon.expire_ideas, DAY),
 )

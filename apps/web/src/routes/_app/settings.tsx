@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Separator } from '@/components/ui/separator';
 import { useAuth } from '@/features/auth/auth-context';
 import { useOwner } from '@/features/auth/use-owner';
+import { PresenterSettingsCard } from '@/features/presenter/components/presenter-settings-card';
 import { PageHeader } from '@/features/queue/components/page-header';
 import { TrendFiltersCard } from '@/features/trends/components/trend-filters-card';
 import { TrendInputsCard } from '@/features/trends/components/trend-inputs-card';
@@ -63,6 +64,7 @@ function SettingsPage() {
         </Alert>
       )}
 
+      <PresenterSettingsCard />
       <TrendSettingsCard />
       <TrendInputsCard />
       <TrendScheduleCard />

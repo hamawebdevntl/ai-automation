@@ -22,6 +22,7 @@ export function makeProduction(overrides: Partial<ProductionRow> = {}): Producti
     leased_by: null,
     lease_expires_at: null,
     render_backend: null,
+    presenter: null,
     script: null,
     script_approved_at: null,
     script_approved_by: null,
@@ -72,6 +73,7 @@ export function makeIdea(overrides: Partial<IdeaRow> = {}): IdeaRow {
     trend_run_id: null,
     relevance: null,
     connection: null,
+    presenter_override: null,
     ...overrides,
   };
 }

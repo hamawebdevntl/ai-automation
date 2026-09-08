@@ -785,3 +785,134 @@ class Supa:
         )
         rows = res.data or []
         return rows[0] if rows else None
+
+    # -- the HeyGen catalogue ------------------------------------------------
+    #
+    # The app cannot call HeyGen -- it is a static bundle holding no secrets --
+    # so the picker in Settings reads two tables the worker fills. See
+    # `activities/presenter.py` for what fills them and the 20260908150000
+    # migration for why they exist at all.
+
+    def heygen_catalogue(self) -> dict[str, Any] | None:
+        """The singleton sync row, or None when the migration has not run here.
+
+        None rather than an exception because this is read on every sweep tick
+        by a deployment that may be a migration behind, and a missing table is
+        not a reason to fill the log with tracebacks.
+        """
+        try:
+            res = self._c.table("heygen_catalogue").select("*").limit(1).execute()
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            log.debug("heygen_catalogue is unreadable: %s", exc)
+            return None
+        rows = res.data or []
+        return rows[0] if rows else None
+
+    def claim_heygen_catalogue(self, stale_after_seconds: int = 900) -> bool:
+        """Take the refresh, or report that someone else has it.
+
+        The filter is the claim, exactly as `claim_trend_run`'s `eq` is: two
+        workers sweeping at the same second both issue this update and only one
+        matches a row. Reading and then writing would let both through, and
+        both would then walk the whole voice list against a rate-limited API.
+
+        A `running` row older than `stale_after_seconds` is claimable again.
+        Without that, a worker killed mid-refresh would leave the row saying
+        `running` for ever, and the settings page would show a refresh that
+        never ends and a button that never works again. There is no lease to
+        expire here as there is on a production, so the timestamp is the lease.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+        ).isoformat()
+        res = (
+            self._c.table("heygen_catalogue")
+            .update({"status": "running", "started_at": _now_iso(), "error": None})
+            .or_(f"status.neq.running,started_at.lt.{cutoff}")
+            .execute()
+        )
+        return bool(res.data)
+
+    def finish_heygen_catalogue(self, *, read: bool, **fields: Any) -> None:
+        """Record how the refresh went. Never raises.
+
+        Called from the failure path as well as the success one, where the
+        interesting error is the one being handled: losing it to a secondary
+        failure writing this row would leave the settings page saying
+        "refreshing" for ever with no explanation anywhere.
+
+        `read` is whether the account was actually read. Only then is
+        `refreshed_at` stamped -- it is what the settings page shows as "read
+        from HeyGen <when>", and a refresh that got a 401 read nothing. It is
+        also what the six-hourly refill is measured against, so stamping it on
+        a failure would silence the retry as well as lie about it.
+        """
+        patch = dict(fields)
+        if read:
+            patch["refreshed_at"] = _now_iso()
+        try:
+            (
+                self._c.table("heygen_catalogue")
+                .update(patch)
+                .eq("status", "running")
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            log.warning("could not record the end of a HeyGen catalogue refresh: %s", exc)
+
+    def replace_heygen_looks(self, rows: list[dict[str, Any]], *, complete: bool) -> None:
+        """Write what the account owns, and forget what it no longer does.
+
+        The delete is the reason this is one method rather than an upsert at
+        the call site: a look removed in HeyGen's own UI must stop being
+        offered, and an id that survives only because nothing deleted it is
+        one an owner can pick and have park a production with
+        `avatar_not_found`.
+
+        `complete` is whether the response was the whole account. It is not
+        always: `GET /v3/avatars/looks` caps `limit` at 50, so an account with
+        more looks than that hands back a page rather than a list, and deleting
+        everything outside it would throw away the rest -- including, on a bad
+        day, the avatar the preset itself names. A partial answer therefore
+        adds and updates without removing anything. A stale row an owner can be
+        warned about beats a working avatar that vanished from the picker.
+
+        An empty response deletes nothing either. `looks()` returns `[]` both
+        for an account with no avatars and for a response shape we failed to
+        parse, and emptying the picker on the second is worse than a stale row
+        on the first.
+        """
+        if not rows:
+            return
+        self._c.table("heygen_looks").upsert(rows, on_conflict="avatar_id").execute()
+        if not complete:
+            return
+        keep = [row["avatar_id"] for row in rows]
+        self._c.table("heygen_looks").delete().not_.in_("avatar_id", keep).execute()
+
+    def known_heygen_voices(self) -> list[str]:
+        """Every voice id anyone has asked about, oldest request first."""
+        res = (
+            self._c.table("heygen_voices")
+            .select("voice_id")
+            .order("requested_at", desc=False)
+            .execute()
+        )
+        return [row["voice_id"] for row in (res.data or []) if row.get("voice_id")]
+
+    def pending_heygen_voices(self) -> int:
+        """How many ids are waiting for their first answer."""
+        try:
+            res = (
+                self._c.table("heygen_voices")
+                .select("voice_id", count="exact")
+                .eq("status", "pending")
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - same reason as heygen_catalogue
+            log.debug("heygen_voices is unreadable: %s", exc)
+            return 0
+        return res.count or 0
+
+    def upsert_heygen_voice(self, row: dict[str, Any]) -> None:
+        self._c.table("heygen_voices").upsert(row, on_conflict="voice_id").execute()

@@ -13,6 +13,11 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Spinner } from '@/components/ui/spinner';
 import { Textarea } from '@/components/ui/textarea';
 import { useOwner } from '@/features/auth/use-owner';
+import {
+  NO_OVERRIDE,
+  PresenterOverride,
+  type PresenterOverrideState,
+} from '@/features/presenter/components/presenter-override';
 import { ideaQueryOptions, stylePresetsQueryOptions, useApproveIdea, useRejectIdea } from '@/features/queue/api';
 import { IdeaProductionPanel } from '@/features/queue/components/idea-production-panel';
 import { QueryError } from '@/features/queue/components/query-state';
@@ -49,6 +54,9 @@ function IdeaDecisionPage() {
 
   const [styleId, setStyleId] = useState<string | null>(null);
   const [note, setNote] = useState('');
+  // Only the presenter lane can carry one; every other style leaves this at
+  // its default and sends null.
+  const [presenter, setPresenter] = useState<PresenterOverrideState>(NO_OVERRIDE);
 
   const approve = useApproveIdea();
   const reject = useRejectIdea();
@@ -74,9 +82,13 @@ function IdeaDecisionPage() {
   const handleApprove = async () => {
     if (!styleId) return;
     try {
-      await approve.mutateAsync({ ideaId, styleId, note });
+      await approve.mutateAsync({ ideaId, styleId, note, presenter: presenter.choice });
       toast.success('Approved', {
-        description: `Queued as ${selectedPreset?.name ?? 'the chosen style'}. Production starts in a few seconds.`,
+        description: presenter.choice
+          ? `Queued as ${selectedPreset?.name ?? 'the chosen style'}, fronted by ${
+              presenter.choice.avatar_name ?? presenter.choice.avatar_id
+            }. Production starts in a few seconds.`
+          : `Queued as ${selectedPreset?.name ?? 'the chosen style'}. Production starts in a few seconds.`,
       });
       // Deliberately no navigation. This page becomes the live view of the
       // production the approval just opened; bouncing back to the list of
@@ -180,7 +192,30 @@ function IdeaDecisionPage() {
             {presetsQuery.error && <QueryError error={presetsQuery.error} />}
             {presetsQuery.isPending && <Skeleton className="h-40 w-full" />}
             {presets.length > 0 && (
-              <StylePicker presets={presets} value={styleId} onChange={setStyleId} disabled={!isOwner || isDeciding} />
+              <StylePicker
+                presets={presets}
+                value={styleId}
+                // The override belongs to the lane it was made on. Switching
+                // style unmounts the picker, and without this its last answer
+                // would survive into a style that has no presenter at all.
+                onChange={(id) => {
+                  setStyleId(id);
+                  setPresenter(NO_OVERRIDE);
+                }}
+                disabled={!isOwner || isDeciding}
+              />
+            )}
+
+            {/* Only on the lane that has a presenter to swap. Keyed on the
+                preset so switching styles starts a fresh decision rather than
+                carrying one made about a different lane. */}
+            {selectedPreset?.render_mode === 'heygen' && (
+              <PresenterOverride
+                key={selectedPreset.id}
+                preset={selectedPreset}
+                onChange={setPresenter}
+                disabled={!isOwner || isDeciding}
+              />
             )}
 
             <Separator />
@@ -206,6 +241,11 @@ function IdeaDecisionPage() {
               </Alert>
             )}
 
+            {/* A half-made override must not approve quietly as the preset:
+                the owner asked for a different presenter and would only find
+                out at Gate 2 that they did not get one. */}
+            {presenter.blocked && <p className="text-sm text-destructive">{presenter.blocked}</p>}
+
             {selectedPreset && (
               <p className="text-sm text-muted-foreground">
                 Approving queues this as <strong className="text-foreground">{selectedPreset.name}</strong> —{' '}
@@ -216,7 +256,7 @@ function IdeaDecisionPage() {
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
               <Button
                 onClick={handleApprove}
-                disabled={!isOwner || !styleId || isDeciding}
+                disabled={!isOwner || !styleId || isDeciding || Boolean(presenter.blocked)}
                 className="w-full sm:w-auto"
               >
                 {approve.isPending ? <Spinner className="size-4" /> : <CheckIcon className="size-4" />}
