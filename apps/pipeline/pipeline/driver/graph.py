@@ -168,6 +168,15 @@ def _publish_outcome(state: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 START = "write_script"
+"""Where a *generated* production begins.
+
+An uploaded cut does not start here and never touches the four steps below it:
+`create_upload_production` opens the row with `run_state.step` already set to
+`check_upload`, so `engine.current_step` reads that rather than falling back to
+this default. There is no second START constant because there is no second
+graph -- the two entrances converge on `generate_copy` and share everything
+from there.
+"""
 
 GRAPH: dict[str, Step] = {
     "write_script": Step(
@@ -263,6 +272,24 @@ GRAPH: dict[str, Step] = {
         # second worker while the first was still working. Sizing the lease per
         # step is what removes the need for a heartbeat.
         lease_seconds=3600,
+    ),
+    "check_upload": Step(
+        name="check_upload",
+        run="upload.check_upload",
+        # `fetch_and_qc`'s budget, because it is the same work minus the
+        # provider: a hundreds-of-megabytes download, ffprobe and three ffmpeg
+        # passes. Sized per step for the same reason -- a lease that expired
+        # mid-check would hand the row to a second worker while the first was
+        # still working.
+        lease_seconds=3600,
+        retry=(Retry(ANY_ERROR, interval_seconds=20, max_attempts=3, backoff_rate=2),),
+        # Parking is cheap here and it is the honest answer: an upload whose
+        # file cannot be read is a file the owner has to look at, and nothing
+        # has been billed either way.
+        catch="parked",
+        # The convergence point. From here an uploaded cut and a rendered one
+        # are the same thing: copy, Gate 2, publish, analytics.
+        next="generate_copy",
     ),
     "generate_copy": Step(
         name="generate_copy",

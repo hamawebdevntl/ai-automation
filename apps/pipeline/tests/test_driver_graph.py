@@ -248,6 +248,11 @@ class TestFetchAndQcGetsRoomToRun:
         # mid-render and hand the row to a second worker.
         assert g.GRAPH["fetch_and_qc"].lease_seconds == 3600
 
-    def test_and_it_is_the_only_step_that_needs_it(self):
+    def test_and_only_the_steps_that_move_a_whole_video_get_it(self):
+        # `check_upload` is `fetch_and_qc` with the provider removed -- the same
+        # download, the same ffprobe and ffmpeg passes, the same uploads -- so it
+        # needs the same room. The assertion stays an exact set rather than a
+        # floor: a long lease is how a wedged worker keeps a production to
+        # itself, and every step that takes one should have had to say why here.
         long_leases = {n for n, s in g.GRAPH.items() if s.lease_seconds > 900}
-        assert long_leases == {"fetch_and_qc"}
+        assert long_leases == {"fetch_and_qc", "check_upload"}

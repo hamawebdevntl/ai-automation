@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import httpx
 from supabase import Client, create_client
 
 from pipeline.config import settings
@@ -293,6 +294,24 @@ class Supa:
             **fields,
         )
 
+    def extend_lease(self, production_id: str, seconds: int) -> None:
+        """Give the current holder longer.
+
+        `claim_production` takes one lease length for every row, because it
+        cannot know which step it is about to hand out until it has handed it
+        out. `graph.Step.lease_seconds` is the per-step answer, and this is what
+        makes it true rather than a comment: a step that legitimately runs for
+        an hour asks for the hour once it is holding the row.
+
+        Only ever lengthens in practice -- the caller checks before calling --
+        but it is written as a plain set, because a lease is "mine until", not a
+        counter.
+        """
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+        self._c.table("productions").update({"lease_expires_at": expires}).eq(
+            "id", production_id
+        ).execute()
+
     def release_lease(self, production_id: str) -> None:
         """Give the row back without advancing it.
 
@@ -367,21 +386,45 @@ class Supa:
         `reconcile_renders` cannot see these -- it only looks at rows that are
         already `running`. This is what catches a production opened while the
         driver was down.
+
+        Two shapes qualify, because the two entrances leave different evidence.
+        A generated production is inserted with no step at all, so "has no step"
+        is the whole test. An uploaded one is inserted *with* one --
+        `create_upload_production` puts it at `check_upload` rather than letting
+        it default into the render lane -- so for those the test is that it is
+        still sitting at that first step with nobody holding it. Without this
+        second case an upload that no worker ever claimed would never be parked
+        and never be visible as stuck.
         """
         res = (
             self._c.table("productions")
-            .select("id,status,run_state,created_at,updated_at,lease_expires_at")
+            .select("id,source,status,run_state,created_at,updated_at,lease_expires_at")
             .eq("status", ProductionStatus.QUEUED.value)
             # A paused row is deliberately not being picked up. Parking it for
             # "the driver never started it" would punish the owner for pausing.
             .is_("paused_at", "null")
             .execute()
         )
-        return [
-            row
-            for row in (res.data or [])
-            if not (row.get("run_state") or {}).get("step")
-        ]
+        return [row for row in (res.data or []) if self._is_unstarted(row)]
+
+    def _is_unstarted(self, row: dict[str, Any]) -> bool:
+        step = (row.get("run_state") or {}).get("step")
+        if not step:
+            return True
+        if row.get("source") != "upload" or step != "check_upload":
+            return False
+        # A worker holding the row is working, however long it takes: the
+        # quality check on a 500 MB upload is minutes of ffmpeg, and the step
+        # asks for an hour's lease before it starts.
+        expires = row.get("lease_expires_at")
+        if not expires:
+            return True
+        try:
+            return datetime.fromisoformat(str(expires).replace("Z", "+00:00")) < datetime.now(
+                timezone.utc
+            )
+        except ValueError:
+            return True
 
     def expired_runs(self, days: int) -> list[dict[str, Any]]:
         """Productions still going long after they opened.
@@ -466,6 +509,32 @@ class Supa:
                 file_options={"content-type": "video/mp4", "upsert": "true"},
             )
         return key
+
+    def download_render(self, key: str, dest: Path) -> Path:
+        """Pull an object back out of the renders bucket.
+
+        The counterpart to `upload_render`, and the entrance an uploaded cut
+        comes in through: the browser has already put the file in the bucket,
+        so `check_upload` has nothing to fetch from a provider and everything
+        to fetch from here.
+
+        Streamed through a signed URL rather than `storage.download()`, which
+        returns the whole object as bytes -- the bucket admits files up to
+        500 MB, and holding one of those in the worker's memory while ffmpeg
+        also wants it would be a poor trade for a shorter method.
+        """
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        url = self.signed_render_url(key, expires_in=3600)
+        with (
+            httpx.Client(timeout=None, follow_redirects=True) as client,
+            client.stream("GET", url) as resp,
+        ):
+            if resp.status_code >= 400:
+                raise SupaError(f"could not download {key}: HTTP {resp.status_code}")
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1 << 20):
+                    fh.write(chunk)
+        return dest
 
     def signed_render_url(self, key: str, expires_in: int = 3600) -> str:
         res = self._c.storage.from_(self._bucket).create_signed_url(key, expires_in)

@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router';
-import { ArrowLeftIcon, CheckIcon, XIcon } from 'lucide-react';
+import { ArrowLeftIcon, CheckIcon, UploadIcon, XIcon } from 'lucide-react';
 import { useState } from 'react';
 import { toast } from 'sonner';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -52,6 +52,7 @@ function ProductionReviewPage() {
   }
 
   const { production, idea, style } = data;
+  const isUpload = production.source === 'upload';
   const qc = parseQcReport(production.qc);
   const awaitingDecision = production.status === 'awaiting_review' || production.status === 'qc_failed';
   const rejectNeedsNote = note.trim().length === 0;
@@ -79,6 +80,12 @@ function ProductionReviewPage() {
 
       <div className="space-y-2">
         <div className="flex flex-wrap items-center gap-2">
+          {isUpload && (
+            <Badge variant="secondary" className="font-normal">
+              <UploadIcon className="size-3" />
+              Uploaded
+            </Badge>
+          )}
           {style && (
             <Badge variant="secondary" className="font-normal">
               {style.name}
@@ -88,10 +95,10 @@ function ProductionReviewPage() {
             {production.status.replace(/_/g, ' ')}
           </Badge>
           <span className="text-xs text-muted-foreground">
-            rendered {formatRelative(production.completed_at ?? production.created_at)}
+            {isUpload ? 'uploaded' : 'rendered'} {formatRelative(production.completed_at ?? production.created_at)}
           </span>
         </div>
-        <h1 className="text-2xl font-semibold tracking-tight">{idea?.title ?? 'Finished cut'}</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">{production.title ?? idea?.title ?? 'Finished cut'}</h1>
         {idea?.hook && <p className="text-muted-foreground">{idea.hook}</p>}
       </div>
 
@@ -139,18 +146,31 @@ function ProductionReviewPage() {
                 <p className="text-xs uppercase tracking-wide text-muted-foreground">Duration</p>
                 <p className="tabular-nums">{formatDuration(production.duration_seconds)}</p>
               </div>
-              <div>
-                <p className="text-xs uppercase tracking-wide text-muted-foreground">Estimated</p>
-                <p className="tabular-nums">{formatUsd(production.cost_estimate_usd)}</p>
-              </div>
-              <div>
-                <p className="text-xs uppercase tracking-wide text-muted-foreground">Actual</p>
-                <p className="tabular-nums">{formatUsd(production.cost_actual_usd)}</p>
-              </div>
-              <div>
-                <p className="text-xs uppercase tracking-wide text-muted-foreground">Task</p>
-                <p className="truncate font-mono text-xs">{production.task_id ?? '—'}</p>
-              </div>
+              {/* An uploaded cut cost this pipeline nothing and has no render
+                  task, so those cells would be three em dashes. What a reviewer
+                  does need in their place is the disclosure the uploader gave,
+                  because approving is what sends it to the platforms. */}
+              {isUpload ? (
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Declared as</p>
+                  <p>{production.is_aigc ? 'AI-generated' : 'Not AI-generated'}</p>
+                </div>
+              ) : (
+                <>
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-muted-foreground">Estimated</p>
+                    <p className="tabular-nums">{formatUsd(production.cost_estimate_usd)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-muted-foreground">Actual</p>
+                    <p className="tabular-nums">{formatUsd(production.cost_actual_usd)}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-muted-foreground">Task</p>
+                    <p className="truncate font-mono text-xs">{production.task_id ?? '—'}</p>
+                  </div>
+                </>
+              )}
             </CardContent>
           </Card>
         </div>
@@ -181,6 +201,21 @@ function ProductionReviewPage() {
               </Button>
             </CardContent>
           </Card>
+
+          {isUpload && production.brief && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">What it is about</CardTitle>
+                <CardDescription>
+                  What you said when you uploaded it. There is no script on an uploaded cut, so this is what the
+                  per-platform copy below was written from.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <p className="whitespace-pre-wrap text-sm leading-relaxed">{production.brief}</p>
+              </CardContent>
+            </Card>
+          )}
 
           {production.script && (
             <Card>

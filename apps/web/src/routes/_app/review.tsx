@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { createFileRoute, Link } from '@tanstack/react-router';
-import { ArrowRightIcon, CircleAlertIcon, FilmIcon } from 'lucide-react';
+import { ArrowRightIcon, CircleAlertIcon, FilmIcon, UploadIcon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -8,6 +8,7 @@ import { reviewQueueQueryOptions } from '@/features/queue/api';
 import { PageHeader } from '@/features/queue/components/page-header';
 import { ProductionStatusBadge } from '@/features/queue/components/production-status';
 import { EmptyQueue, ListSkeleton, QueryError } from '@/features/queue/components/query-state';
+import { UploadCutPanel } from '@/features/queue/components/upload-cut-panel';
 import { formatDuration, formatRelative, formatUsd, parseQcReport } from '@/lib/format';
 
 export const Route = createFileRoute('/_app/review')({
@@ -44,6 +45,12 @@ function ReviewQueuePage() {
                 <Card className="transition-colors hover:border-primary/40">
                   <CardHeader>
                     <div className="flex flex-wrap items-center gap-2">
+                      {production.source === 'upload' && (
+                        <Badge variant="secondary" className="font-normal">
+                          <UploadIcon className="size-3" />
+                          Uploaded
+                        </Badge>
+                      )}
                       {qcFailed ? (
                         <Badge variant="outline" className="border-transparent bg-destructive/10 text-destructive">
                           <CircleAlertIcon className="size-3" />
@@ -63,11 +70,14 @@ function ReviewQueuePage() {
                         </Badge>
                       )}
                       <span className="text-xs text-muted-foreground">
-                        rendered {formatRelative(production.completed_at ?? production.created_at)}
+                        {production.source === 'upload' ? 'uploaded' : 'rendered'}{' '}
+                        {formatRelative(production.completed_at ?? production.created_at)}
                       </span>
                     </div>
-                    <CardTitle className="text-base">{idea?.title ?? 'Untitled cut'}</CardTitle>
-                    {idea?.hook && <CardDescription>{idea.hook}</CardDescription>}
+                    <CardTitle className="text-base">{production.title ?? idea?.title ?? 'Untitled cut'}</CardTitle>
+                    {(production.brief ?? idea?.hook) && (
+                      <CardDescription>{production.brief ?? idea?.hook}</CardDescription>
+                    )}
                   </CardHeader>
                   <CardContent className="flex flex-wrap items-center justify-between gap-3">
                     <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground tabular-nums">
@@ -75,7 +85,9 @@ function ReviewQueuePage() {
                         <FilmIcon className="size-3.5" aria-hidden />
                         {formatDuration(production.duration_seconds)}
                       </span>
-                      <span>{formatUsd(production.cost_actual_usd ?? production.cost_estimate_usd)}</span>
+                      {production.source !== 'upload' && (
+                        <span>{formatUsd(production.cost_actual_usd ?? production.cost_estimate_usd)}</span>
+                      )}
                       <ProductionStatusBadge production={production} />
                     </div>
                     <Button asChild size="sm">
@@ -91,6 +103,8 @@ function ReviewQueuePage() {
           })}
         </ul>
       )}
+
+      <UploadCutPanel />
     </div>
   );
 }

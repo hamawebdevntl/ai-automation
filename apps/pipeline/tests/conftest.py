@@ -35,6 +35,7 @@ class FakeSupa:
         self.saved: list[dict[str, Any]] = []
         self.parked: list[tuple[str, str]] = []
         self.released: list[str] = []
+        self.extended: list[tuple[str, int]] = []
         self.started: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
 
@@ -61,6 +62,10 @@ class FakeSupa:
         self.saved.append({"id": production_id, **run_state, **fields})
         self._run_state = run_state
         return {"id": production_id}
+
+    def extend_lease(self, production_id: str, seconds: int) -> None:
+        self.calls.append(("extend_lease", seconds))
+        self.extended.append((production_id, seconds))
 
     def release_lease(self, production_id: str) -> None:
         self.calls.append(("release_lease", production_id))

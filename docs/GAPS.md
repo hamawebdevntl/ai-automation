@@ -63,6 +63,14 @@ organization's name. For a non-profit this is the higher risk of the two.
 good, and we must set it. But YouTube requires disclosing altered/synthetic
 content, and Meta labels AI content on Instagram. Those are not handled.
 
+Partly closed since uploads landed: the answer is now a per-production column
+(`productions.is_aigc`) rather than a hardcoded `True`, because an uploaded cut
+may genuinely not be AI-generated and only its uploader knows. It defaults to
+true, which is correct for everything the pipeline renders. What is still
+missing is the other half — YouTube and Meta have no equivalent flag wired at
+all, so a video declared as AI-generated is disclosed on TikTok and silently
+not disclosed on the other three.
+
 Separately: **EU AI Act Article 50 transparency obligations were scheduled to
 apply from 2 August 2026** — i.e. already in force as of today, if you have EU
 nexus. My knowledge cutoff is May 2026 and there was active discussion of

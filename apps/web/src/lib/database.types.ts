@@ -390,10 +390,38 @@ export type IdeaRow = {
   connection: string | null;
 };
 
+/**
+ * How a production came to exist.
+ *
+ * `generated` came through Gate 1 from an approved idea and was rendered.
+ * `upload` is a finished cut an owner supplied: it has no idea, no style and
+ * no render, and enters the pipeline at the quality check. Everything from
+ * there on — the check, the copy, Gate 2, publishing, analytics — is the same
+ * code for both, which is the whole point of the distinction being one column
+ * rather than a second pipeline.
+ */
+export type ProductionSource = 'generated' | 'upload';
+
 export type ProductionRow = {
   id: string;
-  idea_id: string;
-  style_preset_id: string;
+  /** Null on an uploaded cut, which was never proposed as an idea.
+   *  `productions_origin_columns` in Postgres pairs this with `source`. */
+  idea_id: string | null;
+  /** Null on an uploaded cut: nothing rendered it, so no style was chosen. */
+  style_preset_id: string | null;
+  source: ProductionSource;
+  /** The subject line for an upload, which has no idea to take one from. Null
+   *  on a generated production — `ideas.title` is that one's subject. */
+  title: string | null;
+  /** What an uploaded video is about, in the uploader's own words. This is what
+   *  `generate_platform_copy` writes the four captions from, standing in for
+   *  the approved script a generated production has. Not a script: nothing
+   *  narrates it and nothing renders from it. */
+  brief: string | null;
+  /** Whether this video is AI-generated, for the platforms' disclosure flags —
+   *  TikTok's `is_aigc` today. True for anything the pipeline rendered; an
+   *  upload answers for itself, because only the uploader knows. */
+  is_aigc: boolean;
   status: ProductionStatus;
   stage: string | null;
   task_id: string | null;
@@ -573,6 +601,8 @@ export interface Database {
           | 'script_approved_by'
           | 'script_updated_at'
           | 'script_updated_by'
+          | 'source'
+          | 'is_aigc'
         > & {
           id?: string;
           created_at?: string;
@@ -582,6 +612,10 @@ export interface Database {
           platform_copy?: Json;
           paused_at?: string | null;
           superseded_by?: string | null;
+          // Both default in Postgres, and an upload is inserted by
+          // `create_upload_production` rather than through this client at all.
+          source?: ProductionSource;
+          is_aigc?: boolean;
         };
         Update: Writable<ProductionRow>;
         Relationships: [];
@@ -633,6 +667,24 @@ export interface Database {
       };
       decide_production: {
         Args: { p_production_id: string; p_decision: ApprovalDecision; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      // Open a production for a cut that already exists.
+      //
+      // Called *after* the file is in the renders bucket at
+      // `<p_production_id>/final.mp4` — the function refuses if it is not
+      // there, which is what stops a failed upload leaving a production
+      // pointed at nothing. Owner-gated in SQL like every other write, and it
+      // writes its own `production_events` row so the upload is visible as an
+      // upload rather than looking like a render that left no trace.
+      create_upload_production: {
+        Args: {
+          p_production_id: string;
+          p_title: string;
+          p_brief: string;
+          p_is_aigc: boolean;
+          p_note?: string | null;
+        };
         Returns: ProductionRow;
       };
       // The pipeline controls. Owner-gated in SQL exactly as the gates are —

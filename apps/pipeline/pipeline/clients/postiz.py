@@ -191,12 +191,26 @@ class PostizClient:
         return {}
 
     def settings_for(
-        self, platform: Platform, *, title: str, tags: list[str] | None = None
+        self,
+        platform: Platform,
+        *,
+        title: str,
+        tags: list[str] | None = None,
+        made_with_ai: bool = True,
     ) -> dict[str, Any]:
+        """Per-platform settings for one post.
+
+        `made_with_ai` defaults to true because it is true of everything this
+        pipeline renders, and a disclosure that defaults to "no" is the wrong
+        way round: the failure mode of over-disclosing is a label nobody minds,
+        and the failure mode of under-disclosing is a platform sanction. It is
+        a parameter at all because an uploaded cut may genuinely not be
+        AI-generated, and only its uploader knows.
+        """
         if platform == "instagram":
             return self.instagram_settings()
         if platform == "tiktok":
-            return self.tiktok_settings(title)
+            return self.tiktok_settings(title, made_with_ai=made_with_ai)
         if platform == "youtube":
             return self.youtube_settings(title, tags=tags)
         if platform == "linkedin":

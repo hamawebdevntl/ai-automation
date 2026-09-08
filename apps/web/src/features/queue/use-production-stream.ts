@@ -45,7 +45,11 @@ export function useProductionStream(productionId: string | null | undefined) {
           queryClient.setQueryData(queueKeys.production(productionId), (previous: ProductionWithContext | undefined) =>
             previous ? { ...previous, production } : previous,
           );
-          queryClient.setQueryData(queueKeys.productionForIdea(production.idea_id), production);
+          // An uploaded cut has no idea, so there is no per-idea cache entry
+          // for it to freshen.
+          if (production.idea_id) {
+            queryClient.setQueryData(queueKeys.productionForIdea(production.idea_id), production);
+          }
 
           // The lists carry their own joined context, so they are refetched
           // rather than patched -- and a status change is what moves a

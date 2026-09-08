@@ -27,6 +27,8 @@ import type { ProductionRow, ProductionStatus, RewindStep } from '@/lib/database
 /** A step as the driver knows it. Mirrors the keys of `GRAPH`. */
 export type GraphStep =
   | 'write_script'
+  /** The uploaded lane's only step of its own. Everything after it is shared. */
+  | 'check_upload'
   | 'open_script_gate'
   | 'await_script'
   | 'submit_render'
@@ -50,6 +52,16 @@ export type GraphStep =
  * `resume_step()` in Postgres carries the same default. If the three ever
  * disagree, a fresh row is sent to the wrong step. */
 export const FIRST_STEP: GraphStep = 'write_script';
+
+/**
+ * Where an uploaded cut starts instead.
+ *
+ * `create_upload_production` writes this into `run_state.step` at insert, so
+ * unlike `FIRST_STEP` it is never actually reached as a default — it is here so
+ * that a row which somehow arrived without a step is placed at its own lane's
+ * first step rather than at a render it must never reach.
+ */
+export const FIRST_UPLOAD_STEP: GraphStep = 'check_upload';
 
 export const TERMINAL_STEPS = [
   'published',
@@ -77,7 +89,7 @@ export type StepState =
   /** Reached, and deliberately not done. Publishing being switched off. */
   | 'skipped';
 
-export type StepKey = 'queued' | 'script' | 'render' | 'check' | 'copy' | 'gate2' | 'publish' | 'done';
+export type StepKey = 'queued' | 'uploaded' | 'script' | 'render' | 'check' | 'copy' | 'gate2' | 'publish' | 'done';
 
 export interface PipelineStep {
   key: StepKey;
@@ -149,13 +161,82 @@ export const PIPELINE_STEPS: readonly PipelineStep[] = [
   },
 ] as const;
 
-const STEP_INDEX = new Map<GraphStep, number>(
-  PIPELINE_STEPS.flatMap((step, index) => step.graphSteps.map((g) => [g, index] as const)),
-);
+/**
+ * The same timeline for a cut somebody uploaded.
+ *
+ * A separate skeleton rather than the one above with three steps greyed out,
+ * because "skipped" is not what happened to them. An upload did not skip the
+ * script gate — there was never a script, and nothing was ever going to render
+ * it. Drawing steps that could not have applied would invite the reader to ask
+ * why they did not happen, which is the opposite of what a timeline is for.
+ *
+ * Everything from `check` down is the same object as the generated lane's, and
+ * that is the point: an uploaded production and a rendered one are the same
+ * production from the quality check onwards.
+ */
+export const UPLOAD_PIPELINE_STEPS: readonly PipelineStep[] = [
+  {
+    key: 'uploaded',
+    label: 'Uploaded',
+    description: 'You supplied the finished cut. No idea, no script and no render — it starts here.',
+    graphSteps: [],
+  },
+  {
+    key: 'check',
+    label: 'Quality check',
+    description: 'The file is inspected for the faults a person should not have to catch by watching.',
+    graphSteps: ['check_upload'],
+  },
+  {
+    key: 'copy',
+    label: 'Platform copy',
+    description: 'A caption, title and description written for each platform, from the description you gave.',
+    graphSteps: ['generate_copy'],
+  },
+  {
+    key: 'gate2',
+    label: 'Gate 2 — your sign-off',
+    description: 'Nothing publishes until a person approves the finished cut.',
+    graphSteps: ['open_gate2', 'await_gate2'],
+    isGate: true,
+  },
+  {
+    key: 'publish',
+    label: 'Publishing',
+    description: 'Posted to each enabled platform, then confirmed.',
+    graphSteps: ['publish', 'poll_publish'],
+  },
+  {
+    key: 'done',
+    label: 'Finished',
+    description: 'Where this production ended up.',
+    graphSteps: ['published', 'rejected', 'parked', 'cancelled', 'publishing_disabled'],
+  },
+] as const;
 
-/** Which display step a driver step belongs to. */
-export function stepIndexOf(graphStep: string): number {
-  return STEP_INDEX.get(graphStep as GraphStep) ?? 0;
+/** Which skeleton this production is drawn against. */
+export function pipelineStepsFor(production: Pick<ProductionLike, 'source'>): readonly PipelineStep[] {
+  return production.source === 'upload' ? UPLOAD_PIPELINE_STEPS : PIPELINE_STEPS;
+}
+
+function indexMap(steps: readonly PipelineStep[]): Map<GraphStep, number> {
+  return new Map(steps.flatMap((step, index) => step.graphSteps.map((g) => [g, index] as const)));
+}
+
+const STEP_INDEX = indexMap(PIPELINE_STEPS);
+const UPLOAD_STEP_INDEX = indexMap(UPLOAD_PIPELINE_STEPS);
+
+/**
+ * Which display step a driver step belongs to, in one skeleton.
+ *
+ * Takes the steps rather than reading a module-level map, because the two
+ * skeletons number their rows differently: `generate_copy` is index 4 in the
+ * generated lane and index 2 in the uploaded one, and a position read against
+ * the wrong one puts the whole timeline out by two.
+ */
+export function stepIndexOf(graphStep: string, steps: readonly PipelineStep[] = PIPELINE_STEPS): number {
+  const map = steps === UPLOAD_PIPELINE_STEPS ? UPLOAD_STEP_INDEX : STEP_INDEX;
+  return map.get(graphStep as GraphStep) ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +245,7 @@ export function stepIndexOf(graphStep: string): number {
 
 type ProductionLike = Pick<
   ProductionRow,
+  | 'source'
   | 'status'
   | 'stage'
   | 'run_state'
@@ -174,6 +256,7 @@ type ProductionLike = Pick<
   | 'superseded_by'
   | 'lease_expires_at'
   | 'created_at'
+  | 'updated_at'
 >;
 
 function runState(production: ProductionLike): Record<string, unknown> {
@@ -185,9 +268,14 @@ function readString(state: Record<string, unknown>, key: string): string | null 
   return typeof value === 'string' && value ? value : null;
 }
 
+/** The step a row with none yet is treated as being at. */
+function firstStepFor(production: Pick<ProductionLike, 'source'>): GraphStep {
+  return production.source === 'upload' ? FIRST_UPLOAD_STEP : FIRST_STEP;
+}
+
 /** Where the driver has this row now. */
 export function currentGraphStep(production: ProductionLike): GraphStep {
-  return (readString(runState(production), 'step') as GraphStep | null) ?? FIRST_STEP;
+  return (readString(runState(production), 'step') as GraphStep | null) ?? firstStepFor(production);
 }
 
 /**
@@ -202,7 +290,7 @@ export function stoppedAtStep(production: ProductionLike): GraphStep {
   const state = runState(production);
   const step = currentGraphStep(production);
   if (!isTerminalStep(step)) return step;
-  return (readString(state, 'previous_step') as GraphStep | null) ?? FIRST_STEP;
+  return (readString(state, 'previous_step') as GraphStep | null) ?? firstStepFor(production);
 }
 
 /** Has the worker actually started on this row, or is it still waiting? */
@@ -229,8 +317,27 @@ export const WORKER_GRACE_MS = 30_000;
  * that has not come, and nothing on the row will change until one does.
  */
 export function isUnclaimed(production: ProductionLike, now: number = Date.now()): boolean {
-  if (hasStarted(production)) return false;
   if (production.status !== 'queued' || production.paused_at !== null) return false;
+
+  // An uploaded cut cannot be recognised by having no step: it is inserted
+  // *with* one, because `create_upload_production` puts it at `check_upload`
+  // rather than letting it default into the render lane. So the marker is
+  // different — still queued, still at its own first step, and not currently
+  // held by a worker.
+  //
+  // Measured from `updated_at` rather than `created_at`, and this is the part
+  // that has to be right: the check itself legitimately runs for minutes on a
+  // large file, and a worker holds an hour's lease while it does. Reading
+  // `created_at` would call every slow upload abandoned.
+  if (production.source === 'upload') {
+    if (currentGraphStep(production) !== FIRST_UPLOAD_STEP) return false;
+    if (isLeased(production, now)) return false;
+    const touched = production.updated_at || production.created_at;
+    if (!touched) return false;
+    return now - new Date(touched).getTime() > WORKER_GRACE_MS;
+  }
+
+  if (hasStarted(production)) return false;
   if (!production.created_at) return false;
   return now - new Date(production.created_at).getTime() > WORKER_GRACE_MS;
 }
@@ -240,9 +347,9 @@ export function isPaused(production: ProductionLike): boolean {
 }
 
 /** The worker is holding this row right now, so its state is about to change. */
-export function isLeased(production: ProductionLike): boolean {
+export function isLeased(production: ProductionLike, now: number = Date.now()): boolean {
   if (!production.lease_expires_at) return false;
-  return new Date(production.lease_expires_at).getTime() > Date.now();
+  return new Date(production.lease_expires_at).getTime() > now;
 }
 
 /**
@@ -340,15 +447,16 @@ export interface TimelineStep extends PipelineStep {
 }
 
 export function buildTimeline(production: ProductionLike): TimelineStep[] {
+  const steps = pipelineStepsFor(production);
   const step = currentGraphStep(production);
   const terminal = isTerminalStep(step);
-  const position = stepIndexOf(terminal ? stoppedAtStep(production) : step);
+  const position = stepIndexOf(terminal ? stoppedAtStep(production) : step, steps);
   const stopped = isStopped(production);
   const held = isHeldForPublishing(production);
   const started = hasStarted(production);
   const paused = isPaused(production);
 
-  return PIPELINE_STEPS.map((pipelineStep, index) => ({
+  return steps.map((pipelineStep, index) => ({
     ...pipelineStep,
     state: stateFor({ pipelineStep, index, position, terminal, stopped, held, started, paused, production, step }),
   }));
@@ -377,11 +485,16 @@ function stateFor(args: {
     return 'pending';
   }
 
-  // The first step is the only one that is complete before the driver has
-  // touched the row: Gate 1 has already happened.
+  // The first step of either lane is the only one that is complete before the
+  // driver has touched the row: Gate 1 has already happened, or the file has
+  // already been uploaded.
   if (pipelineStep.key === 'queued') {
     return started || terminal ? 'done' : 'active';
   }
+  // An upload's first row is done the moment the row exists — the file is in
+  // the bucket before `create_upload_production` will open one, so unlike a
+  // queued production there is nothing still to arrive.
+  if (pipelineStep.key === 'uploaded') return 'done';
 
   if (index < position) return 'done';
 
@@ -484,7 +597,9 @@ export function describeProduction(production: ProductionLike, now: number = Dat
     return {
       headline: 'Waiting for a worker',
       detail:
-        'Approved, but no pipeline worker has picked this up. The worker is probably not running — nothing here changes until it is.',
+        production.source === 'upload'
+          ? 'The file is uploaded, but no pipeline worker has picked it up to check it. The worker is probably not running — nothing here changes until it is.'
+          : 'Approved, but no pipeline worker has picked this up. The worker is probably not running — nothing here changes until it is.',
       tone: 'waiting',
     };
   }
@@ -496,7 +611,8 @@ export function describeProduction(production: ProductionLike, now: number = Dat
     };
   }
 
-  const label = PIPELINE_STEPS[stepIndexOf(step)]?.label ?? 'Working';
+  const steps = pipelineStepsFor(production);
+  const label = steps[stepIndexOf(step, steps)]?.label ?? 'Working';
   return { headline: label, detail: stage, tone: 'working' };
 }
 
@@ -563,13 +679,18 @@ export function availableControls(production: ProductionLike): Record<ControlAct
             ? no(BUSY)
             : ok,
 
-    rerun: superseded
-      ? no('This production has already been re-run.')
-      : !canRerun(production)
-        ? no('This production is still running. Cancel it first, or wait for it to finish.')
-        : leased
-          ? no(BUSY)
-          : ok,
+    rerun:
+      production.source === 'upload'
+        ? no(
+            'This is an uploaded cut, so there is nothing to make again. Upload the video again to put a new one through Gate 2.',
+          )
+        : superseded
+          ? no('This production has already been re-run.')
+          : !canRerun(production)
+            ? no('This production is still running. Cancel it first, or wait for it to finish.')
+            : leased
+              ? no(BUSY)
+              : ok,
 
     rewind: superseded
       ? no('This production was superseded by a re-run.')
