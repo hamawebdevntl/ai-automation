@@ -14,6 +14,7 @@ import { ProductionTimeline } from '@/features/queue/components/production-timel
 import { QcReportCard } from '@/features/queue/components/qc-report-card';
 import { QueryError } from '@/features/queue/components/query-state';
 import { ScriptEditor } from '@/features/queue/components/script-editor';
+import { SourceFootageSection } from '@/features/queue/components/source-footage-panel';
 import { describeProduction, hasStarted, isAtGate2, isAtScriptGate } from '@/features/queue/pipeline-steps';
 import { useProductionStream } from '@/features/queue/use-production-stream';
 import { RENDER_MODE_LABELS } from '@/lib/database.types';
@@ -127,7 +128,12 @@ function ProductionProcessPage() {
         </Alert>
       )}
 
-      {isAtScriptGate(production) && <ScriptEditor production={production} />}
+      {isAtScriptGate(production) && (
+        <>
+          <SourceFootageSection production={production} />
+          <ScriptEditor production={production} />
+        </>
+      )}
 
       <Card>
         <CardHeader>
@@ -193,7 +199,14 @@ function ProductionProcessPage() {
           still shows 'what the narration was written from' for a finished
           production -- and shows it as the same component the owner approved
           it in, rather than a second rendering of the same column. */}
-      {!isAtScriptGate(production) && production.script && <ScriptEditor production={production} />}
+      {!isAtScriptGate(production) && (
+        <>
+          {/* Renders nothing unless this style read an upload, in which case
+              it is the record of what the reel was made from. */}
+          <SourceFootageSection production={production} />
+          {production.script && <ScriptEditor production={production} />}
+        </>
+      )}
 
       {idea && (
         <Button asChild variant="ghost" size="sm" className="-ml-2 w-fit">

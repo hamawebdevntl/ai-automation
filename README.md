@@ -166,6 +166,17 @@ The presenter lane is the one that bills per render against a pay-as-you-go
 wallet rather than a monthly allowance, which is why the cost range sits next
 to the choice at Gate 1 rather than behind it.
 
+There is a fifth mode, `fal_video`, whose input is **a video the owner uploads
+plus an instruction they write** rather than text. It is the only lane that
+does not generate its footage, and it needs three things on the row before a
+cent is spent: the file, the instruction, and a record of consent for the
+people who appear in it. The instruction is the model's prompt verbatim, so it
+is approved by the script gate alongside the script rather than saved and
+forgotten. Its preset (`fal-restyle`) ships **inactive**: video-to-video is
+priced above text-to-video, its cost depends on how long a file you upload, and
+there is no spend cap yet — so nobody should be able to pick it by accident
+before those two are answered.
+
 ---
 
 ## Repositories used

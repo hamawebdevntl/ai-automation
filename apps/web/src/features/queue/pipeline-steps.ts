@@ -1,4 +1,5 @@
-import type { ProductionRow, ProductionStatus, RewindStep } from '@/lib/database.types';
+import type { ProductionRow, ProductionStatus, RenderMode, RewindStep } from '@/lib/database.types';
+import { SOURCE_RENDER_MODES } from '@/lib/database.types';
 
 /**
  * What the pipeline does after Gate 1, expressed for a person.
@@ -317,6 +318,53 @@ export function isScriptEditable(production: ProductionLike): boolean {
     production.status === 'parked' ||
     production.status === 'failed'
   );
+}
+
+// ---------------------------------------------------------------------------
+// The source-footage lane
+// ---------------------------------------------------------------------------
+
+/** The three fields a footage lane needs, and nothing else from the row. */
+type SourceLike = Pick<ProductionRow, 'source_video_key' | 'render_instruction' | 'source_consent_at'>;
+
+/** Whether this preset renders from an uploaded file rather than from text. */
+export function needsSourceFootage(mode: RenderMode | null | undefined): boolean {
+  return mode !== null && mode !== undefined && (SOURCE_RENDER_MODES as readonly RenderMode[]).includes(mode);
+}
+
+/** One missing input, named. */
+export type SourceGap = 'footage' | 'instruction' | 'consent';
+
+/**
+ * Which of the footage lane's inputs is still missing, in the order they are asked for.
+ *
+ * A mirror of `_missing_source_input` in `activities/render.py` and of the block
+ * inside `approve_script`, and the order is the same in all three on purpose:
+ * an owner who is told "upload a video", then "write an instruction", then
+ * "record consent" is being walked through a checklist. Being told all three at
+ * once, or a different one each time, is not that.
+ *
+ * Returns null when nothing is missing — including for a production whose style
+ * does not read footage at all, which is every production but this lane's.
+ */
+export function missingSourceInput(production: SourceLike, mode: RenderMode | null | undefined): SourceGap | null {
+  if (!needsSourceFootage(mode)) return null;
+  if (!production.source_video_key) return 'footage';
+  if (!production.render_instruction?.trim()) return 'instruction';
+  if (!production.source_consent_at) return 'consent';
+  return null;
+}
+
+/** Why the script cannot be approved yet, when the reason is a missing upload. */
+export function sourceGapReason(gap: SourceGap): string {
+  switch (gap) {
+    case 'footage':
+      return 'This style renders from your own footage. Upload a video first.';
+    case 'instruction':
+      return 'Write the instruction saying what to do with the footage.';
+    case 'consent':
+      return 'Record consent for the people in the footage before approving.';
+  }
 }
 
 /** Why the script cannot be edited, in words an owner can act on. */

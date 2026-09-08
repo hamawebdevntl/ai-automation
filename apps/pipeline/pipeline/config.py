@@ -68,6 +68,23 @@ class Settings(BaseSettings):
     # fetch promptly rather than storing the URL and coming back to it.
     fal_poll_budget_seconds: int = Field(default=1800, alias="FAL_POLL_BUDGET_SECONDS")
 
+    # --- The source-footage lane --------------------------------------------
+    # How long the signed URL to the owner's upload stays valid.
+    #
+    # This has to outlive the whole render rather than the submit. The provider
+    # fetches the file when the job leaves the queue, not when it is accepted,
+    # and it may re-fetch mid-run -- so a URL sized for the submit expires under
+    # a job that is queued behind someone else's, and the render fails after
+    # being billed for. Six hours against a thirty-minute poll budget is
+    # deliberately generous: the URL grants read access to one object the owner
+    # uploaded themselves, so a long lifetime costs far less than a short one.
+    #
+    # `_submit_fal_video` refuses to submit if this is not longer than
+    # `fal_poll_budget_seconds`, so the two cannot be tuned out of step.
+    source_video_url_ttl_seconds: int = Field(
+        default=6 * 3600, alias="SOURCE_VIDEO_URL_TTL_SECONDS"
+    )
+
     # --- HeyGen -------------------------------------------------------------
     # The presenter lane. Selected per style preset via
     # style_presets.render_mode = 'heygen', so nothing here decides which

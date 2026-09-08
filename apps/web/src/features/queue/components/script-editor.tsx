@@ -22,7 +22,8 @@ import { useOwner } from '@/features/auth/use-owner';
 import { MAX_SCRIPT_CHARS, type ProductionRow } from '@/lib/database.types';
 import { formatRelative } from '@/lib/format';
 import { useApproveScript, useRedraftScript, useSaveScript } from '../api';
-import { currentGraphStep, isLeased, isScriptEditable, scriptLockReason } from '../pipeline-steps';
+import { currentGraphStep, isLeased, isScriptEditable, scriptLockReason, sourceGapReason } from '../pipeline-steps';
+import { useSourceLane } from '../use-source-lane';
 
 /**
  * Reading, editing and approving the narration, before a cent is spent on it.
@@ -151,6 +152,15 @@ export function ScriptEditor({ production }: { production: ProductionRow }) {
     !serverScript && (step === 'write_script' || step === 'open_script_gate') && !isStoppedRow(production);
 
   const canWrite = isOwner && editable && !busy;
+
+  // On the footage lane, approving is a statement about the upload and the
+  // instruction as well as the words -- so it is refused here for the same
+  // reason `approve_script` refuses it in Postgres. `isLoading` blocks too: the
+  // style is what says whether this lane applies at all, and enabling the one
+  // button that spends money before that answer arrives would be the wrong way
+  // to be wrong.
+  const lane = useSourceLane(production);
+  const canApprove = canWrite && !leased && validity.ok && !lane.isLoading && lane.gap === null;
 
   const runSave = async () => {
     try {
@@ -304,9 +314,11 @@ export function ScriptEditor({ production }: { production: ProductionRow }) {
           </p>
         )}
 
+        {editable && lane.gap !== null && <p className="text-sm text-muted-foreground">{sourceGapReason(lane.gap)}</p>}
+
         {editable && (
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
-            <Button onClick={() => setConfirm('approve')} disabled={!canWrite || !validity.ok || leased}>
+            <Button onClick={() => setConfirm('approve')} disabled={!canApprove}>
               {approve.isPending ? <Spinner className="size-4" /> : <CheckIcon className="size-4" />}
               Approve and start the render
             </Button>

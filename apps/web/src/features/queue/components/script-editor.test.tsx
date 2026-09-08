@@ -2,6 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OwnerState } from '@/features/auth/use-owner';
+import type { SourceLane } from '@/features/queue/use-source-lane';
 import type { ProductionRow } from '@/lib/database.types';
 import { makeProduction } from '@/test/factories';
 
@@ -37,6 +38,22 @@ vi.mock('@/features/queue/api', () => ({
   useRedraftScript: () => ({ mutateAsync: redraft, isPending: false }),
 }));
 
+/**
+ * The footage lane, absent.
+ *
+ * Four of the five styles render from text and have no upload to wait for, so
+ * this is what every test below is about unless it says otherwise. The lane is
+ * mocked rather than given a query client because it reads a preset over the
+ * network, and none of these tests is about that.
+ */
+const mockLane = vi.fn<() => SourceLane>(() => ({
+  style: null,
+  needsSource: false,
+  gap: null,
+  isLoading: false,
+}));
+vi.mock('@/features/queue/use-source-lane', () => ({ useSourceLane: () => mockLane() }));
+
 const { ScriptEditor, estimateSeconds, validateScript } = await import('@/features/queue/components/script-editor');
 
 const DRAFT = 'A property CRM makes you type every viewing twice, and the second one is always wrong.';
@@ -66,6 +83,7 @@ async function confirmDialog(user: ReturnType<typeof userEvent.setup>, name: Reg
 beforeEach(() => {
   vi.clearAllMocks();
   mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
+  mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isLoading: false });
 });
 
 // ---------------------------------------------------------------------------
@@ -297,5 +315,51 @@ describe('after approval', () => {
 
     expect(screen.getByText('Unsaved changes')).toBeInTheDocument();
     expect(screen.getByText(/Save keeps them; approve saves and starts the render/)).toBeInTheDocument();
+  });
+});
+
+describe('the footage lane cannot be approved half-finished', () => {
+  it('refuses approval while the upload is missing, and says which one', () => {
+    // The same refusal `approve_script` makes in Postgres, shown before the
+    // click rather than after it. On this lane approving is a statement about
+    // the footage and the instruction as well as the words.
+    mockLane.mockReturnValue({ style: null, needsSource: true, gap: 'footage', isLoading: false });
+    show(atGate());
+
+    expect(button('Approve and start the render')).toBeDisabled();
+    expect(screen.getByText(/Upload a video first/)).toBeInTheDocument();
+  });
+
+  it('still refuses when only the consent record is missing', () => {
+    mockLane.mockReturnValue({ style: null, needsSource: true, gap: 'consent', isLoading: false });
+    show(atGate());
+
+    expect(button('Approve and start the render')).toBeDisabled();
+    expect(screen.getByText(/Record consent/)).toBeInTheDocument();
+  });
+
+  it('allows approval once nothing is missing', () => {
+    mockLane.mockReturnValue({ style: null, needsSource: true, gap: null, isLoading: false });
+    show(atGate());
+
+    expect(button('Approve and start the render')).toBeEnabled();
+  });
+
+  it('waits rather than enabling the one button that spends money', () => {
+    // Until the preset has been read we do not know whether this lane applies.
+    // Enabling approve during that window is the wrong way to be wrong.
+    mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isLoading: true });
+    show(atGate());
+
+    expect(button('Approve and start the render')).toBeDisabled();
+    // Saving and redrafting cost nothing, so neither waits on it.
+    expect(button('Write another draft')).toBeEnabled();
+  });
+
+  it('leaves the four text lanes exactly as they were', () => {
+    mockLane.mockReturnValue({ style: null, needsSource: false, gap: null, isLoading: false });
+    show(atGate());
+
+    expect(button('Approve and start the render')).toBeEnabled();
   });
 });
