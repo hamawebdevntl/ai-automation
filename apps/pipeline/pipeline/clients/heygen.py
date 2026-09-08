@@ -58,6 +58,50 @@ _CONFIG_ERROR_CODES = (
     "forbidden",
 )
 
+# Where a remaining balance might be called, in the order worth trying. The
+# pay-as-you-go account this was checked against reports
+# `wallet.remaining_balance`.
+#
+# Deliberately only the two keys that hold *dollars*. `remaining_credit` and
+# `remaining_quota` are counts of credits, and the caller records the delta
+# across a render as USD -- so reading a credit count here would put "12" in the
+# ledger as twelve dollars and file it as the provider's own figure, which is
+# the one number in this system that is supposed to be beyond doubt. A plan that
+# reports only credits reports no balance as far as this is concerned, which
+# leaves the spend counter to do the capping.
+_BALANCE_KEYS = ("remaining_balance", "balance")
+
+
+def _find_balance(payload: Any) -> float | None:
+    """The first balance-shaped number anywhere in an account body."""
+    for key in _BALANCE_KEYS:
+        found = _find_number(payload, key)
+        if found is not None:
+            return found
+    return None
+
+
+def _find_number(payload: Any, key: str) -> float | None:
+    """Depth-first search for a numeric value under `key`.
+
+    A search rather than a path because the wallet has moved between plans and
+    a fixed path that stopped resolving would read as an empty account -- which
+    would park every presenter render rather than none of them.
+    """
+    if isinstance(payload, dict):
+        for found_key, value in payload.items():
+            if found_key == key and isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            found = _find_number(value, key)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_number(item, key)
+            if found is not None:
+                return found
+    return None
+
 
 class HeyGenError(RuntimeError):
     """Any unexpected HeyGen failure."""
@@ -214,6 +258,32 @@ class HeyGenClient:
         because the account is empty.
         """
         return self._request("GET", "/v3/users/me")
+
+    def balance(self) -> float | None:
+        """What the wallet holds, or None if this plan does not report one.
+
+        The only provider-side figure in the system. It is what makes a
+        presenter render's *measured* cost possible -- the delta across a
+        render is HeyGen's own number, where fal's has to be derived from a
+        rate -- and it is the one check that can refuse a render this account
+        cannot afford before the request is made rather than after.
+        `submit_render` calls it for exactly that reason.
+
+        Searched for rather than read from a fixed path. It sits at
+        `wallet.remaining_balance` on a pay-as-you-go account, and a plan change
+        is not a reason for the check to start calling a funded account empty.
+        Returns None rather than zero when nothing is found, because "this plan
+        reports no balance" and "this account is out of credit" must not lead to
+        the same decision.
+        """
+        try:
+            return _find_balance(self.account())
+        except HeyGenError as exc:
+            # A balance we cannot read is not a balance we know is too low. The
+            # spend counter still applies, and the submit that follows fails
+            # loudly on its own if the key is the problem.
+            log.warning("could not read the HeyGen balance: %s", exc)
+            return None
 
     def looks(
         self, *, ownership: str = "private", limit: int = MAX_LOOKS_PAGE

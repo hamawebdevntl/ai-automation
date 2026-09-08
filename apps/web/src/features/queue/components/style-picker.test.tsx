@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { OwnerState } from '@/features/auth/use-owner';
 import { StylePicker } from '@/features/queue/components/style-picker';
-import type { StylePresetRow } from '@/lib/database.types';
+import type { StylePresetRow, StylePresetSpendRow } from '@/lib/database.types';
 
 // StylePicker now shows an owner-only badge naming the render backend, so the
 // role hook has to be controllable from the test.
@@ -112,5 +112,135 @@ describe('render backend visibility', () => {
     mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
     render(<StylePicker presets={[PRESENTER]} value={null} onChange={vi.fn()} />);
     expect(screen.getByText('HeyGen presenter')).toBeInTheDocument();
+  });
+});
+
+describe('a style at its spend cap', () => {
+  function spend(overrides: Partial<StylePresetSpendRow> = {}): StylePresetSpendRow {
+    return {
+      style_preset_id: 'preset-presenter',
+      slug: 'ai-presenter',
+      provider: 'heygen',
+      model: '',
+      block_reason: null,
+      render_count: 0,
+      measured_avg_usd: null,
+      measured_min_usd: null,
+      measured_max_usd: null,
+      ...overrides,
+    };
+  }
+
+  it('cannot be chosen, and says which cap was hit and when it resets', async () => {
+    // The sentence is composed by `spend_block_reason()` in Postgres and shown
+    // verbatim: one wording for the disabled button here and for the park
+    // reason on a production that reached the render step.
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+    const reason = 'Daily spend cap reached for heygen: $30.00 of $30.00 today. It resets 2026-09-09 00:00 UTC.';
+
+    render(
+      <StylePicker
+        presets={[preset(), PRESENTER]}
+        spend={[spend({ block_reason: reason })]}
+        value={null}
+        onChange={onChange}
+      />,
+    );
+    await user.click(screen.getByLabelText(/AI presenter/));
+
+    expect(onChange).not.toHaveBeenCalled();
+    expect(screen.getByText(reason)).toBeInTheDocument();
+    expect(screen.getByText('Capped')).toBeInTheDocument();
+  });
+
+  it('leaves every other style pickable, because the cap is per provider', async () => {
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <StylePicker
+        presets={[preset(), PRESENTER]}
+        spend={[spend({ block_reason: 'Monthly spend cap reached for heygen.' })]}
+        value={null}
+        onChange={onChange}
+      />,
+    );
+    await user.click(screen.getByLabelText(/Stock b-roll/));
+
+    expect(onChange).toHaveBeenCalledWith('preset-stock');
+  });
+
+  it('marks nothing capped while the verdict is still loading', async () => {
+    // Postgres is what refuses, so an unknown verdict must not disable a style
+    // an owner is entitled to pick.
+    const onChange = vi.fn();
+    const user = userEvent.setup();
+
+    render(<StylePicker presets={[PRESENTER]} spend={undefined} value={null} onChange={onChange} />);
+    await user.click(screen.getByLabelText(/AI presenter/));
+
+    expect(onChange).toHaveBeenCalledWith('preset-presenter');
+    expect(screen.queryByText('Capped')).not.toBeInTheDocument();
+  });
+});
+
+describe('measured cost replacing the estimate', () => {
+  it('shows what the style has really cost once it has rendered', () => {
+    // The acceptance criterion: the estimates get replaced by measured figures
+    // once real renders exist. The presenter lane's $1-2 was, in its own
+    // migration's words, "an estimate and not yet a measurement".
+    render(
+      <StylePicker
+        presets={[PRESENTER]}
+        spend={[
+          {
+            style_preset_id: 'preset-presenter',
+            slug: 'ai-presenter',
+            provider: 'heygen',
+            model: '',
+            block_reason: null,
+            render_count: 4,
+            measured_avg_usd: 1.42,
+            measured_min_usd: 1.2,
+            measured_max_usd: 1.6,
+          },
+        ]}
+        value={null}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('$1.42 over 4 renders')).toBeInTheDocument();
+    expect(screen.queryByText('$1.00 – $2.00')).not.toBeInTheDocument();
+    // And says so, rather than letting a billed average pass for the estimate
+    // it replaced.
+    expect(screen.getByText(/actually billed, not an estimate/)).toBeInTheDocument();
+    expect(screen.getByText(/The estimate was \$1\.00 – \$2\.00\./)).toBeInTheDocument();
+  });
+
+  it('keeps the estimate until something has actually been billed', () => {
+    render(
+      <StylePicker
+        presets={[PRESENTER]}
+        spend={[
+          {
+            style_preset_id: 'preset-presenter',
+            slug: 'ai-presenter',
+            provider: 'heygen',
+            model: '',
+            block_reason: null,
+            render_count: 0,
+            measured_avg_usd: null,
+            measured_min_usd: null,
+            measured_max_usd: null,
+          },
+        ]}
+        value={null}
+        onChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('$1.00 – $2.00')).toBeInTheDocument();
   });
 });

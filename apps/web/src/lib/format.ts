@@ -18,6 +18,22 @@ export function formatCostRange(preset: Pick<StylePresetRow, 'est_cost_min_usd' 
   return min === max ? formatUsd(min) : `${formatUsd(min)} – ${formatUsd(max)}`;
 }
 
+/**
+ * "$1.42 over 7 renders", or null when nothing has been billed on this style.
+ *
+ * The figure that replaces the estimate range once real renders exist. Null
+ * rather than a zero-render average, because "no renders yet" and "renders
+ * that cost nothing" are different facts and only the second is worth
+ * showing as a measurement.
+ */
+export function formatMeasuredCost(
+  spend: { render_count: number; measured_avg_usd: number | null } | null | undefined,
+): string | null {
+  if (!spend || spend.render_count <= 0 || spend.measured_avg_usd === null) return null;
+  const renders = spend.render_count === 1 ? '1 render' : `${spend.render_count} renders`;
+  return `${formatUsd(spend.measured_avg_usd)} over ${renders}`;
+}
+
 export function formatMinutes(minutes: number | null | undefined): string {
   if (minutes === null || minutes === undefined) return '—';
   if (minutes < 60) return `~${minutes} min`;

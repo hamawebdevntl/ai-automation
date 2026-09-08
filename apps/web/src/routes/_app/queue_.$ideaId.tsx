@@ -18,13 +18,21 @@ import { IdeaProductionPanel } from '@/features/queue/components/idea-production
 import { QueryError } from '@/features/queue/components/query-state';
 import { StylePicker } from '@/features/queue/components/style-picker';
 import { VelocityBadge } from '@/features/queue/components/velocity-badge';
-import { formatCostRange, formatMinutes, formatRelative, titleCase } from '@/lib/format';
+import { isSpendCapRefusal, spendForPreset, stylePresetSpendQueryOptions } from '@/features/spend/api';
+import { formatCostRange, formatMeasuredCost, formatMinutes, formatRelative, titleCase } from '@/lib/format';
 
 export const Route = createFileRoute('/_app/queue_/$ideaId')({
   loader: ({ context, params }) =>
     Promise.all([
       context.queryClient.ensureQueryData(ideaQueryOptions(params.ideaId)),
       context.queryClient.ensureQueryData(stylePresetsQueryOptions()),
+      // Warmed with the presets so the cap verdict is usually on screen with
+      // the choice rather than a moment after it -- but its failure is
+      // swallowed deliberately. The app and the schema are deployed
+      // separately, and a bundle that reached a database without this view
+      // must still be able to run Gate 1: `StylePicker` marks nothing capped
+      // without a verdict, and `approve_idea` is what actually refuses.
+      context.queryClient.ensureQueryData(stylePresetSpendQueryOptions()).catch(() => null),
     ]),
   component: IdeaDecisionPage,
 });
@@ -46,6 +54,7 @@ function IdeaDecisionPage() {
 
   const ideaQuery = useQuery(ideaQueryOptions(ideaId));
   const presetsQuery = useQuery(stylePresetsQueryOptions());
+  const spendQuery = useQuery(stylePresetSpendQueryOptions());
 
   const [styleId, setStyleId] = useState<string | null>(null);
   const [note, setNote] = useState('');
@@ -57,6 +66,7 @@ function IdeaDecisionPage() {
   const idea = ideaQuery.data;
   const presets = presetsQuery.data ?? [];
   const selectedPreset = presets.find((preset) => preset.id === styleId) ?? null;
+  const selectedSpend = selectedPreset ? spendForPreset(spendQuery.data, selectedPreset.id) : undefined;
 
   if (ideaQuery.error) return <QueryError error={ideaQuery.error} />;
 
@@ -84,6 +94,17 @@ function IdeaDecisionPage() {
       // invisible in the first place. The production panel renders in this
       // card's place, below, so the replacement appears where the eye already is.
     } catch (error) {
+      // A cap can be reached between this page loading and the click, so the
+      // refusal is expected rather than exceptional. It is called out
+      // separately because the fix is a different one: top up, raise the
+      // ceiling in Settings, or pick another style.
+      if (isSpendCapRefusal(error)) {
+        toast.error('That style is at its spend cap', {
+          description: error instanceof Error ? error.message : undefined,
+        });
+        void spendQuery.refetch();
+        return;
+      }
       toast.error(error instanceof Error ? error.message : 'Could not approve this idea');
     }
   };
@@ -180,7 +201,13 @@ function IdeaDecisionPage() {
             {presetsQuery.error && <QueryError error={presetsQuery.error} />}
             {presetsQuery.isPending && <Skeleton className="h-40 w-full" />}
             {presets.length > 0 && (
-              <StylePicker presets={presets} value={styleId} onChange={setStyleId} disabled={!isOwner || isDeciding} />
+              <StylePicker
+                presets={presets}
+                spend={spendQuery.data}
+                value={styleId}
+                onChange={setStyleId}
+                disabled={!isOwner || isDeciding}
+              />
             )}
 
             <Separator />
@@ -209,7 +236,8 @@ function IdeaDecisionPage() {
             {selectedPreset && (
               <p className="text-sm text-muted-foreground">
                 Approving queues this as <strong className="text-foreground">{selectedPreset.name}</strong> —{' '}
-                {formatCostRange(selectedPreset)}, {formatMinutes(selectedPreset.est_minutes)}.
+                {formatMeasuredCost(selectedSpend) ?? formatCostRange(selectedPreset)},{' '}
+                {formatMinutes(selectedPreset.est_minutes)}.
               </p>
             )}
 
