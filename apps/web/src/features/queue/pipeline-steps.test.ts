@@ -9,8 +9,11 @@ import {
   isRenderInFlight,
   isScriptEditable,
   isUnclaimed,
+  missingSourceInput,
+  needsSourceFootage,
   rewindableSteps,
   scriptLockReason,
+  sourceGapReason,
   stoppedAtStep,
   WORKER_GRACE_MS,
 } from './pipeline-steps';
@@ -368,5 +371,63 @@ describe('a production nothing has picked up', () => {
       paused_at: '2026-09-07T10:00:01Z',
     });
     expect(isUnclaimed(paused, opened + 999_999)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The footage lane
+// ---------------------------------------------------------------------------
+
+describe('what a footage lane still needs', () => {
+  const ready = {
+    source_video_key: 'sources/p1/1757000000000-clip.mp4',
+    render_instruction: 'Cut this to thirty seconds and grade it warm.',
+    source_consent_at: '2026-09-08T09:00:00Z',
+  };
+
+  it('asks for nothing on the four lanes that generate from text', () => {
+    // Every mode but one, and the reason this returns null rather than throwing
+    // for them: the check is asked on every production, not only this lane's.
+    for (const mode of ['mpt', 'fal_visuals', 'fal_full', 'heygen'] as const) {
+      expect(needsSourceFootage(mode)).toBe(false);
+      expect(
+        missingSourceInput({ source_video_key: null, render_instruction: null, source_consent_at: null }, mode),
+      ).toBeNull();
+    }
+  });
+
+  it('asks for footage, then the instruction, then consent — one at a time', () => {
+    // The order matters: it is the same order `_missing_source_input` and
+    // `approve_script` use, so an owner is walked through a checklist rather
+    // than told a different thing each time they click.
+    expect(
+      missingSourceInput({ source_video_key: null, render_instruction: null, source_consent_at: null }, 'fal_video'),
+    ).toBe('footage');
+    expect(missingSourceInput({ ...ready, render_instruction: null, source_consent_at: null }, 'fal_video')).toBe(
+      'instruction',
+    );
+    expect(missingSourceInput({ ...ready, source_consent_at: null }, 'fal_video')).toBe('consent');
+    expect(missingSourceInput(ready, 'fal_video')).toBeNull();
+  });
+
+  it('does not accept whitespace as an instruction', () => {
+    // `btrim(text)` with one argument strips only spaces, which is how a
+    // newline once passed the script gate. Both sides name the whole set now.
+    expect(missingSourceInput({ ...ready, render_instruction: '  \n  ' }, 'fal_video')).toBe('instruction');
+  });
+
+  it('waits rather than guessing while the style is unknown', () => {
+    // A null mode is "the preset has not been read yet". Treating that as
+    // "needs nothing" would enable the approve button on the one lane where it
+    // must not be enabled, so `useSourceLane` reports `isLoading` separately
+    // and the editor blocks on it.
+    expect(needsSourceFootage(null)).toBe(false);
+    expect(needsSourceFootage(undefined)).toBe(false);
+  });
+
+  it('gives each gap a reason an owner can act on', () => {
+    expect(sourceGapReason('footage')).toMatch(/upload a video/i);
+    expect(sourceGapReason('instruction')).toMatch(/instruction/i);
+    expect(sourceGapReason('consent')).toMatch(/consent/i);
   });
 });

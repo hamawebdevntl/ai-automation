@@ -91,6 +91,13 @@ publish is never retried, by design, because Postiz starts its workflow with
 `TERMINATE_EXISTING`. What is left is the fal lane, which has no idempotency key
 of its own -- an ambiguous fal failure parks rather than resubmitting.
 
+The `fal_video` lane was expected to make that worse, on the grounds that a
+resubmit would re-upload the source footage. It does not: the owner's browser
+puts the file in our own bucket once, before the gate, and the pipeline sends
+fal a signed URL. So an ambiguous failure there costs a signature and a second
+*generation*, not a second upload — and it still parks, because that generation
+is still billed.
+
 ### B7. Reviewer throughput is unmodelled
 Two gates times 10 reels a day is 20 review actions daily, every day. If the
 owner is away for three days the queue is 60 items deep. Needs batch-approve,
@@ -101,9 +108,37 @@ auto-expiry, or a delegated second reviewer — a product decision, not a techni
 ## C. Deferred, but name them now
 Observability and alerting; a retention policy for the Supabase Storage
 renders bucket; fleet-level cost ceiling
-(OpenMontage's cost_tracker is per-project, not per-month); voice-cloning
-consent if a real person's voice is used; music licensing for organizational
-use; analytics-to-idea-scoring loop (already known custom).
+(OpenMontage's cost_tracker is per-project, not per-month); music licensing for
+organizational use; analytics-to-idea-scoring loop (already known custom).
+
+### C1. Consent for uploaded footage — no longer deferred
+This list used to say "voice-cloning consent if a real person's voice is used".
+Accepting an upload made that live rather than deferred, so the `fal_video` lane
+carries a consent artefact: `productions.source_consent_at`, `source_consent_by`
+and a required `source_consent_note` in the owner's own words saying who is in
+the footage and how they agreed. It is required before the first render — by
+`approve_script`, and by a trigger underneath it — and it is cleared whenever the
+footage changes, because consent is about a particular file.
+
+**Two things this does not answer.** Voice cloning itself is still deferred: no
+lane clones a voice, and if one is built the consent record it needs is a
+different one (the provider holds it, not us). And the system still has no
+position on **rights** — whether footage the owner did not shoot may be used this
+way at all. The consent note is where that is currently written down, which
+makes it a record rather than a control.
+
+### C2. Which HeyGen product consumes an upload
+Asked and answered as part of the `fal_video` work, and recorded here because
+the answer is that neither candidate is the feature it looked like:
+
+* **An avatar look built from footage of a real person** needs no new render
+  mode. HeyGen builds the look through a consent-verified flow in its own
+  console, and what comes out is an `avatar_id` — so rendering our approved
+  script through it is `render_mode = 'heygen'`, which exists. It is a second
+  presenter preset, not a second lane.
+* **Lip-syncing or translating existing footage** does take a video, but its
+  other input is a target language rather than a free-text instruction. It is a
+  different feature with a different input shape, and it needs its own issue.
 
 ---
 

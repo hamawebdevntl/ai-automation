@@ -42,15 +42,39 @@ export type StyleLane = 'stock' | 'generative' | 'presenter';
  *  - `heygen`      HeyGen returns a finished presenter reel -- voiced,
  *                  captioned and already 9:16. MoneyPrinterTurbo never touches
  *                  the output; only the script generator is shared.
+ *  - `fal_video`   fal transforms footage the owner uploaded, guided by an
+ *                  instruction the owner wrote. The only mode whose input is a
+ *                  file rather than text.
  */
-export type RenderMode = 'mpt' | 'fal_visuals' | 'fal_full' | 'heygen';
+export type RenderMode = 'mpt' | 'fal_visuals' | 'fal_full' | 'heygen' | 'fal_video';
 
 export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
   mpt: 'Standard render',
   fal_visuals: 'fal footage, standard assembly',
   fal_full: 'fal end to end',
   heygen: 'HeyGen presenter',
+  fal_video: 'fal, from your own footage',
 };
+
+/**
+ * Modes that render from an uploaded file rather than from text.
+ *
+ * A mirror of `render_mode_needs_source` in Postgres, and the reason that is a
+ * function there rather than a literal in five places. A production on one of
+ * these cannot pass the script gate without footage, an instruction and a
+ * consent record — `approve_script` refuses, and a trigger refuses underneath
+ * it.
+ */
+export const SOURCE_RENDER_MODES = ['fal_video'] as const satisfies readonly RenderMode[];
+
+/** The longest render instruction, matching `productions_render_instruction_length`. */
+export const MAX_INSTRUCTION_CHARS = 1500;
+
+/** The shortest consent note `confirm_source_consent` accepts. A tick is not a record. */
+export const MIN_CONSENT_NOTE_CHARS = 10;
+
+/** And the longest, matching the same function's own check. */
+export const MAX_CONSENT_NOTE_CHARS = 2000;
 
 export type ProductionStatus =
   | 'queued'
@@ -420,6 +444,29 @@ export type ProductionRow = {
   script_updated_at: string | null;
   /** Who last changed it. Null when the pipeline wrote the draft. */
   script_updated_by: string | null;
+  /** Object key of the footage the owner uploaded, under `sources/<id>/` in the
+   *  private renders bucket. Only ever set on a `fal_video` production. The URL
+   *  is not stored: one is signed at submit time, because a stored one would
+   *  have expired by the time the render read it. */
+  source_video_key: string | null;
+  /** The file name as uploaded, for the review screen. Never used to build the key. */
+  source_video_name: string | null;
+  source_video_bytes: number | null;
+  source_video_uploaded_at: string | null;
+  source_video_uploaded_by: string | null;
+  /** What the owner asked the model to do with the footage — the prompt,
+   *  verbatim, which is why it is approved by the script gate rather than
+   *  saved and forgotten. Any edit clears `script_approved_at`. */
+  render_instruction: string | null;
+  render_instruction_updated_at: string | null;
+  render_instruction_updated_by: string | null;
+  /** When an owner recorded that the people in the footage agreed to this use.
+   *  Null blocks a source-lane render outright, and it is cleared whenever the
+   *  footage changes — consent is about a particular file. */
+  source_consent_at: string | null;
+  source_consent_by: string | null;
+  /** The owner's own words on who is in the footage and how they agreed. */
+  source_consent_note: string | null;
   video_url: string | null;
   thumbnail_url: string | null;
   duration_seconds: number | null;
@@ -573,6 +620,21 @@ export interface Database {
           | 'script_approved_by'
           | 'script_updated_at'
           | 'script_updated_by'
+          // The source lane's inputs. Written only by `attach_source_video`,
+          // `save_render_instruction` and `confirm_source_consent`, each of
+          // which is owner-gated in SQL, so none of them is ever part of an
+          // insert from here.
+          | 'source_video_key'
+          | 'source_video_name'
+          | 'source_video_bytes'
+          | 'source_video_uploaded_at'
+          | 'source_video_uploaded_by'
+          | 'render_instruction'
+          | 'render_instruction_updated_at'
+          | 'render_instruction_updated_by'
+          | 'source_consent_at'
+          | 'source_consent_by'
+          | 'source_consent_note'
         > & {
           id?: string;
           created_at?: string;
@@ -685,6 +747,32 @@ export interface Database {
       };
       request_script_redraft: {
         Args: { p_production_id: string; p_note?: string | null };
+        Returns: ProductionRow;
+      };
+      // The source-footage lane. Three inputs, three functions, and the same
+      // owner check and audit row as everything above — but note what is *not*
+      // here: there is no `approve_instruction`. Approving is `approve_script`,
+      // which is now a statement about the script and the instruction together,
+      // because they are rendered together. Each of these clears the approval,
+      // exactly as `save_script` does.
+      attach_source_video: {
+        // The key is validated against `sources/<production_id>/<filename>`, so
+        // one production's row can never be pointed at another's footage.
+        Args: { p_production_id: string; p_key: string; p_name?: string | null; p_bytes?: number | null };
+        Returns: ProductionRow;
+      };
+      clear_source_video: {
+        Args: { p_production_id: string };
+        Returns: ProductionRow;
+      };
+      save_render_instruction: {
+        Args: { p_production_id: string; p_instruction: string };
+        Returns: ProductionRow;
+      };
+      confirm_source_consent: {
+        // The note is required and has a minimum length: "yes" is not a record
+        // anyone can answer a rights question out of a year later.
+        Args: { p_production_id: string; p_note: string };
         Returns: ProductionRow;
       };
     };

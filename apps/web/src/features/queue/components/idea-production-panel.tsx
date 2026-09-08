@@ -12,6 +12,7 @@ import { useProductionStream } from '../use-production-stream';
 import { ProductionStatusBadge } from './production-status';
 import { ProductionTimeline } from './production-timeline';
 import { ScriptEditor } from './script-editor';
+import { SourceFootageSection } from './source-footage-panel';
 
 /**
  * What happened after this idea was approved, on the idea's own page.
@@ -94,7 +95,14 @@ export function IdeaProductionPanel({ ideaId, decidedAt }: { ideaId: string; dec
   // reference, so it goes below -- locked, because the render has been paid for
   // against it.
   const atGate = isAtScriptGate(production);
-  const script = <ScriptEditor production={production} />;
+  // The footage goes above the words on the lane that has any: on that lane
+  // the script is a caption for the upload rather than the other way round.
+  const script = (
+    <>
+      <SourceFootageSection production={production} />
+      <ScriptEditor production={production} />
+    </>
+  );
 
   const record = (
     <Card>

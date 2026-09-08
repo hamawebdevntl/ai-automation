@@ -16,6 +16,7 @@ import { toError } from '@/lib/supabase-error';
 export const queueKeys = {
   all: ['queue'] as const,
   stylePresets: () => [...queueKeys.all, 'style-presets'] as const,
+  stylePreset: (id: string) => [...queueKeys.stylePresets(), id] as const,
   ideas: (status: IdeaStatus) => [...queueKeys.all, 'ideas', status] as const,
   ideaPage: (status: IdeaStatus, page: number, pageSize: number) =>
     [...queueKeys.ideas(status), 'page', page, pageSize] as const,
@@ -82,6 +83,28 @@ export function stylePresetsQueryOptions() {
         .order('sort_order', { ascending: true });
       if (error) throw toError(error);
       return data ?? [];
+    },
+  });
+}
+
+/**
+ * One preset by id, active or not.
+ *
+ * `stylePresetsQueryOptions` filters to `is_active`, which is right for Gate 1
+ * — an inactive preset must not be pickable — and wrong for reading back the
+ * style a production is already running, since a preset can be deactivated
+ * after it was chosen. This is the read that answers "does this production
+ * render from uploaded footage?", and it has to keep answering it correctly
+ * for a production that is already under way.
+ */
+export function stylePresetQueryOptions(id: string) {
+  return queryOptions({
+    queryKey: queueKeys.stylePreset(id),
+    staleTime: 10 * 60_000,
+    queryFn: async (): Promise<StylePresetRow | null> => {
+      const { data, error } = await supabase.from('style_presets').select('*').eq('id', id).maybeSingle();
+      if (error) throw toError(error);
+      return data;
     },
   });
 }
@@ -628,6 +651,163 @@ export function useRedraftScript() {
     const { data, error } = await supabase.rpc('request_script_redraft', {
       p_production_id: productionId,
       p_note: note?.trim() || null,
+    });
+    if (error) throw toError(error);
+    return data;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The source-footage lane
+// ---------------------------------------------------------------------------
+//
+// Three inputs the owner supplies before the script gate will open on a
+// `fal_video` production: the footage, the instruction, and a consent record.
+// Each is written by an owner-gated Postgres function that clears
+// `script_approved_at`, so changing any of them re-opens the gate — approval is
+// a statement about all of what will be rendered, not about the words alone.
+//
+// The upload itself is the one thing here that is not an RPC. There is no server
+// tier to proxy a 200 MB file through, so the bytes go straight to Storage under
+// a policy that admits owners writing under `sources/` and nothing else, and
+// `attach_source_video` is the row change that makes the object part of the
+// production. Two steps, and the row is written second on purpose: a row
+// pointing at an object that failed to upload is worse than an object no row
+// points at.
+
+/** The private bucket the pipeline already reads and writes. */
+const RENDERS_BUCKET = 'renders';
+
+/**
+ * What the bucket's `allowed_mime_types` accepts.
+ *
+ * Checked here as well so a rejected file says why. Storage answers an
+ * unlisted type with a 400 whose body is not something to show anyone, and
+ * QuickTime — what an iPhone uploads — is exactly the file most likely to hit
+ * it.
+ */
+export const SOURCE_VIDEO_TYPES = ['video/mp4', 'video/quicktime', 'video/webm'] as const;
+
+/** The bucket's own `file_size_limit`, mirrored for a message rather than a 413. */
+export const SOURCE_VIDEO_MAX_BYTES = 500 * 1024 * 1024;
+
+/**
+ * A storage key for one upload: `sources/<production id>/<stamp>-<name>`.
+ *
+ * The production id is load-bearing rather than tidy — `attach_source_video`
+ * refuses a key that names any other production's folder, which is what stops
+ * one production's row being pointed at another's footage, and therefore at
+ * footage whose consent record lives on a different row.
+ *
+ * The timestamp makes a re-upload a new object. There is deliberately no UPDATE
+ * policy on the bucket: overwriting a file in place would change footage that an
+ * existing consent record already points at.
+ */
+export function sourceVideoKey(productionId: string, fileName: string): string {
+  const base = fileName.split(/[\\/]/).pop() ?? 'upload.mp4';
+  const safe =
+    base
+      .replace(/[^A-Za-z0-9._-]+/g, '-')
+      .replace(/^-+/, '')
+      .slice(-80) || 'upload.mp4';
+  return `sources/${productionId}/${Date.now()}-${safe}`;
+}
+
+export interface AttachSourceVideoInput {
+  productionId: string;
+  file: File;
+}
+
+/**
+ * Put the footage in Storage, then record it on the production.
+ *
+ * `upsert: false` so a key collision is an error rather than a silent
+ * overwrite; with a timestamp in the key it should never happen, and if it does
+ * the right answer is to hear about it.
+ */
+export function useAttachSourceVideo() {
+  return useScriptMutation(async ({ productionId, file }: AttachSourceVideoInput) => {
+    if (!(SOURCE_VIDEO_TYPES as readonly string[]).includes(file.type)) {
+      throw new Error(
+        `${file.type || 'That file'} is not a video this pipeline accepts. Upload an MP4, a QuickTime .mov or a WebM.`,
+      );
+    }
+    if (file.size > SOURCE_VIDEO_MAX_BYTES) {
+      throw new Error(
+        `That file is ${Math.round(file.size / 1024 / 1024)} MB. The limit is ${SOURCE_VIDEO_MAX_BYTES / 1024 / 1024} MB.`,
+      );
+    }
+
+    const key = sourceVideoKey(productionId, file.name);
+    const { error: uploadError } = await supabase.storage
+      .from(RENDERS_BUCKET)
+      .upload(key, file, { contentType: file.type, upsert: false });
+    if (uploadError) throw toError(uploadError);
+
+    const { data, error } = await supabase.rpc('attach_source_video', {
+      p_production_id: productionId,
+      p_key: key,
+      p_name: file.name,
+      p_bytes: file.size,
+    });
+    if (error) throw toError(error);
+    return data;
+  });
+}
+
+/**
+ * Detach the footage.
+ *
+ * The row is cleared and the object is left where it is. Deleting it is a
+ * second call the owner's policy also admits, but it is not done here: the
+ * footage may be the subject of a consent record on an earlier event row, and
+ * a detach is usually "I picked the wrong file", not "destroy this".
+ */
+export function useClearSourceVideo() {
+  return useScriptMutation(async ({ productionId }: ControlInput) => {
+    const { data, error } = await supabase.rpc('clear_source_video', {
+      p_production_id: productionId,
+    });
+    if (error) throw toError(error);
+    return data;
+  });
+}
+
+export interface SaveRenderInstructionInput {
+  productionId: string;
+  instruction: string;
+}
+
+/** Persist what the model is told to do with the footage. An edit un-approves. */
+export function useSaveRenderInstruction() {
+  return useScriptMutation(async ({ productionId, instruction }: SaveRenderInstructionInput) => {
+    const { data, error } = await supabase.rpc('save_render_instruction', {
+      p_production_id: productionId,
+      p_instruction: instruction,
+    });
+    if (error) throw toError(error);
+    return data;
+  });
+}
+
+export interface ConfirmSourceConsentInput {
+  productionId: string;
+  note: string;
+}
+
+/**
+ * Record that the people in the footage agreed to this use.
+ *
+ * A separate action from approving, because it is a different kind of claim:
+ * approval says "render this" and can be undone by an edit, while this is a
+ * statement about the world that is answered for later. Hence a note rather
+ * than a checkbox — and the note has a minimum length in SQL.
+ */
+export function useConfirmSourceConsent() {
+  return useScriptMutation(async ({ productionId, note }: ConfirmSourceConsentInput) => {
+    const { data, error } = await supabase.rpc('confirm_source_consent', {
+      p_production_id: productionId,
+      p_note: note,
     });
     if (error) throw toError(error);
     return data;

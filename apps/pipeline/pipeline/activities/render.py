@@ -35,8 +35,27 @@ MPT = "mpt"                  # MoneyPrinterTurbo does everything
 FAL_VISUALS = "fal_visuals"  # fal generates clips, MPT assembles them
 FAL_FULL = "fal_full"        # fal generates visuals and voice, we assemble
 HEYGEN = "heygen"            # HeyGen delivers a finished presenter reel
+FAL_VIDEO = "fal_video"      # fal transforms footage the owner uploaded
 
-FAL_MODES = (FAL_VISUALS, FAL_FULL)
+FAL_MODES = (FAL_VISUALS, FAL_FULL, FAL_VIDEO)
+
+# Modes whose input is a file rather than text. These need three things on the
+# row before a cent may be spent -- footage, an instruction, and a consent
+# record -- and `_missing_source_input` is the one place that says which.
+SOURCE_MODES = (FAL_VIDEO,)
+
+# The longest instruction sent to a model. The database caps the column at the
+# same number, so this only ever bites if the two drift apart.
+MAX_INSTRUCTION_CHARS = 1500
+
+# Lanes the quality check must not count cuts against.
+#
+# A presenter reel is one continuous shot by design. The source lane's cutting
+# is whatever the owner uploaded, and a single-take piece to camera is a
+# perfectly good source video -- so warning that it has no cuts would be
+# reporting on their footage rather than on our render. Frozen fraction still
+# applies to both: a render that stalled looks like a still either way.
+NO_CUTS_EXPECTED = (HEYGEN, FAL_VIDEO)
 
 
 def _phase_for(mode: str) -> str:
@@ -89,6 +108,26 @@ def submit_render(
             "no render was submitted: the script is approved but empty.",
         )
 
+    # The source lane's inputs and its configuration, both checked here rather
+    # than in `_submit_fal_video`.
+    #
+    # The inputs are restated locally for exactly the reason the script check
+    # above is: `approve_script` refuses to open the gate without them and
+    # `productions_source_lane_is_ready` refuses the `task_id` write underneath
+    # it, so in a correct system this is unreachable -- and reaching it would
+    # mean paying to transform footage nobody attached.
+    #
+    # The *configuration* is checked here because of where the claim is taken.
+    # A few lines below, `claim_render_slot` sets `task_id`, and that is
+    # irreversible in practice: a row that parks holding one can never have its
+    # script or its footage edited again, so a mistyped setting would strand the
+    # production rather than stop it. Parking before the claim leaves it
+    # retryable, which is the correct outcome for a fault a person can fix.
+    if mode in SOURCE_MODES:
+        problem = _missing_source_input(production) or _source_lane_config_problem(preset)
+        if problem:
+            return _fail(supa, production_id, f"no render was submitted: {problem}")
+
     task_id = production_id
 
     # Claim the right to submit. Only one caller can win, so a duplicated
@@ -112,6 +151,9 @@ def submit_render(
         }
 
     supa.update_production(production_id, render_backend=mode)
+
+    if mode == FAL_VIDEO:
+        return _submit_fal_video(production_id, production, preset, supa)
 
     if mode in FAL_MODES:
         return _submit_fal(production_id, idea, preset, mode, supa, script)
@@ -226,6 +268,168 @@ def _submit_fal(
     return {
         "production_id": production_id,
         "backend": mode,
+        "phase": "fal",
+        "task_id": production_id,
+        "fal_model": model,
+        "fal_request_id": handles["request_id"],
+        "fal_status_url": handles["status_url"],
+        "fal_response_url": handles["response_url"],
+        "started_at": time.time(),
+        "polls": 0,
+    }
+
+
+def _missing_source_input(production: dict[str, Any]) -> str | None:
+    """Which of the source lane's three inputs is absent, in words.
+
+    One function so that the pipeline, `approve_script` and the review screen
+    are all answering the same question in the same order -- an owner told
+    "upload a video" who then gets told "write an instruction" is being walked
+    through a checklist, which is the point.
+    """
+    if not (production.get("source_video_key") or "").strip():
+        return "this style renders from uploaded footage, and none is attached."
+    if not (production.get("render_instruction") or "").strip():
+        return "footage is attached but no instruction says what to do with it."
+    if not production.get("source_consent_at"):
+        return "no consent has been recorded for the people in the uploaded footage."
+    return None
+
+
+def _source_lane_config_problem(preset: dict[str, Any]) -> str | None:
+    """Anything about this lane's setup that would fail the submit, in words.
+
+    Separate from the inputs because it is a different kind of fault -- the
+    owner supplied everything and an operator did not -- but it is checked in
+    the same place and for the same reason: before the claim, so the production
+    parks retryable rather than stranded.
+    """
+    model = ((preset.get("params") or {}).get("fal") or {}).get("model")
+    if not model:
+        return (
+            f"the style preset {preset.get('slug')!r} renders from uploaded footage "
+            f"but names no params.fal.model."
+        )
+
+    conf = settings()
+    ttl = int(conf.source_video_url_ttl_seconds)
+    budget = int(conf.fal_poll_budget_seconds)
+    if ttl <= budget:
+        return (
+            f"SOURCE_VIDEO_URL_TTL_SECONDS is {ttl}s, which does not outlive the "
+            f"{budget}s fal poll budget. The provider fetches the upload when the job "
+            f"leaves the queue, so the signed URL must outlive the whole render."
+        )
+    return None
+
+
+def _fal_video_payload(cfg: dict[str, Any], url: str, instruction: str) -> dict[str, Any]:
+    """The request body, built from the preset and the two things the owner gave.
+
+    Split out from the submit so that everything which can raise on a malformed
+    preset -- `float()`, `int()` -- happens in the block that releases the claim
+    rather than in the one that keeps it.
+    """
+    payload: dict[str, Any] = {
+        "video_url": url,
+        "prompt": instruction.strip()[:MAX_INSTRUCTION_CHARS],
+    }
+    # Asked for explicitly, because the quality check *fails* a render that is
+    # not 9:16 and the source here is whatever the owner had on their phone. A
+    # model that honours this turns a landscape upload into a publishable reel;
+    # one that ignores it produces a landscape render that arrives at Gate 2
+    # flagged, which is the honest outcome but a paid one. The plainest fix is
+    # upstream of all of this -- the panel says portrait works best.
+    if cfg.get("aspect_ratio"):
+        payload["aspect_ratio"] = cfg["aspect_ratio"]
+    if cfg.get("resolution"):
+        payload["resolution"] = cfg["resolution"]
+    if cfg.get("strength") is not None:
+        payload["strength"] = float(cfg["strength"])
+    if cfg.get("fps"):
+        payload["fps"] = int(cfg["fps"])
+    # A ceiling on the bill as much as on the runtime, and the only one there
+    # is: the rate is per second of output, and on this lane the length comes
+    # from a file the owner chose rather than from a preset. Models that ignore
+    # the field follow the upload instead, so this is a request and not yet a
+    # cap -- which is one of the two reasons the preset ships inactive.
+    if cfg.get("max_duration_seconds"):
+        payload["duration"] = int(cfg["max_duration_seconds"])
+    return payload
+
+
+def _submit_fal_video(
+    production_id: str,
+    production: dict[str, Any],
+    preset: dict[str, Any],
+    supa: Supa,
+    fal: FalClient | None = None,
+) -> dict[str, Any]:
+    """Ask fal to make a new video out of one the owner uploaded.
+
+    The instruction is the prompt, verbatim. That is the whole reason it is held
+    to the script gate: on this lane the words a person approved are not
+    narration, they are the thing the model is told to do, and nothing else in
+    the request is a human decision.
+
+    Everything that could *refuse* this submit has already been checked by
+    `submit_render`, before the render claim was taken. That ordering is not
+    tidiness: `task_id` cannot be unset by anything an owner can reach, so a row
+    that parks holding one can never have its script or its footage edited
+    again. It is stranded rather than retryable.
+
+    The two blocks below divide on exactly that line, and the division is the
+    most important thing in this function:
+
+      * **Before `fal.submit`** nothing has been billed, so a failure releases
+        the claim and the production is picked up again. Minting the signed URL
+        is a Supabase Storage call and Storage can be down; a blip there is not
+        in `submit_render`'s retry list, so without this it would strand the row.
+      * **At `fal.submit`** it has, or may have. fal has no idempotency key --
+        `docs/GAPS.md` B6 -- so an ambiguous failure must not become a second
+        billed generation. The claim is kept and the production parks. Being
+        uneditable afterwards is the correct outcome there: a render may exist
+        that was paid for against exactly this footage and these words.
+
+    Note what a resubmit here would *not* cost, against what B6 feared: the
+    owner's file is already in our bucket, put there by their own browser before
+    the gate, so nothing is re-uploaded. Only the generation is at stake.
+    """
+    fal = fal or FalClient()
+
+    # Both already checked by `submit_render`, before the claim, so neither of
+    # these raises on the real path. They are kept because this function is also
+    # the unit under test, and because a raise here would strand a claimed row.
+    problem = _missing_source_input(production) or _source_lane_config_problem(preset)
+    if problem:
+        raise ValueError(f"cannot submit a footage render: {problem}")
+
+    cfg = (preset.get("params") or {}).get("fal") or {}
+    model = cfg["model"]
+
+    try:
+        url = supa.signed_render_url(
+            production["source_video_key"],
+            expires_in=int(settings().source_video_url_ttl_seconds),
+        )
+        payload = _fal_video_payload(cfg, url, production.get("render_instruction") or "")
+    except Exception:
+        # Nothing billed yet. Releasing the claim is what keeps this a fault a
+        # person can retry rather than a production nobody can touch.
+        supa.update_production(production_id, task_id=None, status=ProductionStatus.QUEUED.value)
+        raise
+
+    try:
+        handles = fal.submit(model, payload)
+    except FalRefused as exc:
+        # A refusal is about the footage or the instruction, not a fault. It
+        # parks, and it must never be retried or routed to another backend.
+        return _fail(supa, production_id, f"fal declined this footage or instruction: {exc}")
+
+    supa.update_production(production_id, stage=f"fal transforming your footage ({model})")
+    return {
+        "production_id": production_id,
+        "backend": FAL_VIDEO,
         "phase": "fal",
         "task_id": production_id,
         "fal_model": model,
@@ -504,8 +708,10 @@ def _poll_fal(
     if not urls:
         return _fail(supa, production_id, f"fal reported success but returned no video: {result}")
 
-    if backend == FAL_FULL:
-        # Nothing else to do on fal's side; assembly happens where ffmpeg is.
+    if backend in (FAL_FULL, FAL_VIDEO):
+        # Neither hands anything to MoneyPrinterTurbo. `fal_full` still has
+        # assembly ahead of it, in `_assemble_fal_full`; `fal_video` has none at
+        # all, because what fal returned is the reel.
         supa.update_production(production_id, stage="fal generated")
         return {
             **carry,
@@ -723,6 +929,18 @@ def fetch_and_qc(
             # clips and speech, and everything MPT would have done has to
             # happen here.
             local, has_subtitles = _assemble_fal_full(event, supa, Path(tmp))
+        elif backend == FAL_VIDEO:
+            # The one lane with nothing to assemble and nothing to voice. The
+            # model was given a finished video and an instruction, and what it
+            # returned is a finished video -- so this only moves bytes, exactly
+            # as the presenter lane does. fal's media URLs expire, which is why
+            # it happens now rather than later.
+            #
+            # `has_subtitles` stays false, and that is honest rather than a gap:
+            # nothing in this lane produces a caption track, so the quality
+            # report says captions are missing and the reviewer decides at Gate
+            # 2. Claiming otherwise would make the report lie about a real reel.
+            local = FalClient().download(video_ref, Path(tmp) / "final.mp4")
         else:
             # Both the pure-MPT path and the visuals path converge here: the
             # visuals path's finished file is an ordinary MPT render.
@@ -756,10 +974,7 @@ def fetch_and_qc(
         scene_changes=cuts,
         mean_volume_db=volume,
         has_subtitles=has_subtitles,
-        # A presenter reel is one continuous shot by design, so counting cuts
-        # against it would warn on every video in the lane. Frozen fraction
-        # still applies: an avatar render that stalled looks like a still.
-        expect_cuts=backend != HEYGEN,
+        expect_cuts=backend not in NO_CUTS_EXPECTED,
     )
 
     supa.update_production(
