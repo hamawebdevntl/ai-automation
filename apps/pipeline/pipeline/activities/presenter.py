@@ -34,7 +34,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from pipeline.clients.heygen import HeyGenClient, HeyGenError, HeyGenRejected
+from pipeline.clients.heygen import MAX_LOOKS_PAGE, HeyGenClient, HeyGenError, HeyGenRejected
 from pipeline.clients.supa import Supa
 
 log = logging.getLogger(__name__)
@@ -50,6 +50,15 @@ REFRESH_AFTER_SECONDS = 6 * 60 * 60
 # saying `running` for ever, which shows in Settings as a refresh that never
 # ends. Generous against a slow HeyGen, short against an owner waiting.
 STALE_CLAIM_SECONDS = 15 * 60
+
+# How long to wait before trying again after a refresh that failed outright,
+# and after one that left a voice unresolved. Both exist to bound a retry that
+# would otherwise be every tick: a rejected key and a voice HeyGen would not
+# answer about are each permanent until someone changes something, and hammering
+# a rate-limited API for either helps nobody. The Refresh button is the way to
+# retry sooner, and it does not wait for these.
+FAILED_RETRY_SECONDS = 15 * 60
+PENDING_RETRY_SECONDS = 5 * 60
 
 # HeyGen names its avatar engines in roman numerals -- avatar_iii, avatar_iv,
 # avatar_v -- and they turn up in different fields on different endpoints
@@ -77,23 +86,33 @@ def _strings(payload: Any) -> list[str]:
     return []
 
 
-def _number(payload: Any, key: str) -> float | None:
-    """The first numeric `key` at any depth. Same shape as the live test's
-    wallet lookup, and for the same reason: a nested response is not a contract
-    we control."""
+def _dimensions(payload: Any) -> tuple[float, float] | None:
+    """The first width/height pair found on one object, at any depth.
+
+    Both from the *same* object on purpose. Searching for each independently
+    finds them in different nested places -- a preview thumbnail's width beside
+    a source frame's height -- and the ratio of two unrelated numbers is not an
+    orientation. A pair that cannot be found together is no answer at all,
+    which is what `unknown` is for.
+    """
     if isinstance(payload, dict):
-        for k, v in payload.items():
-            if k == key and isinstance(v, (int, float)) and not isinstance(v, bool):
-                return float(v)
-            found = _number(v, key)
+        width, height = payload.get("width"), payload.get("height")
+        if _is_number(width) and _is_number(height):
+            return float(width), float(height)
+        for value in payload.values():
+            found = _dimensions(value)
             if found is not None:
                 return found
     elif isinstance(payload, list):
         for item in payload:
-            found = _number(item, key)
+            found = _dimensions(item)
             if found is not None:
                 return found
     return None
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def engines_of(look: dict[str, Any]) -> list[str]:
@@ -121,7 +140,10 @@ def orientation_of(look: dict[str, Any]) -> str:
     if stated in _ORIENTATIONS:
         return stated
 
-    width, height = _number(look, "width"), _number(look, "height")
+    size = _dimensions(look)
+    if size is None:
+        return "unknown"
+    width, height = size
     if not width or not height:
         return "unknown"
     if width == height:
@@ -188,15 +210,20 @@ def refresh_catalogue(supa: Supa | None = None, heygen: HeyGenClient | None = No
 
     heygen = heygen or HeyGenClient()
     try:
-        looks = [row for row in (look_row(item) for item in heygen.looks()) if row]
+        answer = heygen.looks()
     except HeyGenError as exc:
         # Recorded on the row rather than only in the log: the person who
         # pressed the button is looking at a page, not at CloudWatch, and "the
         # key is unauthorised" is a sentence they can act on.
-        supa.finish_heygen_catalogue(status="failed", error=str(exc)[:500])
+        supa.finish_heygen_catalogue(read=False, status="failed", error=str(exc)[:500])
         return {"error": str(exc)[:200]}
 
-    supa.replace_heygen_looks(looks)
+    looks = [row for row in (look_row(item) for item in answer) if row]
+    # A full page means the endpoint may have had more to say: `limit` caps at
+    # 50 and this is one request, so a full page is a page rather than a list.
+    # Nothing is deleted on one -- see `replace_heygen_looks`.
+    complete = len(answer) < MAX_LOOKS_PAGE
+    supa.replace_heygen_looks(looks, complete=complete)
 
     # Every id we hold an answer for, re-asked. There are a handful of these --
     # the preset's narrator, plus whatever the owner has tried -- and a voice
@@ -224,8 +251,8 @@ def refresh_catalogue(supa: Supa | None = None, heygen: HeyGenClient | None = No
             # into one the picker refuses to save.
             log.warning("could not resolve HeyGen voice %s: %s", voice_id, exc)
 
-    supa.finish_heygen_catalogue(status="idle", looks=len(looks), voices=resolved)
-    return {"looks": len(looks), "voices": resolved, "unknown": unknown}
+    supa.finish_heygen_catalogue(read=True, status="idle", looks=len(looks), voices=resolved, error=None)
+    return {"looks": len(looks), "voices": resolved, "unknown": unknown, "complete": complete}
 
 
 def _due(state: dict[str, Any] | None, pending: int) -> bool:
@@ -238,12 +265,28 @@ def _due(state: dict[str, Any] | None, pending: int) -> bool:
         # No row means the migration has not run here. Refreshing would write
         # to tables that do not exist; the sweep stays quiet instead.
         return False
-    if state.get("status") == "running":
+    status = state.get("status")
+    if status == "running":
         # Only if the worker holding it has plainly gone. `claim_heygen_catalogue`
         # applies the same cutoff, so the two cannot disagree about whose it is.
         return _older_than(state.get("started_at"), STALE_CLAIM_SECONDS)
-    if state.get("status") == "requested" or pending:
+    if status == "requested":
+        # Someone pressed Refresh, or added a voice. Answered on the next tick.
         return True
+    if status == "failed":
+        # A key that was rejected will be rejected again, so this backs off
+        # rather than retrying every minute for as long as it stays wrong.
+        # `refreshed_at` is deliberately not what is measured: a failed refresh
+        # read nothing, and stamping it would both silence this retry and have
+        # the settings page claim the account was read at the moment it was not.
+        return _older_than(state.get("started_at"), FAILED_RETRY_SECONDS)
+    if pending:
+        # A voice waiting for its first answer, on a slower clock than the
+        # request that created it. `request_heygen_voice` sets `requested`, so
+        # a new id is picked up at once by the branch above; this is only the
+        # net for one whose answer was lost to a transient failure, and without
+        # the window it would re-walk the whole catalogue every single tick.
+        return _older_than(state.get("refreshed_at"), PENDING_RETRY_SECONDS)
     return _older_than(state.get("refreshed_at"), REFRESH_AFTER_SECONDS)
 
 

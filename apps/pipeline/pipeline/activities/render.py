@@ -348,15 +348,27 @@ def _presenter_config(idea: dict[str, Any], preset: dict[str, Any]) -> dict[str,
     no voice keeps the preset's narrator rather than falling back to HeyGen's
     default for that avatar, which would make the narrator a property of
     HeyGen's catalogue exactly as sending no `voice_id` does.
+
+    The exception is `engine`, which belongs to the avatar rather than standing
+    beside it. An override that names a look advertising Avatar IV carries no
+    engine at all -- omitting the key is what selects it -- and merging that
+    against a preset naming `avatar_iii` would submit a pair no validation ever
+    saw, failing terminally on an engine the new look never claimed. So an
+    override naming an avatar replaces the engine outright, present or absent.
     """
     cfg = dict((preset.get("params") or {}).get("heygen") or {})
     override = idea.get("presenter_override") or {}
     if not isinstance(override, dict):
         return cfg
-    for key in PRESENTER_KEYS:
-        value = override.get(key)
-        if value:
-            cfg[key] = value
+    if override.get("avatar_id"):
+        cfg["avatar_id"] = override["avatar_id"]
+        engine = override.get("engine")
+        if engine:
+            cfg["engine"] = engine
+        else:
+            cfg.pop("engine", None)
+    if override.get("voice_id"):
+        cfg["voice_id"] = override["voice_id"]
     return cfg
 
 

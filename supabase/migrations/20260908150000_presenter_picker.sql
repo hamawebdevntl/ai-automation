@@ -26,9 +26,11 @@
 --   * Engine. Omitting `engine` selects Avatar IV; a look that advertises
 --     `avatar_iii` only fails on an engine it never claimed to support.
 --
--- Orientation is a warning -- a landscape look with `fit: cover` is a
--- deliberate choice someone may want. An engine the look does not advertise is
--- refused outright, because there is no configuration in which it works.
+-- Orientation is a warning rather than a refusal, because the crop is a
+-- picture, not a failure: a head-and-shoulders landscape look can crop to a
+-- perfectly usable 9:16, and the lane renders it either way. What must not
+-- happen is choosing it without knowing. An engine the look does not advertise
+-- is refused outright, because there is no configuration in which it works.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------

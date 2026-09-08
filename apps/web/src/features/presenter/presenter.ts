@@ -47,9 +47,9 @@ const ORIENTATION_WARNINGS: Partial<Record<LookOrientation, string>> = {
 /**
  * The sentence to show beside a look, or null when there is nothing to say.
  *
- * A warning rather than a refusal: a landscape look with `fit: cover` is a
- * choice someone may want, and the lane supports it. What is not acceptable is
- * making it silently.
+ * A warning rather than a refusal: the crop is a picture, not a failure, and
+ * a head-and-shoulders landscape look can crop to a perfectly usable 9:16.
+ * What is not acceptable is choosing it without knowing.
  */
 export function orientationWarning(look: HeyGenLookRow): string | null {
   return ORIENTATION_WARNINGS[look.orientation] ?? null;

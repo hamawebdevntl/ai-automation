@@ -1,4 +1,5 @@
 import { queryOptions, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useEffect } from 'react';
 import { queueKeys } from '@/features/queue/api';
 import type { HeyGenCatalogueRow, HeyGenLookRow, HeyGenVoiceRow, StylePresetRow } from '@/lib/database.types';
 import { isCatalogueRefreshing } from '@/lib/database.types';
@@ -22,12 +23,27 @@ export const presenterKeys = {
  */
 const REFRESHING_POLL_MS = 3000;
 
+/**
+ * The bundle and the database are deployed separately, so a build can reach a
+ * schema that has not had this migration applied yet. `42P01` is the missing
+ * table, and the honest answer to "which looks can this account use?" against a
+ * schema that cannot hold one is "none cached" — which the picker already says
+ * well — rather than a red banner over a settings page that otherwise works.
+ * The same fallback `trends/api.ts` makes for `trend_settings`.
+ */
+function isMissingSchema(code: string | undefined): boolean {
+  return code === '42P01' || code === '42703';
+}
+
 export function looksQueryOptions() {
   return queryOptions({
     queryKey: presenterKeys.looks(),
     queryFn: async (): Promise<HeyGenLookRow[]> => {
       const { data, error } = await supabase.from('heygen_looks').select('*');
-      if (error) throw toError(error);
+      if (error) {
+        if (isMissingSchema(error.code)) return [];
+        throw toError(error);
+      }
       return data ?? [];
     },
   });
@@ -41,7 +57,10 @@ export function voicesQueryOptions() {
         .from('heygen_voices')
         .select('*')
         .order('requested_at', { ascending: false });
-      if (error) throw toError(error);
+      if (error) {
+        if (isMissingSchema(error.code)) return [];
+        throw toError(error);
+      }
       return data ?? [];
     },
   });
@@ -59,7 +78,10 @@ export function catalogueQueryOptions() {
     queryKey: presenterKeys.catalogue(),
     queryFn: async (): Promise<HeyGenCatalogueRow | null> => {
       const { data, error } = await supabase.from('heygen_catalogue').select('*').limit(1).maybeSingle();
-      if (error) throw toError(error);
+      if (error) {
+        if (isMissingSchema(error.code)) return null;
+        throw toError(error);
+      }
       return data;
     },
     refetchInterval: (query) => (isCatalogueRefreshing(query.state.data ?? null) ? REFRESHING_POLL_MS : false),
@@ -106,6 +128,24 @@ export function useRequestVoice() {
       void queryClient.invalidateQueries({ queryKey: presenterKeys.catalogue() });
     },
   });
+}
+
+/**
+ * Refetch the caches whenever a refresh finishes.
+ *
+ * Only the sync row polls, and only while it says something is happening — so
+ * without this the moment it stops is the moment nothing looks again, and the
+ * empty state's promise that "this page updates on its own" is not kept. There
+ * is no realtime subscription to lean on: three tables change together, and the
+ * one row that says when they did is already being watched.
+ */
+export function useCatalogueSync(refreshedAt: string | null | undefined) {
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    if (!refreshedAt) return;
+    void queryClient.invalidateQueries({ queryKey: presenterKeys.looks() });
+    void queryClient.invalidateQueries({ queryKey: presenterKeys.voices() });
+  }, [refreshedAt, queryClient]);
 }
 
 export interface SetPresetPresenterInput {

@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import { look, voice } from '@/features/presenter/test-fixtures';
 import {
   blockedReason,
   byUsability,
@@ -9,6 +8,7 @@ import {
   orientationWarning,
   toChoice,
 } from '@/features/presenter/presenter';
+import { look, voice } from '@/features/presenter/test-fixtures';
 
 /**
  * The two rules that decide whether a pick renders or parks.
@@ -66,9 +66,9 @@ describe('blockedReason', () => {
   it('holds a landscape look until the owner says they meant it', () => {
     const landscape = look({ orientation: 'landscape' });
     expect(blockedReason(landscape, voice(), false)).toMatch(/Confirm/);
-    // A refusal would be wrong: the lane supports `fit: cover`, and a
-    // landscape presenter is a choice someone may want. Making it silently is
-    // the thing that must not happen.
+    // A refusal would be wrong: the crop is a picture, not a failure, and a
+    // head-and-shoulders look can crop to a usable 9:16. Choosing it without
+    // knowing is the thing that must not happen.
     expect(blockedReason(landscape, voice(), true)).toBeNull();
   });
 

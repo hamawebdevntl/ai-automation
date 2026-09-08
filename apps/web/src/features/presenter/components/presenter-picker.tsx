@@ -13,6 +13,7 @@ import { Spinner } from '@/components/ui/spinner';
 import {
   catalogueQueryOptions,
   looksQueryOptions,
+  useCatalogueSync,
   useRefreshCatalogue,
   useRequestVoice,
   voicesQueryOptions,
@@ -65,6 +66,10 @@ export function PresenterPicker({
   const catalogue = catalogueQuery.data ?? null;
   const refreshing = isCatalogueRefreshing(catalogue);
 
+  // The looks and voices do not poll; the one row that says when they last
+  // changed does. This is what turns that into a refetch.
+  useCatalogueSync(catalogue?.refreshed_at);
+
   const selectedLook = looks.find((look) => look.avatar_id === value.avatarId) ?? null;
 
   if (looksQuery.error) return <QueryError error={looksQuery.error} />;
@@ -75,6 +80,10 @@ export function PresenterPicker({
         refreshing={refreshing}
         lastFilled={catalogue?.refreshed_at ?? null}
         error={catalogue?.error ?? null}
+        // A viewer may read the catalogue and may not refill it:
+        // `request_heygen_catalogue_refresh` raises 42501 for one, and a button
+        // that is enabled only to fail is worse than one that is not there.
+        disabled={disabled}
       />
 
       {looksQuery.isPending ? (
@@ -122,10 +131,12 @@ function CatalogueHeader({
   refreshing,
   lastFilled,
   error,
+  disabled,
 }: {
   refreshing: boolean;
   lastFilled: string | null;
   error: string | null;
+  disabled?: boolean;
 }) {
   const refresh = useRefreshCatalogue();
 
@@ -143,7 +154,7 @@ function CatalogueHeader({
           type="button"
           variant="outline"
           size="sm"
-          disabled={refreshing || refresh.isPending}
+          disabled={disabled || refreshing || refresh.isPending}
           onClick={async () => {
             try {
               await refresh.mutateAsync();
@@ -254,9 +265,9 @@ function LookConsequences({
       <AlertTitle>{look.name ?? look.avatar_id}</AlertTitle>
       <AlertDescription className="space-y-3">
         <p>{warning}</p>
-        {/* A refusal would be wrong: the lane supports `fit: cover`, and a
-            landscape look is a choice someone may want. Making it silently is
-            what must not happen. */}
+        {/* A refusal would be wrong: the crop is a picture, not a failure,
+            and a head-and-shoulders look can crop to a usable 9:16. Choosing
+            it without knowing is what must not happen. */}
         {needsConfirmation(look) && (
           <div className="flex items-start gap-2">
             <Checkbox

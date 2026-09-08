@@ -100,11 +100,17 @@ export function PresenterSettingsCard() {
             <Button type="button" onClick={onSave} disabled={!dirty || save.isPending || Boolean(blocked)}>
               {save.isPending ? 'Saving…' : 'Save as the default'}
             </Button>
-            {blocked ? (
-              <span className="text-xs text-destructive">{blocked}</span>
-            ) : (
-              dirty && <span className="text-xs text-muted-foreground">Unsaved changes</span>
-            )}
+            {/* Only while there is something to save. A successful save
+                re-seeds the draft from the preset, which resets the landscape
+                consent — and a red "confirm this first" under a disabled
+                button, seconds after the save it is describing, reads as a
+                failure rather than as a finished job. */}
+            {dirty &&
+              (blocked ? (
+                <span className="text-xs text-destructive">{blocked}</span>
+              ) : (
+                <span className="text-xs text-muted-foreground">Unsaved changes</span>
+              ))}
           </div>
         )}
 

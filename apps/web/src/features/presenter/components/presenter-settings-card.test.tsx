@@ -45,6 +45,9 @@ vi.mock('@/features/presenter/api', () => ({
   looksQueryOptions: () => ({ queryKey: ['presenter', 'looks'], queryFn: async () => looks }),
   voicesQueryOptions: () => ({ queryKey: ['presenter', 'voices'], queryFn: async () => voices }),
   catalogueQueryOptions: () => ({ queryKey: ['presenter', 'catalogue'], queryFn: async () => catalogue }),
+  // A no-op here: it exists to refetch the caches when a refresh lands, and
+  // these fixtures are already whatever the refetch would return.
+  useCatalogueSync: () => {},
   useSetPresetPresenter: () => ({ mutateAsync: save, isPending: false }),
   useRefreshCatalogue: () => ({ mutateAsync: refresh, isPending: false }),
   useRequestVoice: () => ({ mutateAsync: requestVoice, isPending: false }),
@@ -73,6 +76,10 @@ const VOICE = voice({ voice_id: 'v-ok' });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Restated rather than left to `clearAllMocks`, which clears calls and not
+  // implementations: without this the viewer test below leaks a disabled
+  // picker into every test that runs after it.
+  mockOwner.mockReturnValue({ isOwner: true, isLoading: false, role: 'owner', displayName: null });
   looks = [PORTRAIT, LANDSCAPE, STUDIO];
   voices = [VOICE];
   catalogue = {
@@ -122,8 +129,8 @@ describe('PresenterSettingsCard', () => {
     expect(saveButton).toBeDisabled();
     expect(screen.getByText(/Confirm you want a landscape look/)).toBeInTheDocument();
 
-    // A refusal would be wrong -- the lane supports `fit: cover` -- so the
-    // consent is what unlocks it, not a second opinion about the look.
+    // A refusal would be wrong -- the crop is a picture, not a failure -- so
+    // the consent is what unlocks it, not a second opinion about the look.
     await user.click(screen.getByRole('checkbox', { name: /Use it anyway/ }));
     expect(saveButton).toBeEnabled();
   });
@@ -200,5 +207,28 @@ describe('PresenterSettingsCard', () => {
 
     expect(await screen.findByText(/Only an owner can change it/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Save as the default/ })).not.toBeInTheDocument();
+    // Including the one button that is not a save. Refreshing the catalogue is
+    // owner-gated in SQL too, and a button enabled only to come back with
+    // 42501 is worse than one that is plainly unavailable.
+    expect(screen.getByRole('button', { name: /Refresh/ })).toBeDisabled();
+  });
+
+  it('stops saying "confirm this first" once the save has happened', async () => {
+    const user = userEvent.setup();
+    render(<PresenterSettingsCard />, { wrapper });
+
+    await user.click(await screen.findByRole('button', { name: /Marcus/ }));
+    await user.click(screen.getByRole('button', { name: /Nadia \(calm\)/ }));
+    await user.click(screen.getByRole('checkbox', { name: /Use it anyway/ }));
+    expect(screen.getByRole('button', { name: /Save as the default/ })).toBeEnabled();
+
+    // The preset now names what was just saved, which re-seeds the draft and
+    // resets the consent. Red text under a disabled button, seconds after the
+    // save it is describing, reads as a failure rather than a finished job.
+    presets = [presenterPreset({ params: { heygen: { avatar_id: 'landscape-1', voice_id: 'v-ok' } } })];
+    await user.click(screen.getByRole('button', { name: /Save as the default/ }));
+
+    expect(save).toHaveBeenCalled();
+    expect(screen.queryByText(/Confirm you want a landscape look/)).not.toBeInTheDocument();
   });
 });

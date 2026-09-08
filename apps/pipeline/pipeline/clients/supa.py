@@ -790,7 +790,7 @@ class Supa:
     #
     # The app cannot call HeyGen -- it is a static bundle holding no secrets --
     # so the picker in Settings reads two tables the worker fills. See
-    # `activities/presenter.py` for what fills them and the 20260908130000
+    # `activities/presenter.py` for what fills them and the 20260908150000
     # migration for why they exist at all.
 
     def heygen_catalogue(self) -> dict[str, Any] | None:
@@ -833,26 +833,35 @@ class Supa:
         )
         return bool(res.data)
 
-    def finish_heygen_catalogue(self, **fields: Any) -> None:
+    def finish_heygen_catalogue(self, *, read: bool, **fields: Any) -> None:
         """Record how the refresh went. Never raises.
 
         Called from the failure path as well as the success one, where the
         interesting error is the one being handled: losing it to a secondary
         failure writing this row would leave the settings page saying
         "refreshing" for ever with no explanation anywhere.
+
+        `read` is whether the account was actually read. Only then is
+        `refreshed_at` stamped -- it is what the settings page shows as "read
+        from HeyGen <when>", and a refresh that got a 401 read nothing. It is
+        also what the six-hourly refill is measured against, so stamping it on
+        a failure would silence the retry as well as lie about it.
         """
+        patch = dict(fields)
+        if read:
+            patch["refreshed_at"] = _now_iso()
         try:
             (
                 self._c.table("heygen_catalogue")
-                .update({"refreshed_at": _now_iso(), **fields})
+                .update(patch)
                 .eq("status", "running")
                 .execute()
             )
         except Exception as exc:  # noqa: BLE001 - see docstring
             log.warning("could not record the end of a HeyGen catalogue refresh: %s", exc)
 
-    def replace_heygen_looks(self, rows: list[dict[str, Any]]) -> None:
-        """Make the table say exactly what the account currently owns.
+    def replace_heygen_looks(self, rows: list[dict[str, Any]], *, complete: bool) -> None:
+        """Write what the account owns, and forget what it no longer does.
 
         The delete is the reason this is one method rather than an upsert at
         the call site: a look removed in HeyGen's own UI must stop being
@@ -860,14 +869,24 @@ class Supa:
         one an owner can pick and have park a production with
         `avatar_not_found`.
 
-        An empty response deletes nothing. `looks()` returns `[]` both for an
-        account with no avatars and for a response shape we failed to parse,
-        and emptying the picker on the second is worse than a stale row on the
-        first.
+        `complete` is whether the response was the whole account. It is not
+        always: `GET /v3/avatars/looks` caps `limit` at 50, so an account with
+        more looks than that hands back a page rather than a list, and deleting
+        everything outside it would throw away the rest -- including, on a bad
+        day, the avatar the preset itself names. A partial answer therefore
+        adds and updates without removing anything. A stale row an owner can be
+        warned about beats a working avatar that vanished from the picker.
+
+        An empty response deletes nothing either. `looks()` returns `[]` both
+        for an account with no avatars and for a response shape we failed to
+        parse, and emptying the picker on the second is worse than a stale row
+        on the first.
         """
         if not rows:
             return
         self._c.table("heygen_looks").upsert(rows, on_conflict="avatar_id").execute()
+        if not complete:
+            return
         keep = [row["avatar_id"] for row in rows]
         self._c.table("heygen_looks").delete().not_.in_("avatar_id", keep).execute()
 

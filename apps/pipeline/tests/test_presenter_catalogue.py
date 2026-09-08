@@ -53,6 +53,14 @@ class TestOrientation:
     def test_nested_dimensions_are_still_found(self):
         assert presenter.orientation_of({"size": {"width": 1920, "height": 1080}}) == "landscape"
 
+    def test_a_width_and_a_height_from_different_objects_are_not_a_ratio(self):
+        # A thumbnail's width beside a source frame's height is two unrelated
+        # numbers, and dividing them would report an orientation nobody stated
+        # -- suppressing the crop warning on a look that needs it, or raising
+        # one on a look that does not.
+        look = {"thumbnail": {"width": 320}, "source": {"height": 2752}}
+        assert presenter.orientation_of(look) == "unknown"
+
     def test_unknown_rather_than_a_guess(self):
         # 'unknown' shows in the picker as "orientation not reported", which is
         # honest. Defaulting to portrait would suppress the one warning that
@@ -123,9 +131,20 @@ class TestWhenARefreshIsDue:
     def test_a_request_from_the_app_is_honoured_at_once(self):
         assert presenter._due({"status": "requested", "refreshed_at": _iso(seconds=5)}, 0)
 
-    def test_a_voice_waiting_for_its_first_answer_is_enough(self):
-        # The owner is looking at "checking…" next to an id they just typed.
-        assert presenter._due({"status": "idle", "refreshed_at": _iso(seconds=5)}, 1)
+    def test_a_voice_still_waiting_is_retried_on_its_own_clock(self):
+        # `request_heygen_voice` sets `requested`, so a newly typed id is
+        # picked up by the branch above rather than by this one. This is only
+        # the net for an answer lost to a transient failure -- and without the
+        # window, one permanently unanswerable voice would re-walk the whole
+        # catalogue against a rate-limited API every single tick.
+        assert not presenter._due({"status": "idle", "refreshed_at": _iso(seconds=5)}, 1)
+        assert presenter._due({"status": "idle", "refreshed_at": _iso(minutes=6)}, 1)
+
+    def test_a_failed_refresh_backs_off_rather_than_retrying_every_minute(self):
+        # A rejected key will be rejected again. Refresh in Settings is the way
+        # to retry sooner, and it does not wait for this.
+        assert not presenter._due({"status": "failed", "started_at": _iso(minutes=2)}, 0)
+        assert presenter._due({"status": "failed", "started_at": _iso(minutes=20)}, 0)
 
     def test_a_fresh_cache_with_nothing_asking_is_left_alone(self):
         assert not presenter._due({"status": "idle", "refreshed_at": _iso(seconds=60)}, 0)
@@ -174,6 +193,7 @@ class FakeSupa:
         self._voices = voices
         self._claimed = claimed
         self.looks: list[dict[str, Any]] | None = None
+        self.deleted_missing: bool | None = None
         self.upserted: list[dict[str, Any]] = []
         self.finished: dict[str, Any] | None = None
 
@@ -186,8 +206,9 @@ class FakeSupa:
     def claim_heygen_catalogue(self, stale_after_seconds: int = 900) -> bool:
         return self._claimed
 
-    def replace_heygen_looks(self, rows):
+    def replace_heygen_looks(self, rows, *, complete):
         self.looks = rows
+        self.deleted_missing = complete
 
     def known_heygen_voices(self):
         return self._voices
@@ -195,8 +216,8 @@ class FakeSupa:
     def upsert_heygen_voice(self, row):
         self.upserted.append(row)
 
-    def finish_heygen_catalogue(self, **fields):
-        self.finished = fields
+    def finish_heygen_catalogue(self, *, read, **fields):
+        self.finished = {"read": read, **fields}
 
 
 @pytest.fixture
@@ -216,8 +237,8 @@ class TestRefresh:
         assert [row["avatar_id"] for row in supa.looks] == ["look-1"]
         assert supa.upserted[0]["status"] == "ok"
         assert supa.upserted[0]["name"] == "Anna's voice"
-        assert supa.finished == {"status": "idle", "looks": 1, "voices": 1}
-        assert result == {"looks": 1, "voices": 1, "unknown": 0}
+        assert supa.finished == {"read": True, "status": "idle", "looks": 1, "voices": 1, "error": None}
+        assert result == {"looks": 1, "voices": 1, "unknown": 0, "complete": True}
 
     def test_nothing_happens_when_nothing_is_asking(self):
         supa = FakeSupa({"status": "idle", "refreshed_at": _iso(seconds=30)}, ["v1"])
@@ -246,6 +267,31 @@ class TestRefresh:
         assert supa.finished["status"] == "failed"
         assert "unauthorized" in supa.finished["error"]
         assert supa.looks is None
+        # `refreshed_at` is not stamped: a refresh that got a 401 read nothing,
+        # and stamping it would both have the settings page claim the account
+        # was read and silence the retry that is measured against it.
+        assert supa.finished["read"] is False
+
+    def test_a_full_page_of_looks_adds_without_deleting(self, stale_state):
+        # `limit` caps at 50, so a full page is a page rather than a list. An
+        # account with 60 avatars must not lose 10 of them -- possibly
+        # including the one the preset names -- to a delete that assumed it had
+        # seen everything.
+        supa = FakeSupa(stale_state, [])
+        full = [{"id": f"look-{n}"} for n in range(50)]
+        result = presenter.refresh_catalogue(supa, FakeHeyGen(full, {}))
+
+        assert len(supa.looks) == 50
+        assert supa.deleted_missing is False
+        assert result["complete"] is False
+
+    def test_a_short_page_is_the_whole_account_and_removes_what_is_gone(self, stale_state):
+        # A look deleted in HeyGen's own UI must stop being offered: picking it
+        # parks a production with `avatar_not_found`, which is terminal.
+        supa = FakeSupa(stale_state, [])
+        presenter.refresh_catalogue(supa, FakeHeyGen([{"id": "look-1"}], {}))
+
+        assert supa.deleted_missing is True
 
     def test_one_unusable_voice_does_not_cost_the_others(self, stale_state):
         supa = FakeSupa(stale_state, ["gone", "v2"])
@@ -323,8 +369,32 @@ class TestPresenterConfig:
 
     def test_an_engine_only_arrives_when_the_override_names_one(self):
         assert "engine" not in _presenter_config({}, PRESET)
-        cfg = _presenter_config({"presenter_override": {"engine": "avatar_iii"}}, PRESET)
+        override = {"avatar_id": "studio", "engine": "avatar_iii"}
+        assert _presenter_config({"presenter_override": override}, PRESET)["engine"] == "avatar_iii"
+
+    def test_a_new_avatar_drops_the_presets_engine_rather_than_inheriting_it(self):
+        # The engine belongs to the avatar rather than standing beside it. An
+        # override naming a look that advertises Avatar IV carries no engine at
+        # all -- omitting the key is what selects it -- and keeping the
+        # preset's `avatar_iii` would submit a pair nothing validated, failing
+        # terminally on an engine the new look never claimed. This is the exact
+        # failure the picker exists to prevent, arriving by the back door.
+        preset = {
+            "slug": "ai-presenter",
+            "params": {"heygen": {"avatar_id": "studio", "voice_id": "v", "engine": "avatar_iii"}},
+        }
+        cfg = _presenter_config({"presenter_override": {"avatar_id": "modern"}}, preset)
+        assert cfg["avatar_id"] == "modern"
+        assert "engine" not in cfg
+
+    def test_a_voice_only_override_leaves_the_avatars_engine_alone(self):
+        preset = {
+            "slug": "ai-presenter",
+            "params": {"heygen": {"avatar_id": "studio", "voice_id": "v", "engine": "avatar_iii"}},
+        }
+        cfg = _presenter_config({"presenter_override": {"voice_id": "other"}}, preset)
         assert cfg["engine"] == "avatar_iii"
+        assert cfg["avatar_id"] == "studio"
 
 
 class TestPresenterRecord:
