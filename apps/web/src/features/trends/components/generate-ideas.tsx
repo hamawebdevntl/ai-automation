@@ -153,7 +153,7 @@ export function RunBanner({
   if (run.status === 'cancelled') return <Stopped run={run} />;
   if (run.status === 'failed') return <Failed run={run} onRetry={onRetry} />;
   if (run.status === 'succeeded' && isSearchRun(run)) {
-    if (run.interpretation === null) return <NotInterpreted run={run} />;
+    if (run.interpretation === null) return <NotInterpreted run={run} onRetry={onRetry} />;
     const outcome = searchOutcome(run);
     if (outcome === 'none') return <NothingRelevant run={run} onRefine={onRefine} />;
     if (outcome === 'few') return <FewRelevant run={run} onRefine={onRefine} />;

@@ -170,17 +170,37 @@ export function FewRelevant({ run, onRefine }: { run: SearchRun; onRefine?: (pro
  * restarted. The old worker claimed it, scouted the saved list, and whatever
  * it added answers a question nobody asked. Said plainly, because the ideas
  * below would otherwise look like the answer.
+ *
+ * It is about *that* run, and a finished run never changes -- so this stays
+ * on screen after the worker has been redeployed, until a new run replaces
+ * it. Saying so, and offering the new run as a button, is what stops a fixed
+ * deployment from looking like a broken one.
  */
-export function NotInterpreted({ run }: { run: SearchRun }) {
+export function NotInterpreted({ run, onRetry }: { run: SearchRun; onRetry?: (prompt: string) => void }) {
   return (
     <Alert variant="destructive">
       <CircleAlertIcon className="size-4" />
-      <AlertTitle>This search was not read as a search</AlertTitle>
+      <AlertTitle>That search was not read as a search</AlertTitle>
       <AlertDescription>
         <span>
-          It ran on a worker that predates searching by description, so it scouted the saved list instead of “
-          {run.prompt}”. Anything it added is not an answer to that. Redeploy the worker and search again.
+          It ran on a worker that predated searching by description, so it scouted the saved list instead of “
+          {run.prompt}”. Anything it added is not an answer to that.
         </span>
+        <span>
+          This notice is about that run and stays until the next one. Once the worker has been redeployed, search again
+          — the new run reads the description before it scouts, and says so here.
+        </span>
+        {onRetry ? (
+          <Button variant="outline" size="sm" className="w-fit" onClick={() => onRetry(run.prompt)}>
+            Search this again
+          </Button>
+        ) : (
+          <Button asChild variant="outline" size="sm" className="w-fit">
+            <Link to="/queue" search={{ search: run.id }}>
+              Open this search
+            </Link>
+          </Button>
+        )}
       </AlertDescription>
     </Alert>
   );

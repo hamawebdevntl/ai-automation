@@ -323,11 +323,19 @@ describe('when a search did not finish', () => {
     expect(await screen.findByText(/you stopped that run/i)).toBeInTheDocument();
   });
 
-  it('flags a search an older worker ran as the saved list', async () => {
+  it('flags a search an older worker ran as the saved list, and offers the new run as a button', async () => {
+    // A finished run never changes, so this notice outlives the redeploy that
+    // fixes it. The button is the way to find out the worker is new now.
+    const user = userEvent.setup();
     selected = trendSearchRun({ status: 'succeeded', inserted: 5, interpretation: null, interpreted_at: null });
     render(<AiSearchPanel selectedRunId="search-1" />, { wrapper });
 
     expect(await screen.findByText(/was not read as a search/i)).toBeInTheDocument();
+    expect(screen.getByText(/stays until the next one/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /search this again/i }));
+
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ prompt: PROMPT }));
   });
 });
 
