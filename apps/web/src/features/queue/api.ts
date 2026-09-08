@@ -4,6 +4,7 @@ import type {
   ApprovalRow,
   IdeaRow,
   IdeaStatus,
+  PresenterChoice,
   ProductionEventRow,
   ProductionRow,
   ProductionStatus,
@@ -359,16 +360,26 @@ export interface ApproveIdeaInput {
   ideaId: string;
   styleId: string;
   note?: string;
+  /**
+   * The presenter for this one production, overriding the preset's pair. Null
+   * or omitted keeps the preset's, which is the common case.
+   *
+   * Validated inside `approve_idea` against the cached HeyGen catalogue, not
+   * here: an avatar this account cannot use fails terminally at render time,
+   * which is after this gate and after the review that reached it.
+   */
+  presenter?: PresenterChoice | null;
 }
 
 export function useApproveIdea() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ ideaId, styleId, note }: ApproveIdeaInput): Promise<IdeaRow> => {
+    mutationFn: async ({ ideaId, styleId, note, presenter }: ApproveIdeaInput): Promise<IdeaRow> => {
       const { data, error } = await supabase.rpc('approve_idea', {
         p_idea_id: ideaId,
         p_style_id: styleId,
         p_note: note?.trim() || null,
+        p_presenter: presenter ?? null,
       });
       if (error) throw toError(error);
       return data;

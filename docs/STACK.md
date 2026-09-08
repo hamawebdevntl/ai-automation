@@ -125,6 +125,17 @@ documentation, and each of them would have been a silent defect:
   preset naming one has to say so or the render fails on an engine it never
   claimed.
 
+**The presenter is chosen in the app, not in a migration.** The pair started as
+two literals in `20260903120000_heygen_presenter_lane.sql`, which made changing
+who fronts a reel a deploy. Settings → Presenter now lists what the account can
+actually use and writes the choice to `style_presets.params.heygen`; Gate 1 can
+swap it for one production, and the pair that rendered is recorded on the
+production the way `render_backend` is. Because the app holds no secrets and
+cannot call HeyGen, what it lists is a cache the worker fills — the same shape
+as `trend_runs`: the app records an intention, the worker acts on it. The two
+constraints above are what the picker surfaces rather than hides, since both
+fail *terminally* and therefore after Gate 1 has already been passed.
+
 One consequence for QC: the slideshow-risk score counts cuts, and a talking
 head is one continuous shot by design. Scored the normal way every presenter
 reel lands at 0.40 and warns, so the check is now lane-aware — cuts are not

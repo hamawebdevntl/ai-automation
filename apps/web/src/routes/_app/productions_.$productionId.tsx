@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+import { PresenterRecordBadge } from '@/features/presenter/components/presenter-record';
 import { productionEventsQueryOptions, productionQueryOptions, stylePresetsQueryOptions } from '@/features/queue/api';
 import { PlatformCopyPanel } from '@/features/queue/components/platform-copy-panel';
 import { ProductionControls } from '@/features/queue/components/production-controls';
@@ -92,6 +93,7 @@ function ProductionProcessPage() {
               {RENDER_MODE_LABELS[production.render_backend]}
             </Badge>
           )}
+          <PresenterRecordBadge presenter={production.presenter} />
           <span className="text-xs text-muted-foreground">opened {formatRelative(production.created_at)}</span>
         </div>
 

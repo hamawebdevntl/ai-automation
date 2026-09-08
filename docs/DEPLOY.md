@@ -259,14 +259,27 @@ curl -s "https://api.heygen.com/v3/avatars/looks?limit=50&ownership=private" \
 An empty wallet fails the render *after* Gate 1 has been passed, which wastes a
 review rather than preventing one. A stale `avatar_id` fails with
 `avatar_not_found`, which the pipeline treats as terminal and parks — correctly,
-since it would fail identically on retry. Changing the avatar or voice is a
-preset update, not a deploy:
+since it would fail identically on retry.
 
-```sql
-update style_presets
-set params = jsonb_set(params, '{heygen,avatar_id}', '"<look id>"')
-where slug = 'ai-presenter';
-```
+**Changing the avatar or voice is neither a deploy nor SQL.** Settings → Presenter
+lists the looks this account owns, with thumbnails, how each is framed, and the
+engine it advertises; an owner picks a pair there and it is written to
+`style_presets.params.heygen`. Gate 1 can override that pair for one production,
+and the pair that actually rendered is recorded on the production.
+
+The app holds no secrets and cannot call HeyGen, so what the picker lists is a
+cache: the worker's `refresh_presenter_catalogue` sweep fills `heygen_looks` and
+`heygen_voices`, six-hourly and on request. **The picker is empty until that
+sweep has run at least once**, which needs `HEYGEN_API_KEY` set on the worker —
+without it the sweep is registered but disabled, exactly as the publishing ones
+are. The Refresh button on the card asks for a refill and reports what came
+back, including the failure: a rejected key shows there as `401 unauthorized`
+rather than only in the worker's log.
+
+The two constraints the picker surfaces are the two that fail terminally:
+a landscape look warns that a 9:16 render crops the speaker and must be
+confirmed before it can be saved, and a look advertising `avatar_iii` only has
+that engine sent for it rather than defaulting to Avatar IV.
 
 There is a live test that submits one real render. It is off unless asked for:
 

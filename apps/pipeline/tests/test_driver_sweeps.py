@@ -20,9 +20,16 @@ class Boom(RuntimeError):
 
 
 @pytest.fixture
-def publishing_off(monkeypatch):
+def lanes_off(monkeypatch):
+    """A deployment with neither publishing nor a HeyGen key.
+
+    Both are optional halves of this system, and both gate a sweep rather than
+    removing one from the table.
+    """
+
     class Cfg:
         publishing_enabled = False
+        heygen_api_key = ""
 
     monkeypatch.setattr(sweeps, "settings", lambda: Cfg())
 
@@ -41,16 +48,21 @@ class TestTheTable:
             "collect_analytics",
             "reap_mpt_tasks",
             "expire_ideas",
+            # Not from EventBridge at all: it fills the HeyGen look and voice
+            # caches the app's presenter picker reads, because a static bundle
+            # holding no secrets cannot ask HeyGen anything itself.
+            "refresh_presenter_catalogue",
         }
 
-    def test_the_publishing_sweeps_are_gated_rather_than_omitted(self, publishing_off):
-        # Registered either way, so turning publishing on is an environment
-        # change and not a code change.
+    def test_the_optional_lanes_are_gated_rather_than_omitted(self, lanes_off):
+        # Registered either way, so turning publishing or the presenter lane on
+        # is an environment change and not a code change.
         gated = {s.name for s in sweeps.SWEEPS if not s.enabled()}
         assert gated == {
             "reconcile_publishes",
             "flush_publishing_backlog",
             "collect_analytics",
+            "refresh_presenter_catalogue",
         }
 
     def test_lease_recovery_is_the_most_frequent(self):
@@ -65,6 +77,13 @@ class TestTheTable:
         by_name = {s.name: s.seconds for s in sweeps.SWEEPS}
         assert by_name["reap_mpt_tasks"] == sweeps.DAY
         assert by_name["expire_ideas"] == sweeps.DAY
+
+    def test_the_catalogue_refresh_is_frequent_because_a_person_waits_on_it(self):
+        # It reads one row and stops on almost every tick. The period is set by
+        # the Refresh button in Settings, not by the six-hourly refill: an owner
+        # who has just created an avatar in HeyGen wants it in the picker now.
+        by_name = {s.name: s.seconds for s in sweeps.SWEEPS}
+        assert by_name["refresh_presenter_catalogue"] == sweeps.MINUTE
 
 
 class TestTheLoop:
