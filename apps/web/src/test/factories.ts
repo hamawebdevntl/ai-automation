@@ -15,6 +15,10 @@ export function makeProduction(overrides: Partial<ProductionRow> = {}): Producti
     id: 'p1',
     idea_id: 'i1',
     style_preset_id: 's1',
+    source: 'generated',
+    title: null,
+    brief: null,
+    is_aigc: true,
     status: 'running',
     stage: null,
     task_id: null,
@@ -47,6 +51,29 @@ export function makeProduction(overrides: Partial<ProductionRow> = {}): Producti
     superseded_by: null,
     ...overrides,
   };
+}
+
+/**
+ * A finished cut somebody uploaded: no idea, no style, no render.
+ *
+ * The three columns that pair with `source` are set together on purpose --
+ * `productions_origin_columns` in Postgres refuses any other combination, and
+ * a factory that could produce one would let a test assert on a row the
+ * database cannot hold.
+ */
+export function makeUploadedProduction(overrides: Partial<ProductionRow> = {}): ProductionRow {
+  return makeProduction({
+    idea_id: null,
+    style_preset_id: null,
+    source: 'upload',
+    title: 'Three quoting mistakes that lose the job',
+    brief: 'A walk-through of the three things that cost tradespeople the work after they quote.',
+    is_aigc: false,
+    status: 'queued',
+    stage: 'uploaded',
+    run_state: { step: 'check_upload', storage_key: 'p1/final.mp4' },
+    ...overrides,
+  });
 }
 
 /** A pending idea from an ordinary run. The described-search columns are null unless asked for. */

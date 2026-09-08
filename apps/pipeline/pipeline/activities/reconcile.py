@@ -183,10 +183,17 @@ def reconcile_leases(supa: Supa | None = None) -> dict[str, Any]:
         parked.append(row["id"])
 
     for row in supa.unstarted_productions():
-        # Opened by Gate 1 and never claimed. Only real when the driver was
-        # down; the grace is generous for the same reason it is in
-        # `reconcile_renders` -- a queue is not a stall.
-        if _stale(row.get("created_at"), NOT_STARTED_GRACE_MINUTES):
+        # Opened by Gate 1 and never claimed, or uploaded and never checked.
+        # Only real when the driver was down; the grace is generous for the
+        # same reason it is in `reconcile_renders` -- a queue is not a stall.
+        #
+        # An upload is measured from `updated_at` rather than `created_at`,
+        # because unlike a row that has never been touched it can legitimately
+        # be between attempts: `check_upload` retries three times with backoff,
+        # and each attempt writes the row. Read from `created_at`, a retrying
+        # upload would be parked out from under the retry.
+        since = row.get("updated_at") if row.get("source") == "upload" else row.get("created_at")
+        if _stale(since, NOT_STARTED_GRACE_MINUTES):
             supa.park(row["id"], "queued but never claimed -- was the driver running?")
             parked.append(row["id"])
 

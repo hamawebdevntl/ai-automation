@@ -12,6 +12,7 @@ import type {
 } from '@/lib/database.types';
 import { supabase } from '@/lib/supabase';
 import { toError } from '@/lib/supabase-error';
+import { RENDERS_BUCKET, renderKeyFor, UPLOAD_CONTENT_TYPE } from './upload';
 
 export const queueKeys = {
   all: ['queue'] as const,
@@ -189,7 +190,10 @@ async function loadProductionsWithContext(statuses: readonly ProductionStatus[])
   if (error) throw toError(error);
   if (!productions || productions.length === 0) return [];
 
-  const ideaIds = [...new Set(productions.map((production) => production.idea_id))];
+  // Uploaded cuts have neither, so both joins are over whatever subset is
+  // left. `.in('id', [])` is a valid query returning nothing, so a page of
+  // nothing but uploads costs one empty round trip rather than a special case.
+  const ideaIds = [...new Set(productions.map((production) => production.idea_id).filter(isPresent))];
   const [ideasResult, presetsResult] = await Promise.all([
     supabase.from('ideas').select('*').in('id', ideaIds),
     supabase.from('style_presets').select('*'),
@@ -202,9 +206,13 @@ async function loadProductionsWithContext(statuses: readonly ProductionStatus[])
 
   return productions.map((production) => ({
     production,
-    idea: ideasById.get(production.idea_id) ?? null,
-    style: presetsById.get(production.style_preset_id) ?? null,
+    idea: production.idea_id ? (ideasById.get(production.idea_id) ?? null) : null,
+    style: production.style_preset_id ? (presetsById.get(production.style_preset_id) ?? null) : null,
   }));
+}
+
+function isPresent<T>(value: T | null | undefined): value is T {
+  return value !== null && value !== undefined;
 }
 
 export function reviewQueueQueryOptions(statuses: readonly ProductionStatus[] = GATE_2_STATUSES) {
@@ -221,9 +229,17 @@ export function productionQueryOptions(id: string) {
       const { data: production, error } = await supabase.from('productions').select('*').eq('id', id).single();
       if (error) throw toError(error);
 
+      // Not fetched at all when the column is null, rather than fetched with
+      // an empty filter: PostgREST reads `id=eq.` as a filter against the
+      // empty string and answers with an error about uuid syntax, so an
+      // uploaded cut would fail to load entirely.
       const [ideaResult, presetResult] = await Promise.all([
-        supabase.from('ideas').select('*').eq('id', production.idea_id).maybeSingle(),
-        supabase.from('style_presets').select('*').eq('id', production.style_preset_id).maybeSingle(),
+        production.idea_id
+          ? supabase.from('ideas').select('*').eq('id', production.idea_id).maybeSingle()
+          : Promise.resolve({ data: null, error: null } as const),
+        production.style_preset_id
+          ? supabase.from('style_presets').select('*').eq('id', production.style_preset_id).maybeSingle()
+          : Promise.resolve({ data: null, error: null } as const),
       ]);
       if (ideaResult.error) throw toError(ideaResult.error);
       if (presetResult.error) throw toError(presetResult.error);
@@ -428,6 +444,75 @@ export function useDecideProduction() {
 }
 
 // ---------------------------------------------------------------------------
+// Uploading a finished cut
+// ---------------------------------------------------------------------------
+
+export interface UploadCutInput {
+  file: File;
+  title: string;
+  brief: string;
+  /** Whether the video is AI-generated. Only the uploader knows. */
+  isAigc: boolean;
+  note?: string;
+}
+
+/**
+ * Put a finished video into the publishing half of the pipeline.
+ *
+ * Two steps, in this order and only this order. The file goes into the private
+ * renders bucket first, at the path every downstream step already looks for it
+ * — which is possible before the row exists because the production id is minted
+ * here rather than by Postgres. Then `create_upload_production` opens the row,
+ * and refuses unless an object is actually sitting at that path.
+ *
+ * That ordering is what makes a failed upload harmless: no row is created, so
+ * there is no production pointed at nothing for an owner to find parked
+ * tomorrow. The cost is an orphaned object when the second call fails, which
+ * is invisible (the bucket is private and unlisted) and cheap, and is the
+ * better half of that trade.
+ *
+ * The bucket takes the file without `upsert`, deliberately. There is no UPDATE
+ * policy on `storage.objects` for the browser, so an upload can only ever
+ * create — no owner can replace the cut behind a production that has already
+ * been checked, reviewed or published.
+ */
+export function useUploadFinishedCut() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ file, title, brief, isAigc, note }: UploadCutInput): Promise<ProductionRow> => {
+      const productionId = crypto.randomUUID();
+
+      const { error: uploadError } = await supabase.storage
+        .from(RENDERS_BUCKET)
+        .upload(renderKeyFor(productionId), file, { contentType: UPLOAD_CONTENT_TYPE, upsert: false });
+      if (uploadError) throw toError(uploadError);
+
+      const { data, error } = await supabase.rpc('create_upload_production', {
+        p_production_id: productionId,
+        p_title: title.trim(),
+        p_brief: brief.trim(),
+        p_is_aigc: isAigc,
+        p_note: note?.trim() || null,
+      });
+      if (error) throw toError(error);
+      return data;
+    },
+    onSuccess: (production) => {
+      // A new production appears in the live list and, once the check has run,
+      // in the review queue. Same reasoning as the controls: tens of rows, and
+      // a hand-written key list is one that goes stale the next time one is
+      // added.
+      queryClient.setQueryData(queueKeys.production(production.id), {
+        production,
+        idea: null,
+        style: null,
+      } satisfies ProductionWithContext);
+      void queryClient.invalidateQueries({ queryKey: queueKeys.all });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Driving a production
 // ---------------------------------------------------------------------------
 //
@@ -584,7 +669,12 @@ function useScriptMutation<TInput extends { productionId: string }>(run: (input:
       queryClient.setQueryData(queueKeys.production(production.id), (previous: ProductionWithContext | undefined) =>
         previous ? { ...previous, production } : previous,
       );
-      queryClient.setQueryData(queueKeys.productionForIdea(production.idea_id), production);
+      // An uploaded cut has no idea, so there is no per-idea cache entry to
+      // freshen. It also has no script gate, so this branch is unreachable
+      // today — it is here so it stays correct if that ever changes.
+      if (production.idea_id) {
+        queryClient.setQueryData(queueKeys.productionForIdea(production.idea_id), production);
+      }
       void queryClient.invalidateQueries({ queryKey: queueKeys.all });
     },
   });

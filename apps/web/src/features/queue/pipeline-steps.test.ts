@@ -370,3 +370,97 @@ describe('a production nothing has picked up', () => {
     expect(isUnclaimed(paused, opened + 999_999)).toBe(false);
   });
 });
+
+/**
+ * An uploaded cut is drawn against its own skeleton.
+ *
+ * The thing these guard is subtle and would be silent: the two skeletons
+ * number their rows differently, so a position read against the wrong one puts
+ * the whole timeline out by two — every step before Gate 2 shown as done
+ * before it has happened.
+ */
+describe('an uploaded cut', () => {
+  function upload(overrides: Partial<ProductionRow> = {}): Prod {
+    return production({
+      source: 'upload',
+      status: 'queued',
+      stage: 'uploaded',
+      run_state: { step: 'check_upload' },
+      ...overrides,
+    });
+  }
+
+  it('is not shown the steps it never had', () => {
+    // Not "skipped" — absent. An upload did not skip the script gate; there was
+    // never a script, and nothing was ever going to render it.
+    const keys = buildTimeline(upload()).map((step) => step.key);
+
+    expect(keys).toEqual(['uploaded', 'check', 'copy', 'gate2', 'publish', 'done']);
+    expect(keys).not.toContain('script');
+    expect(keys).not.toContain('render');
+  });
+
+  it('counts the upload itself as already done', () => {
+    // The file is in the bucket before `create_upload_production` will open a
+    // row, so unlike a queued production there is nothing still to arrive.
+    expect(states(upload()).uploaded).toBe('done');
+  });
+
+  it('places the copy step correctly, which the generated skeleton would not', () => {
+    const prod = upload({ status: 'running', run_state: { step: 'generate_copy' } });
+
+    expect(states(prod)).toMatchObject({ uploaded: 'done', check: 'done', copy: 'active', gate2: 'pending' });
+  });
+
+  it('waits at Gate 2 like anything else', () => {
+    const prod = upload({ status: 'awaiting_review', run_state: { step: 'await_gate2' } });
+
+    expect(states(prod)).toMatchObject({ check: 'done', copy: 'done', gate2: 'waiting' });
+    expect(describeProduction(prod).headline).toBe('Gate 2 — waiting for you');
+  });
+
+  it('says so when no worker has picked the file up', () => {
+    // The generated lane recognises this by the row having no step. An upload
+    // is inserted *with* one, so without its own rule it would sit reading
+    // "Quality check · running" forever with nothing running.
+    const now = Date.now();
+    const prod = upload({
+      created_at: new Date(now - 10 * WORKER_GRACE_MS).toISOString(),
+      updated_at: new Date(now - 10 * WORKER_GRACE_MS).toISOString(),
+    });
+
+    expect(isUnclaimed(prod, now)).toBe(true);
+    expect(describeProduction(prod, now).headline).toBe('Waiting for a worker');
+  });
+
+  it('does not call a slow check abandoned', () => {
+    // The check legitimately runs for minutes on a large file, and the worker
+    // holds an hour's lease while it does. Measured from `created_at` this
+    // would report every slow upload as dropped.
+    const now = Date.now();
+    const prod = upload({
+      created_at: new Date(now - 10 * WORKER_GRACE_MS).toISOString(),
+      updated_at: new Date(now - 10 * WORKER_GRACE_MS).toISOString(),
+      lease_expires_at: new Date(now + 60 * 60_000).toISOString(),
+    });
+
+    expect(isUnclaimed(prod, now)).toBe(false);
+  });
+
+  it('offers no re-run, because there is no render to make again', () => {
+    // Mirrors the guard `rerun_production` now carries. The point of mirroring
+    // is that the owner is told why rather than refused after clicking.
+    const prod = upload({ status: 'rejected', run_state: { step: 'rejected' } });
+
+    expect(availableControls(prod).rerun.enabled).toBe(false);
+    expect(availableControls(prod).rerun.reason).toMatch(/uploaded cut/);
+  });
+
+  it('offers no re-check either, since there is no render to re-fetch', () => {
+    // `task_id` is null on an upload, which is exactly what `rewind_production`
+    // tests before refusing `fetch_and_qc`.
+    const prod = upload({ status: 'awaiting_review', video_url: 'https://signed/final.mp4' });
+
+    expect(rewindableSteps(prod)).toEqual(['generate_copy', 'open_gate2']);
+  });
+});

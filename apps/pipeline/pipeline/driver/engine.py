@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from pipeline.activities import gates, publish, render, script
+from pipeline.activities import gates, publish, render, script, upload
 from pipeline.clients.supa import Supa, SupaError
 from pipeline.config import settings
 from pipeline.driver import graph as g
@@ -33,6 +33,7 @@ ACTIVITIES = {
     "render.submit_render": render.submit_render,
     "render.poll_render": render.poll_render,
     "render.fetch_and_qc": render.fetch_and_qc,
+    "upload.check_upload": upload.check_upload,
     "publish.generate_platform_copy": publish.generate_platform_copy,
     "publish.publish": publish.publish,
     "publish.poll_publish": publish.poll_publish,
@@ -94,6 +95,7 @@ _STEP_OPENING = {
     "submit_render": "Sending the render to the production backend.",
     "poll_render": "Waiting for the render to finish.",
     "fetch_and_qc": "Downloading the finished cut and running the quality check.",
+    "check_upload": "Running the quality check on the cut you uploaded.",
     "generate_copy": "Writing the per-platform copy.",
     "open_gate2": "Opening Gate 2 for a person to sign off the cut.",
     "await_gate2": "Waiting for a person to sign off the cut.",
@@ -139,11 +141,20 @@ def _describe(step_name: str, state: dict[str, Any]) -> str | None:
         return f"Render submitted to {backend}."
     if step_name == "poll_render":
         return "The render finished." if state.get("state") == "complete" else "The render stopped."
-    if step_name == "fetch_and_qc":
+    if step_name in ("fetch_and_qc", "check_upload"):
         risk = state.get("slideshow_risk")
         verdict = "passed" if state.get("qc_passed") else "failed"
         tail = f", slideshow risk {risk:.2f}." if isinstance(risk, (int, float)) else "."
-        return f"Cut downloaded, stored and checked. Quality check {verdict}{tail}"
+        # The two differ only in where the bytes came from. `fetch_and_qc`
+        # moved them out of a provider; `check_upload` found them already in
+        # our own bucket, which is worth saying because it is the whole reason
+        # an upload costs nothing to check.
+        did = (
+            "Cut downloaded, stored and checked"
+            if step_name == "fetch_and_qc"
+            else "The uploaded cut was checked"
+        )
+        return f"{did}. Quality check {verdict}{tail}"
     if step_name == "generate_copy":
         if state.get("skipped"):
             return "Per-platform copy was already written, so nothing was regenerated."
@@ -265,9 +276,19 @@ def advance(row: dict[str, Any], supa: Supa) -> dict[str, Any]:
     event = {k: v for k, v in run_state.items() if k not in _CONTROL_KEYS}
     event["production_id"] = production_id
 
-    if "step" not in run_state:
-        # The first step of a fresh row is the one step that never passes
-        # through `_enter`, which is what announces every step after it.
+    if "previous_step" not in run_state:
+        # A step this row was never *entered* at is one nothing announced:
+        # `_enter` is what writes the "started" event, and it writes
+        # `previous_step` at the same moment. Both entrances land here -- a
+        # generated row inserted with no run_state at all, and an uploaded one
+        # inserted straight onto `check_upload` -- and so does a row a person
+        # sent back with `retry_production`, which clears `previous_step` for
+        # the same reason: it is starting a step afresh rather than continuing
+        # one.
+        #
+        # Keyed on `previous_step` rather than on `step` because `step` is no
+        # longer evidence of anything: an upload has one from birth, so the
+        # older test would have left the whole quality check unannounced.
         supa.record_event(production_id, name, "started", detail=_STEP_OPENING.get(name))
 
     try:
@@ -316,6 +337,16 @@ def _invoke(step: g.Step, event: dict[str, Any], supa: Supa) -> dict[str, Any]:
     """
     fn = ACTIVITIES[step.run]
     try:
+        # `claim_production` takes one lease length for every row, because it
+        # cannot know which step it is handing out until it has handed it out.
+        # `Step.lease_seconds` was therefore documentation rather than
+        # behaviour: `fetch_and_qc` and `check_upload` both declare an hour and
+        # both got the global fifteen minutes. A long step whose lease lapses
+        # is handed to a second worker while the first is still working, and
+        # five of those park the row as "the driver died on this step" -- which
+        # is exactly what a 500 MB upload would look like.
+        if step.lease_seconds > settings().lease_seconds:
+            supa.extend_lease(event["production_id"], step.lease_seconds)
         return fn(event, supa) or {}
     except (SupaError, httpx.TransportError) as exc:
         raise InfrastructureError(str(exc)) from exc

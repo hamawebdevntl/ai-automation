@@ -34,6 +34,12 @@ ACCEPTABLE_IDENTIFIERS: dict[str, tuple[str, ...]] = {
 # workflow, so past this point it has either given up or never started.
 STALE_QUEUE_MINUTES = 45
 
+# `productions.source` for a cut an owner uploaded rather than the pipeline
+# rendering it. Everything from here to analytics treats the two alike; the
+# only places that ask are the two below, and both ask about an input the
+# generated path has and the uploaded path does not.
+UPLOAD = "upload"
+
 
 # ---------------------------------------------------------------------------
 # Copy
@@ -59,20 +65,46 @@ def generate_platform_copy(
     if production.get("platform_copy"):
         return {"production_id": production_id, "skipped": "copy already present"}
 
-    idea = supa.idea(production["idea_id"])
     platforms = supa.enabled_platforms()
-    script = event.get("script") or production.get("script") or ""
-    subject = idea.get("title") or "Untitled"
+    subject, body = _copy_inputs(event, production, supa)
 
     copy_map = copy_for_platforms(
-        mpt, platforms, video_subject=subject, video_script=script, language=""
+        mpt, platforms, video_subject=subject, video_script=body, language=""
     )
     missing = [p for p in platforms if p not in copy_map]
     if missing:
         log.warning("no copy generated for %s on production %s", missing, production_id)
 
-    supa.update_production(production_id, platform_copy=copy_map, script=script or None)
+    fields: dict[str, Any] = {"platform_copy": copy_map}
+    if production.get("source") != UPLOAD and body:
+        # Written back only on the generated path, where `body` *is* the
+        # narration and this column is the source of truth for it. An upload's
+        # `brief` must never be laundered into `script`: nothing narrated it,
+        # `script_approved_at` would then describe words no person approved,
+        # and the review screen would show a "Script" panel for a video whose
+        # audio has nothing to do with it.
+        fields["script"] = body
+    supa.update_production(production_id, **fields)
     return {"production_id": production_id, "platforms": list(copy_map), "missing": missing}
+
+
+def _copy_inputs(event: dict[str, Any], production: dict[str, Any], supa: Supa) -> tuple[str, str]:
+    """What the four captions are written about, and written from.
+
+    Two entrances, two answers. A generated production has an idea for its
+    subject and an approved script for its substance. An upload has neither and
+    cannot: there was no Gate 1 and no script gate. What it has instead is what
+    its uploader typed -- a title and a short description of what the video is
+    -- and that is a *better* input than a transcript would be, which was the
+    alternative. A transcript says what the video says; the copy has to say why
+    someone should watch it, and only a person knows that.
+    """
+    if production.get("source") == UPLOAD:
+        return (production.get("title") or "Untitled"), (production.get("brief") or "")
+
+    idea = supa.idea(production["idea_id"])
+    subject = idea.get("title") or "Untitled"
+    return subject, (event.get("script") or production.get("script") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +223,14 @@ def publish(
 
         piece = copy_map.get(platform) or {}
         content = piece.get("description") or piece.get("caption") or ""
-        title = piece.get("title") or (production.get("script") or "")[:90] or "Untitled"
+        # `productions.title` is the upload's own subject line and is null on
+        # the generated path, where the script is the only text on the row.
+        title = (
+            piece.get("title")
+            or production.get("title")
+            or (production.get("script") or "")[:90]
+            or "Untitled"
+        )
         if not content:
             supa.upsert_publication(
                 production_id, platform, state="skipped", error="no copy generated"
@@ -204,7 +243,14 @@ def publish(
                 integration_id=integration.id,
                 content=content,
                 media=media,
-                settings_obj=postiz.settings_for(platform, title=title),
+                settings_obj=postiz.settings_for(
+                    platform,
+                    title=title,
+                    # The uploader's answer, or true for anything we rendered.
+                    # `is_aigc` is `not null default true`, so the fallback is
+                    # only reached by a caller passing a partial row.
+                    made_with_ai=bool(production.get("is_aigc", True)),
+                ),
                 post_id=post_id,
             )
             supa.upsert_publication(
