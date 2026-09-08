@@ -227,20 +227,25 @@ export function latestTrendRunQueryOptions() {
   return queryOptions({
     queryKey: trendKeys.latestRun(),
     queryFn: async (): Promise<TrendRunRow | null> => {
+      // Not a run an owner has removed: a dismissed run's notice is the thing
+      // dismissing exists to clear. A run still going cannot be dismissed
+      // without being stopped, so filtering here never hides the in-flight lock.
       const { data, error } = await supabase
         .from('trend_runs')
         .select('*')
+        .is('dismissed_at', null)
         .order('requested_at', { ascending: false })
         .limit(1)
         .maybeSingle();
       // The bundle and the database are deployed separately, so a build can
       // reach a database that has not had this migration applied yet. `42P01`
-      // is the missing table, and the honest answer to "what was the last
-      // run?" against a schema that cannot hold one is "there hasn't been" --
-      // not an error banner over a queue that is otherwise working. The same
-      // fallback the trend runner makes for `trend_settings`.
+      // is the missing table and `42703` the missing column, and the honest
+      // answer to "what was the last run?" against a schema that cannot hold
+      // one is "there hasn't been" -- not an error banner over a queue that is
+      // otherwise working. The same fallback the trend runner makes for
+      // `trend_settings`.
       if (error) {
-        if (error.code === '42P01') return null;
+        if (error.code === '42P01' || error.code === '42703') return null;
         throw toError(error);
       }
       return data;
@@ -289,6 +294,7 @@ export function recentSearchesQueryOptions() {
         .from('trend_runs')
         .select('*')
         .not('prompt', 'is', null)
+        .is('dismissed_at', null)
         .order('requested_at', { ascending: false })
         .limit(RECENT_SEARCHES_LIMIT);
       if (error) {
@@ -475,5 +481,41 @@ export function useCancelTrendRun() {
  * outcome the owner wanted described badly if it arrives as an error.
  */
 export function isNothingToStopError(error: unknown): boolean {
+  return codeOf(error) === 'P0002';
+}
+
+/**
+ * Remove a run from the lists, stopping it first if it is still going.
+ *
+ * The row is kept -- see the 20260908120000 migration for why -- so this is one
+ * database call that sets a timestamp the two list queries filter on. Both
+ * caches are invalidated rather than patched: the answer to "what is the
+ * latest run?" has just become some other row, and only the database knows
+ * which. The by-id cache gets the returned row, so a `?search=` link to the
+ * removed run still shows it rather than "not here any more".
+ */
+export function useDismissTrendRun() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (runId: string): Promise<TrendRunRow> => {
+      const { data, error } = await supabase.rpc('dismiss_trend_run', { p_run_id: runId });
+      if (error) throw toError(error);
+      return data;
+    },
+    onSuccess: (run) => {
+      queryClient.setQueryData(trendKeys.run(run.id), run);
+      void queryClient.invalidateQueries({ queryKey: trendKeys.latestRun() });
+      void queryClient.invalidateQueries({ queryKey: trendKeys.recentSearches() });
+    },
+    onError: () => {
+      // Whatever refused it, the list on screen is out of date -- most often
+      // because the same search was removed from another tab.
+      void queryClient.invalidateQueries({ queryKey: trendKeys.recentSearches() });
+    },
+  });
+}
+
+/** `P0002` from `dismiss_trend_run`: the search was already removed. The list was simply stale. */
+export function isAlreadyRemovedError(error: unknown): boolean {
   return codeOf(error) === 'P0002';
 }

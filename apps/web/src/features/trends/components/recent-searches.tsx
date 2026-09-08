@@ -1,5 +1,6 @@
 import { Link } from '@tanstack/react-router';
 import { Button } from '@/components/ui/button';
+import { RemoveSearchButton } from '@/features/trends/components/remove-search-button';
 import { describeRunStatus, EXAMPLE_PROMPTS, isSearchRun, truncatePrompt } from '@/features/trends/search';
 import type { TrendRunRow } from '@/lib/database.types';
 import { formatRelative } from '@/lib/format';
@@ -27,18 +28,21 @@ export function RecentSearches({ runs, selectedRunId }: { runs: TrendRunRow[]; s
       </div>
       <ul className="space-y-1.5">
         {searches.map((run) => (
-          <li key={run.id}>
+          // The remove button sits beside the link, not inside it: a button
+          // inside an anchor is two controls under one thumb.
+          <li key={run.id} className="flex items-start gap-1">
             <Link
               to="/queue"
               search={{ search: run.id }}
               aria-current={run.id === selectedRunId ? 'page' : undefined}
-              className="flex flex-col gap-0.5 rounded-md border p-2.5 text-sm transition-colors hover:bg-accent/50 aria-[current=page]:border-primary/50 aria-[current=page]:bg-accent/40"
+              className="flex min-w-0 flex-1 flex-col gap-0.5 rounded-md border p-2.5 text-sm transition-colors hover:bg-accent/50 aria-[current=page]:border-primary/50 aria-[current=page]:bg-accent/40"
             >
               <span className="font-medium break-words">{truncatePrompt(run.prompt)}</span>
               <span className="text-xs text-muted-foreground">
                 {formatRelative(run.requested_at)} · {describeRunStatus(run)}
               </span>
             </Link>
+            <RemoveSearchButton run={run} selected={run.id === selectedRunId} />
           </li>
         ))}
       </ul>

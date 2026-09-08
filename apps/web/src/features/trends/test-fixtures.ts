@@ -77,6 +77,8 @@ export function trendRun(over: Partial<TrendRunRow> = {}): TrendRunRow {
     prompt: null,
     interpretation: null,
     interpreted_at: null,
+    dismissed_at: null,
+    dismissed_by: null,
     ...over,
   };
 }

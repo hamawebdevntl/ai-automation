@@ -355,6 +355,10 @@ export type TrendRunRow = {
   /** Null until the worker has read the prompt. Always null on a run without one. */
   interpretation: TrendRunInterpretation | null;
   interpreted_at: string | null;
+
+  /** When an owner removed this run from the app's lists. The row stays; the app stops showing it. */
+  dismissed_at: string | null;
+  dismissed_by: string | null;
 };
 
 /** The button, or the dispatcher acting on the owner's schedule. */
@@ -610,6 +614,12 @@ export interface Database {
         Returns: TrendRunRow;
       };
       cancel_trend_run: {
+        Args: { p_run_id: string };
+        Returns: TrendRunRow;
+      };
+      // Removes a run from the lists, stopping it first if it is still going.
+      // Owner-gated in SQL like the others; the row is kept.
+      dismiss_trend_run: {
         Args: { p_run_id: string };
         Returns: TrendRunRow;
       };

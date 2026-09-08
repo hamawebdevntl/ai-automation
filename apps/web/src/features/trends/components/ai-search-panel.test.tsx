@@ -49,6 +49,7 @@ let recent: TrendRunRow[] = [];
 const settings = trendSettings();
 const request = vi.fn(async (): Promise<TrendRunRow> => trendSearchRun({ id: 'search-9', status: 'requested' }));
 const cancel = vi.fn(async () => trendRun({ status: 'cancelled' }));
+const dismissRun = vi.fn(async () => trendSearchRun({ dismissed_at: '2026-09-08T12:00:00Z' }));
 
 vi.mock('@/features/trends/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/features/trends/api')>();
@@ -62,6 +63,7 @@ vi.mock('@/features/trends/api', async (importOriginal) => {
     useSelectedTrendRun: () => ({ run: selected, isPending: false, error: null }),
     useRequestTrendRun: () => ({ mutateAsync: request, isPending: false }),
     useCancelTrendRun: () => ({ mutateAsync: cancel, isPending: false }),
+    useDismissTrendRun: () => ({ mutateAsync: dismissRun, isPending: false }),
   };
 });
 
@@ -374,5 +376,21 @@ describe('recent searches', () => {
 
     await screen.findByText(/recent searches/i);
     expect(screen.queryByText(/no searches yet/i)).not.toBeInTheDocument();
+  });
+
+  it('lets an owner remove each one, and a viewer none', async () => {
+    recent = [
+      trendSearchRun({ id: 'search-2', prompt: 'Bookkeeping for tradespeople', status: 'running', inserted: null }),
+      trendSearchRun({ id: 'search-1', status: 'succeeded', inserted: 8 }),
+    ];
+    const { unmount } = render(<AiSearchPanel selectedRunId={null} />, { wrapper });
+    await screen.findByText(/recent searches/i);
+    expect(screen.getAllByRole('button', { name: /^remove “/i })).toHaveLength(2);
+    unmount();
+
+    mockOwner.mockReturnValue({ isOwner: false, isLoading: false, role: 'viewer', displayName: null });
+    render(<AiSearchPanel selectedRunId={null} />, { wrapper });
+    await screen.findByText(/recent searches/i);
+    expect(screen.queryByRole('button', { name: /^remove “/i })).not.toBeInTheDocument();
   });
 });
