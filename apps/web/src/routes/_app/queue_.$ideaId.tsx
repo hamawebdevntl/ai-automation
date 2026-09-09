@@ -18,6 +18,7 @@ import { IdeaProductionPanel } from '@/features/queue/components/idea-production
 import { QueryError } from '@/features/queue/components/query-state';
 import { StylePicker } from '@/features/queue/components/style-picker';
 import { VelocityBadge } from '@/features/queue/components/velocity-badge';
+import { needsClipRange } from '@/lib/database.types';
 import { formatCostRange, formatMinutes, formatRelative, titleCase } from '@/lib/format';
 
 export const Route = createFileRoute('/_app/queue_/$ideaId')({
@@ -55,7 +56,12 @@ function IdeaDecisionPage() {
   const isDeciding = approve.isPending || reject.isPending;
 
   const idea = ideaQuery.data;
-  const presets = presetsQuery.data ?? [];
+  // A clip style is not a Gate 1 choice. It is active because every accepted
+  // clip is attached to it, but an ordinary idea has no range for it to cut and
+  // `approve_idea` refuses the combination -- so offering it here would be
+  // offering a choice the database rejects. The refusal in SQL is what holds;
+  // this is what stops anyone meeting it.
+  const presets = (presetsQuery.data ?? []).filter((preset) => !needsClipRange(preset.render_mode));
   const selectedPreset = presets.find((preset) => preset.id === styleId) ?? null;
 
   if (ideaQuery.error) return <QueryError error={ideaQuery.error} />;

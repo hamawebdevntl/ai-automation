@@ -524,3 +524,84 @@ def test_a_non_clip_idea_still_goes_to_the_text_generator():
     out = script.write_script({"production_id": "p1"}, supa, mpt=Drafter())
     assert out["script_source"] == "drafted"
     assert supa.row["script"] == "Drafted narration."
+
+
+# ---------------------------------------------------------------------------
+# The claim, against a real `Supa`
+# ---------------------------------------------------------------------------
+
+
+class FakeRpc:
+    """Just enough postgrest to answer one `rpc(...).execute()`."""
+
+    def __init__(self, data: Any) -> None:
+        self._data = data
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def rpc(self, name: str, params: dict[str, Any]) -> FakeRpc:
+        self.calls.append((name, params))
+        return self
+
+    def execute(self) -> Any:
+        return type("Res", (), {"data": self._data})()
+
+    def table(self, _name: str) -> FakeRpc:  # pragma: no cover - not used here
+        return self
+
+
+def real_supa(monkeypatch, data: Any):
+    from pipeline.clients import supa as supa_mod
+
+    class Cfg:
+        supabase_url = "https://example.supabase.co"
+        supabase_service_role_key = "service-role"
+        renders_bucket = "renders"
+
+    monkeypatch.setattr(supa_mod, "settings", lambda: Cfg())
+    client = FakeRpc(data)
+    return supa_mod.Supa(client=client), client
+
+
+def test_an_idle_database_is_not_a_claim(monkeypatch):
+    """A set-returning function answers with nulls, not with no row.
+
+    `claim_production` documents this and guards it; without the same guard here
+    the clip worker treats an all-null row as a claimed recording, and every
+    twenty seconds raises trying to update `clip_sources` id None. This is the
+    regression test for that.
+    """
+    supa, _ = real_supa(monkeypatch, {"id": None, "status": None, "storage_key": None})
+    assert supa.claim_clip_source("clips", 5400) is None
+
+
+def test_a_real_row_is_a_claim(monkeypatch):
+    supa, client = real_supa(monkeypatch, {"id": "src-1", "status": "uploaded"})
+
+    assert supa.claim_clip_source("clips", 5400) == {"id": "src-1", "status": "uploaded"}
+    assert client.calls == [
+        ("claim_clip_source", {"p_worker": "clips", "p_lease_seconds": 5400})
+    ]
+
+
+@pytest.mark.parametrize("empty", [None, [], [{"id": None}]])
+def test_nothing_at_all_is_not_a_claim(monkeypatch, empty):
+    supa, _ = real_supa(monkeypatch, empty)
+    assert supa.claim_clip_source("clips", 5400) is None
+
+
+def test_the_lease_outlives_the_transcription_budget():
+    """A lease expiring mid-phase hands the row over and pays fal twice.
+
+    The phase downloads the recording -- up to the bucket's 5 GiB -- before fal
+    is asked for anything, so the lease has to cover the transfer as well as the
+    transcription. Asserted rather than left to the comment, because the two
+    numbers are in different fields and only their relationship matters.
+    """
+    from pipeline.config import Settings
+
+    fields = Settings.model_fields
+    lease = fields["clip_lease_seconds"].default
+    budget = fields["clip_transcribe_budget_seconds"].default
+    assert lease > budget, "the claim must outlive the transcription it holds"
+    # Enough headroom for a multi-gigabyte download at a few MB/s.
+    assert lease - budget >= 1800

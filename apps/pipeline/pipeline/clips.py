@@ -38,10 +38,13 @@ log = logging.getLogger(__name__)
 # so a candidate is dropped here with a log line rather than refused there with a
 # constraint violation that names no candidate.
 #
-# Both are the platforms' numbers rather than ours: under about three seconds
-# there is no hook, and every one of the four targets caps a short at ninety
+# The floor is `qc.slideshow.MIN_DURATION_S`, and it has to be: that check
+# *fails* a render under five seconds as "too short to publish", so a three
+# second clip was a candidate an owner could accept, wait for, and then find
+# flagged at Gate 2 for a reason decided before it was ever proposed. The
+# ceiling is the platforms': every one of the four caps a short at ninety
 # seconds or less.
-MIN_CLIP_SECONDS = 3.0
+MIN_CLIP_SECONDS = 5.0
 MAX_CLIP_SECONDS = 90.0
 
 # How much of a candidate may be covered by a better-ranked one before it counts
@@ -75,7 +78,7 @@ What makes a clip:
 
 Rules:
 - Use only timecodes that exist in the transcript you were given. Never invent a time past the end of it.
-- Each clip must be between 3 and 90 seconds. Aim for 20-60.
+- Each clip must be between 5 and 90 seconds. Aim for 20-60.
 - Do not propose the same moment twice. Overlapping ranges are wasted review.
 - Rank them best first: the one you would publish if you could only publish one goes first.
 - State for each clip why it stands alone. If you cannot say why in a sentence, do not propose it.

@@ -104,11 +104,19 @@ class Settings(BaseSettings):
 
     # How long a worker's claim on a `clip_sources` row survives unrenewed.
     #
-    # Sized for the transcribe phase, which is the long one, and deliberately
-    # longer than it: a lease that expires mid-transcription would hand the row
-    # to a second worker and pay fal twice for one file. Nothing sleeps holding
-    # it -- the phase runs, the row is written, the lease is released.
-    clip_lease_seconds: int = Field(default=3600, alias="CLIP_LEASE_SECONDS")
+    # Sized for the transcribe phase and deliberately longer than it, because a
+    # lease that expires mid-transcription hands the row to a second worker and
+    # pays fal twice for one file.
+    #
+    # "Longer than it" means longer than the *whole phase*, not just the
+    # transcription: that phase downloads the recording first -- up to the
+    # bucket's 5 GiB -- and runs ffprobe over it before fal is asked for
+    # anything. Against a 2700s transcribe budget, 3600s left only 900s for a
+    # multi-gigabyte transfer, which is not enough on a slow link. Twice the
+    # budget is, and an over-long lease costs only that a genuinely dead
+    # worker's row waits longer before being picked up again -- against paying
+    # for a transcription twice, that is the cheap direction to be wrong in.
+    clip_lease_seconds: int = Field(default=5400, alias="CLIP_LEASE_SECONDS")
 
     # The longest recording that will be transcribed.
     #

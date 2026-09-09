@@ -46,16 +46,30 @@ export function ClipPreview({ storageKey, start, end }: { storageKey: string; st
   // Stop at the end of the candidate's range rather than playing on into the
   // rest of the recording. Without this, reviewing a 12-second clip means
   // watching whatever follows it until you notice.
+  //
+  // The `play` handler is what makes it replayable. Pausing at the end leaves
+  // `currentTime` past it, so the next press of play would be paused again on
+  // its first `timeupdate` and the preview would appear stuck -- reviewable
+  // exactly once. Rewinding on play is the fix, and it also makes a second
+  // press behave like a second look rather than like a broken control.
   useEffect(() => {
     const el = video.current;
     if (!el) return;
 
     const stopAtEnd = () => {
-      if (el.currentTime >= end) el.pause();
+      if (!el.paused && el.currentTime >= end) el.pause();
     };
+    const rewindIfFinished = () => {
+      if (el.currentTime >= end) el.currentTime = start;
+    };
+
     el.addEventListener('timeupdate', stopAtEnd);
-    return () => el.removeEventListener('timeupdate', stopAtEnd);
-  }, [end]);
+    el.addEventListener('play', rewindIfFinished);
+    return () => {
+      el.removeEventListener('timeupdate', stopAtEnd);
+      el.removeEventListener('play', rewindIfFinished);
+    };
+  }, [start, end]);
 
   if (isPending) return <Skeleton className="aspect-video w-full rounded-md" />;
 

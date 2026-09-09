@@ -237,12 +237,17 @@ alter table public.clip_candidates drop constraint if exists clip_candidates_run
 alter table public.clip_candidates add constraint clip_candidates_runs_forwards
   check (end_seconds > start_seconds);
 
--- A clip nobody would publish is not a candidate. Both bounds are the platforms'
--- rather than ours: under about three seconds there is no hook, and every one of
--- the four targets caps a short at ninety seconds or less.
+-- A clip nobody would publish is not a candidate.
+--
+-- The floor is the quality check's own -- `MIN_DURATION_S = 5.0` in
+-- `pipeline/qc/slideshow.py`, which *fails* a render under it as "too short to
+-- publish". Any lower and a candidate could be accepted, rendered and then
+-- flagged at Gate 2 for a reason that was decided before it was ever proposed.
+-- The ceiling is the platforms': every one of the four caps a short at ninety
+-- seconds or less.
 alter table public.clip_candidates drop constraint if exists clip_candidates_publishable_length;
 alter table public.clip_candidates add constraint clip_candidates_publishable_length
-  check (end_seconds - start_seconds between 3 and 90);
+  check (end_seconds - start_seconds between 5 and 90);
 
 -- A decision names its decider and its moment, or it is not a decision. The
 -- same rule, written the same way, as `productions_script_approval_is_attributed`.
@@ -402,8 +407,105 @@ on conflict (slug) do update
       is_active        = excluded.is_active,
       description      = excluded.description;
 
+-- Which modes cut a range out of an uploaded recording.
+--
+-- A function rather than a literal, for the same reason
+-- `render_mode_needs_source` is one: "does this preset need a clip range?" gets
+-- one answer that the gate, the picker's mirror of it and the pipeline are all
+-- checked against.
+create or replace function public.render_mode_needs_clip(p_mode text)
+returns boolean
+language sql
+immutable
+set search_path = public
+as $$
+  select coalesce(p_mode, 'mpt') in ('clip');
+$$;
+
+grant execute on function public.render_mode_needs_clip(text) to authenticated, service_role;
+
+comment on function public.render_mode_needs_clip(text) is
+  'Whether a render mode cuts a range out of an uploaded recording, and therefore requires an idea created by accepting a clip candidate. Such a preset is not a valid choice at Gate 1.';
+
 -- -----------------------------------------------------------------------------
--- 6. approvals learns the third gate
+-- 6. Gate 1 cannot choose a style that needs a clip it has no range for
+-- -----------------------------------------------------------------------------
+--
+-- The `clip-cut` preset ships **active**, unlike `fal-restyle` beside it, and it
+-- has to: it is what `accept_clip_candidate` attaches to every clip, and
+-- `create_clip_source` refuses an inactive style. But an active preset is a
+-- pickable one, and picking it for an ordinary trend idea would produce a
+-- production with no range to cut -- which fails in `_clip_plan` after the owner
+-- had already approved it.
+--
+-- So the rule is stated where it holds rather than left to the browser hiding
+-- the option: an idea may only be approved with a clip style if it *is* a clip.
+-- Replaced verbatim from `20260902170000_approval_queue.sql` apart from that one
+-- block, because Postgres has no way to add a statement to a function.
+create or replace function public.approve_idea(
+  p_idea_id  uuid,
+  p_style_id uuid,
+  p_note     text default null
+)
+returns public.ideas
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_idea public.ideas;
+  v_mode text;
+begin
+  if not public.is_owner() then
+    raise exception 'Only an owner may approve an idea' using errcode = '42501';
+  end if;
+
+  select sp.render_mode into v_mode
+    from public.style_presets sp
+   where sp.id = p_style_id and sp.is_active;
+
+  if v_mode is null then
+    raise exception 'Unknown or inactive style preset' using errcode = '22023';
+  end if;
+
+  -- The new block. `clip_candidate_id` is what makes an idea a clip, and it is
+  -- set only by `accept_clip_candidate`; an idea from the trend scout has none
+  -- and there is nothing for this style to cut.
+  if public.render_mode_needs_clip(v_mode)
+     and not exists (
+       select 1 from public.ideas
+        where id = p_idea_id and clip_candidate_id is not null
+     ) then
+    raise exception 'That style cuts a clip out of an uploaded recording, so it can only be used for a clip you accepted from one. Upload a recording on the Clips page instead.'
+      using errcode = '22023';
+  end if;
+
+  update public.ideas
+     set status            = 'approved',
+         approved_style_id = p_style_id,
+         decided_by        = auth.uid(),
+         decided_at        = now(),
+         decision_note     = p_note
+   where id = p_idea_id
+     and status = 'pending'
+  returning * into v_idea;
+
+  if v_idea.id is null then
+    raise exception 'Idea % is not pending', p_idea_id using errcode = 'P0002';
+  end if;
+
+  insert into public.approvals (gate, subject_type, subject_id, decision, note, style_preset_id, actor_id)
+  values (1, 'idea', p_idea_id, 'approved', p_note, p_style_id, auth.uid());
+
+  return v_idea;
+end;
+$$;
+
+revoke all on function public.approve_idea(uuid, uuid, text) from public, anon;
+grant execute on function public.approve_idea(uuid, uuid, text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- 7. approvals learns the third gate
 -- -----------------------------------------------------------------------------
 --
 -- A clip decision is recorded the way every other gate decision is, in the same
@@ -427,7 +529,7 @@ comment on column public.approvals.gate is
   'Which gate this decision was made at. 1 = an idea and its style, 2 = a finished cut, 3 = a proposed clip candidate. Gate 3 only exists on the clipping path.';
 
 -- -----------------------------------------------------------------------------
--- 7. Registering an upload
+-- 8. Registering an upload
 -- -----------------------------------------------------------------------------
 --
 -- The bytes go to Storage from the browser, under the `sources/` policies the
@@ -551,7 +653,7 @@ revoke all on function public.retry_clip_source(uuid) from public, anon;
 grant execute on function public.retry_clip_source(uuid) to authenticated;
 
 -- -----------------------------------------------------------------------------
--- 8. The clip gate
+-- 9. The clip gate
 -- -----------------------------------------------------------------------------
 --
 -- Modelled on `approve_script`, and on the same argument: the decision *is* the
@@ -758,7 +860,7 @@ revoke all on function public.discard_clip_candidate(uuid, text) from public, an
 grant execute on function public.discard_clip_candidate(uuid, text) to authenticated;
 
 -- -----------------------------------------------------------------------------
--- 9. The worker's claim
+-- 10. The worker's claim
 -- -----------------------------------------------------------------------------
 --
 -- `claim_production`'s idiom rather than `claim_trend_run`'s, and the difference
@@ -804,7 +906,7 @@ comment on function public.claim_clip_source(text, int) is
   'Take one uploaded recording that still needs work. Never returns a source at `awaiting_picks` — that is the whole of the clip gate — nor a `failed` one, which `retry_clip_source` readmits.';
 
 -- -----------------------------------------------------------------------------
--- 10. Row-level security
+-- 11. Row-level security
 -- -----------------------------------------------------------------------------
 --
 -- The same shape as every other table here: authenticated users read, and

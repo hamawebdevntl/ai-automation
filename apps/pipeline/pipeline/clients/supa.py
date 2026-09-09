@@ -531,7 +531,12 @@ class Supa:
         row = res.data
         if isinstance(row, list):
             row = row[0] if row else None
-        return row or None
+        # The same guard `claim_production` documents, and needed for the same
+        # reason: a function returning a table row answers with *nulls* rather
+        # than with no row when nothing matched, so `row` is truthy on an idle
+        # database. Without the id check the clip worker would treat that
+        # all-null row as a claim every twenty seconds and raise on it.
+        return row if row and row.get("id") else None
 
     def update_clip_source(self, source_id: str, **fields: Any) -> dict[str, Any]:
         """Write to a source and release the lease in the same statement.
@@ -578,6 +583,16 @@ class Supa:
         """
         if not rows:
             return []
+        # Clear first, and this is not defensive tidying. A worker killed
+        # between this insert and the `awaiting_picks` write leaves candidates
+        # behind on a source still at `proposing`, which the claim readmits --
+        # and the retry would then collide with `clip_candidates_rank_unique`
+        # and fail forever, burning one LLM call every time.
+        #
+        # Safe because it only ever runs at `proposing`, before the gate has
+        # opened: no candidate can carry a decision yet, so nothing an owner
+        # did is discarded.
+        self._c.table("clip_candidates").delete().eq("source_id", source_id).execute()
         payload = [{**row, "source_id": source_id} for row in rows]
         res = self._c.table("clip_candidates").insert(payload).execute()
         return res.data or []

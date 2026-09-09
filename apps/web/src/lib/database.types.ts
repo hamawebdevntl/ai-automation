@@ -73,6 +73,23 @@ export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
  */
 export const SOURCE_RENDER_MODES = ['fal_video'] as const satisfies readonly RenderMode[];
 
+/**
+ * Modes that cut a range out of an uploaded recording.
+ *
+ * A mirror of `render_mode_needs_clip` in Postgres. These presets are active —
+ * `accept_clip_candidate` attaches one to every clip, and `create_clip_source`
+ * refuses an inactive style — but they are *not* a valid choice at Gate 1: an
+ * ordinary idea has no range to cut, and a production made that way fails after
+ * the owner has already approved it. `approve_idea` refuses it; this is what
+ * keeps it out of the picker in the first place.
+ */
+export const CLIP_RENDER_MODES = ['clip'] as const satisfies readonly RenderMode[];
+
+/** Whether a preset cuts a clip, and therefore belongs only to the clip gate. */
+export function needsClipRange(mode: RenderMode): boolean {
+  return (CLIP_RENDER_MODES as readonly RenderMode[]).includes(mode);
+}
+
 /** The longest render instruction, matching `productions_render_instruction_length`. */
 export const MAX_INSTRUCTION_CHARS = 1500;
 
@@ -504,8 +521,15 @@ export type ClipCandidateRow = {
   created_at: string;
 };
 
-/** The bounds `clip_candidates_publishable_length` enforces, mirrored for display. */
-export const MIN_CLIP_SECONDS = 3;
+/**
+ * The bounds `clip_candidates_publishable_length` enforces, mirrored for display.
+ *
+ * The floor is the quality check's own (`MIN_DURATION_S` in
+ * `pipeline/qc/slideshow.py`), which fails a render under it as too short to
+ * publish — so a shorter clip could be accepted and then flagged at Gate 2 for
+ * a reason settled before it was proposed.
+ */
+export const MIN_CLIP_SECONDS = 5;
 export const MAX_CLIP_SECONDS = 90;
 
 /** What `create_clip_source` accepts for `p_candidate_cap`. */

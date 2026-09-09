@@ -166,7 +166,12 @@ def test_the_duration_falls_back_to_the_transcript_when_unmeasured():
 @pytest.mark.parametrize(
     "start,end,why",
     [
-        (10.0, 11.0, "under the three-second floor"),
+        (10.0, 11.0, "far under the floor"),
+        # 4s is the case the floor moved for: the quality check fails anything
+        # under five seconds as "too short to publish", so a 4s candidate could
+        # be accepted, rendered and then flagged for a reason settled before it
+        # was proposed.
+        (10.0, 14.0, "just under the quality check's own floor"),
         (0.0, 100.0, "over the ninety-second ceiling"),
         (50.0, 40.0, "runs backwards"),
         (50.0, 50.0, "has no length"),
@@ -202,6 +207,25 @@ def test_a_range_with_no_speech_in_it_is_dropped():
     """
     t = transcript((0.0, 10.0, "Talking."), (200.0, 210.0, "Talking again."))
     assert clips.validate([Draft(60.0, 90.0)], transcript=t, cap=6) == []
+
+
+def test_a_clip_exactly_at_the_floor_is_kept():
+    """5s is publishable; the quality check passes it. Only under it fails."""
+    rows = clips.validate([Draft(10.0, 15.0)], transcript=talk(), cap=6)
+    assert len(rows) == 1
+    assert rows[0]["end_seconds"] - rows[0]["start_seconds"] == 5.0
+
+
+def test_the_floor_matches_the_quality_check_that_would_fail_the_render():
+    """If these drift, a clip is accepted and then flagged for being too short.
+
+    `slideshow.build_report` fails a render under `MIN_DURATION_S`, so a
+    candidate shorter than that is one an owner would approve and wait for
+    before being told it was never publishable.
+    """
+    from pipeline.qc import slideshow
+
+    assert clips.MIN_CLIP_SECONDS >= slideshow.MIN_DURATION_S
 
 
 def test_a_negative_start_is_clamped_to_zero():

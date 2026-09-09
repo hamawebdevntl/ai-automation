@@ -150,7 +150,13 @@ def submit_render(
     # `claim_render_slot` would park the row holding a `task_id` that nothing an
     # owner can reach is able to unset, and its script and footage would be
     # uneditable forever.
-    if mode == MPT:
+    #
+    # `FAL_VISUALS` is included even though its *submit* only talks to fal: that
+    # lane hands its clips to MoneyPrinterTurbo at the first poll, so a missing
+    # base URL there would otherwise be discovered after fal had been billed.
+    # Checking it here keeps the failure free, which is the whole point of doing
+    # any of this before the claim.
+    if mode in (MPT, FAL_VISUALS):
         mpt = mpt or MptClient()
 
     task_id = production_id
@@ -695,9 +701,13 @@ def poll_render(
     # function serves both backends unchanged -- which is why the state machine
     # does not need to know which one ran.
     if backend in FAL_MODES and event.get("phase") == "fal":
-        # The visuals lane hands its clips to MoneyPrinterTurbo when generation
-        # finishes, so this one branch does need a client -- and only this one.
-        return _poll_fal(event, supa, mpt or MptClient(), polls)
+        # Passed through as-is, including None. Only the visuals lane's handoff
+        # actually needs a client, and `_handoff_to_mpt` builds one there --
+        # constructing it here would make `fal_full` and `fal_video`, which
+        # never speak to MoneyPrinterTurbo at all, fail at their first poll on a
+        # deployment that has no MPT. That failure would land *after* fal had
+        # been billed, which is the one place it must not.
+        return _poll_fal(event, supa, mpt, polls)
 
     if backend == HEYGEN:
         return _poll_heygen(event, supa, polls)
@@ -773,7 +783,7 @@ def poll_render(
 
 
 def _poll_fal(
-    event: dict[str, Any], supa: Supa, mpt: MptClient, polls: int, fal: FalClient | None = None
+    event: dict[str, Any], supa: Supa, mpt: MptClient | None, polls: int, fal: FalClient | None = None
 ) -> dict[str, Any]:
     """Poll a fal generation, and hand off when it finishes.
 
@@ -934,7 +944,7 @@ def _poll_heygen(
 def _handoff_to_mpt(
     event: dict[str, Any],
     supa: Supa,
-    mpt: MptClient,
+    mpt: MptClient | None,
     fal: FalClient,
     urls: list[str],
     carry: dict[str, Any],
@@ -948,6 +958,13 @@ def _handoff_to_mpt(
     later.
     """
     production_id = event["production_id"]
+    # This is the only place on any lane that needs MoneyPrinterTurbo without
+    # having asked for it at submit time, so it is where the client is built.
+    # `submit_render` already refused this production if the base URL was
+    # missing -- before the claim, and therefore before fal was billed -- so
+    # reaching here without one means the configuration changed under a render
+    # that is already paid for. The constructor says so and the row parks.
+    mpt = mpt or MptClient()
     production = supa.production(production_id)
     idea = supa.idea(production["idea_id"])
     preset = supa.style_preset(production["style_preset_id"])
