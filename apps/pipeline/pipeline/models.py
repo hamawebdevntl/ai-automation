@@ -80,6 +80,117 @@ LIVE_STATUSES: tuple[str, ...] = (
 )
 
 
+class ClipSourceStatus(str, Enum):
+    """`clip_sources.status`.
+
+    Three working states, one waiting state and two ends. `AWAITING_PICKS` is
+    the same kind of thing as `AWAITING_SCRIPT` and `AWAITING_REVIEW` --
+    stopped, deliberately, for a person -- and `claim_clip_source` excludes it
+    for the same reason `claim_production` excludes the other two.
+    """
+
+    UPLOADED = "uploaded"
+    TRANSCRIBING = "transcribing"
+    PROPOSING = "proposing"
+    AWAITING_PICKS = "awaiting_picks"
+    RESOLVED = "resolved"
+    FAILED = "failed"
+
+
+# Statuses a clip source is still the pipeline's problem at. The mirror of
+# `LIVE_STATUSES` below, and the same predicate `claim_clip_source` uses.
+CLIP_WORKING_STATUSES: tuple[str, ...] = (
+    ClipSourceStatus.UPLOADED.value,
+    ClipSourceStatus.TRANSCRIBING.value,
+    ClipSourceStatus.PROPOSING.value,
+)
+
+
+class TranscriptSegment(BaseModel):
+    """One timed span of speech.
+
+    The timings are the product on the clipping lane, not a detail: the model
+    picks its timecodes from these, and the burned-in captions are built from
+    the same list, so a clip's captions cannot disagree with the range that was
+    chosen for it.
+    """
+
+    start: float
+    end: float
+    text: str
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+class Transcript(BaseModel):
+    """`clip_sources.transcript`.
+
+    Stored rather than recomputed. Transcription is the one paid call on this
+    lane and it is charged per minute of audio, so re-running it to caption a
+    clip -- when the clip's range was chosen from these very segments -- would
+    be paying twice for the same words.
+    """
+
+    model_config = {"extra": "allow"}
+
+    text: str = ""
+    language: str | None = None
+    model: str | None = None
+    segments: list[TranscriptSegment] = Field(default_factory=list)
+
+    def between(self, start: float, end: float) -> list[TranscriptSegment]:
+        """Segments that overlap [start, end], clamped to it.
+
+        Overlap rather than containment. A candidate's boundary almost never
+        falls exactly on a segment edge, and dropping the two partial segments
+        at the ends would silently lose the first and last words of every clip
+        -- including the hook, which is the one line that decides whether
+        anybody watches.
+        """
+        out: list[TranscriptSegment] = []
+        for seg in self.segments:
+            if seg.end <= start or seg.start >= end:
+                continue
+            out.append(
+                TranscriptSegment(
+                    start=max(seg.start, start),
+                    end=min(seg.end, end),
+                    text=seg.text,
+                )
+            )
+        return out
+
+    def excerpt(self, start: float, end: float) -> str:
+        """What is said in the range, as one block of text."""
+        return " ".join(s.text.strip() for s in self.between(start, end) if s.text.strip()).strip()
+
+
+class ClipCandidateDraft(BaseModel):
+    """One clip the model proposes. The schema it is asked to fill.
+
+    Every field is something the owner reads at the gate. `reason` in
+    particular is required rather than optional: a range nobody can justify in
+    a sentence is one to discard, and asking the model to write that sentence is
+    most of what makes the list rankable.
+    """
+
+    start_seconds: float = Field(description="Where the clip starts in the recording, in seconds.")
+    end_seconds: float = Field(description="Where it ends, in seconds. Must be after the start.")
+    title: str = Field(description="A short title for the clip. Not a sentence.")
+    hook: str = Field(description="The first line as it will be spoken or read. One sentence.")
+    reason: str = Field(
+        description="Why this range stands alone without the rest of the recording. One or two sentences."
+    )
+
+
+class ClipCandidateList(BaseModel):
+    """The model's whole answer, ranked best first."""
+
+    candidates: list[ClipCandidateDraft] = Field(default_factory=list)
+
+
 class VelocityLabel(str, Enum):
     BREAKOUT = "breakout"
     RISING = "rising"

@@ -232,14 +232,35 @@ class FalClient:
 
     # -- transcription -----------------------------------------------------
 
-    def transcribe(self, audio_url: str, model: str | None = None) -> dict[str, Any]:
-        """Word-level timings for burned-in captions.
+    def transcribe(
+        self,
+        audio_url: str,
+        model: str | None = None,
+        chunk_level: str | None = None,
+    ) -> dict[str, str]:
+        """Timings for burned-in captions, and for choosing a clip.
 
-        Needed only on the end-to-end path. MoneyPrinterTurbo's captioner is
-        selected by global config rather than per request, so it cannot be
-        borrowed for a render it did not produce -- and generating an SRT from
-        a script without timings would drift out of sync immediately.
+        Two callers now want different granularities, which is why
+        `chunk_level` exists rather than being fixed.
+
+        The end-to-end fal lane wants words: it is captioning narration it just
+        synthesised, and word timings are what keep a caption track in sync
+        past the first couple of sentences.
+
+        The clipping lane wants *segments*. A model choosing where a clip
+        starts and ends is choosing between sentences, and word-level chunks of
+        an hour-long recording are both far more tokens than that decision needs
+        and a worse input for it -- a sentence boundary is a natural place for a
+        clip to begin and a word boundary is not. The same segments are then
+        what the captions are burned from, so the range and the captions come
+        from one list and cannot disagree.
+
+        Left unset the model's own default applies, which is what the fal_full
+        lane relied on before this parameter existed.
         """
         endpoint = model or settings().fal_transcribe_model
-        handles = self.submit(endpoint, {"audio_url": audio_url})
+        payload: dict[str, Any] = {"audio_url": audio_url}
+        if chunk_level:
+            payload["chunk_level"] = chunk_level
+        handles = self.submit(endpoint, payload)
         return handles

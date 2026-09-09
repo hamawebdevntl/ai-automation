@@ -45,8 +45,13 @@ export type StyleLane = 'stock' | 'generative' | 'presenter';
  *  - `fal_video`   fal transforms footage the owner uploaded, guided by an
  *                  instruction the owner wrote. The only mode whose input is a
  *                  file rather than text.
+ *  - `clip`        no provider at all: a range is cut out of an uploaded
+ *                  recording, reframed to 9:16 and captioned from its own
+ *                  transcript. The only mode with no per-render API cost —
+ *                  the transcription and the candidate list are charged once
+ *                  against the upload, not per clip.
  */
-export type RenderMode = 'mpt' | 'fal_visuals' | 'fal_full' | 'heygen' | 'fal_video';
+export type RenderMode = 'mpt' | 'fal_visuals' | 'fal_full' | 'heygen' | 'fal_video' | 'clip';
 
 export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
   mpt: 'Standard render',
@@ -54,6 +59,7 @@ export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
   fal_full: 'fal end to end',
   heygen: 'HeyGen presenter',
   fal_video: 'fal, from your own footage',
+  clip: 'Cut from your recording',
 };
 
 /**
@@ -66,6 +72,23 @@ export const RENDER_MODE_LABELS: Record<RenderMode, string> = {
  * it.
  */
 export const SOURCE_RENDER_MODES = ['fal_video'] as const satisfies readonly RenderMode[];
+
+/**
+ * Modes that cut a range out of an uploaded recording.
+ *
+ * A mirror of `render_mode_needs_clip` in Postgres. These presets are active —
+ * `accept_clip_candidate` attaches one to every clip, and `create_clip_source`
+ * refuses an inactive style — but they are *not* a valid choice at Gate 1: an
+ * ordinary idea has no range to cut, and a production made that way fails after
+ * the owner has already approved it. `approve_idea` refuses it; this is what
+ * keeps it out of the picker in the first place.
+ */
+export const CLIP_RENDER_MODES = ['clip'] as const satisfies readonly RenderMode[];
+
+/** Whether a preset cuts a clip, and therefore belongs only to the clip gate. */
+export function needsClipRange(mode: RenderMode): boolean {
+  return (CLIP_RENDER_MODES as readonly RenderMode[]).includes(mode);
+}
 
 /** The longest render instruction, matching `productions_render_instruction_length`. */
 export const MAX_INSTRUCTION_CHARS = 1500;
@@ -388,6 +411,132 @@ export type TrendRunRow = {
 /** The button, or the dispatcher acting on the owner's schedule. */
 export type TrendRunTrigger = 'manual' | 'schedule';
 
+// ---------------------------------------------------------------------------
+// Intelligent clipping
+// ---------------------------------------------------------------------------
+
+/**
+ * How far an uploaded recording has got.
+ *
+ * `awaiting_picks` is the gate, and the same kind of state as
+ * `awaiting_script`: stopped on purpose, waiting for a person, with no timeout
+ * on it. `claim_clip_source` does not return a row in it, which is the whole of
+ * the mechanism — there is no token and no callback.
+ *
+ * `failed` costs nothing and is retryable through `retry_clip_source`: every
+ * phase before the gate is a transcription and one LLM call, and no render has
+ * happened at any point.
+ */
+export type ClipSourceStatus = 'uploaded' | 'transcribing' | 'proposing' | 'awaiting_picks' | 'resolved' | 'failed';
+
+/** Statuses where the pipeline is still working and the owner just waits. */
+export const CLIP_WORKING_STATUSES = [
+  'uploaded',
+  'transcribing',
+  'proposing',
+] as const satisfies readonly ClipSourceStatus[];
+
+export const CLIP_SOURCE_STATUS_LABELS: Record<ClipSourceStatus, string> = {
+  uploaded: 'Queued',
+  transcribing: 'Transcribing',
+  proposing: 'Finding clips',
+  awaiting_picks: 'Ready to review',
+  resolved: 'Done',
+  failed: 'Failed',
+};
+
+/** One timed span of speech. The timings are what the clip ranges are chosen from. */
+export type TranscriptSegment = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+/** `clip_sources.transcript`, written by the pipeline. */
+export type ClipTranscript = {
+  text?: string;
+  language?: string | null;
+  model?: string | null;
+  segments?: TranscriptSegment[];
+};
+
+export type ClipSourceRow = {
+  id: string;
+  /** Object key under `sources/clips/` in the private renders bucket. */
+  storage_key: string;
+  filename: string | null;
+  content_type: string | null;
+  size_bytes: number | null;
+  /** Measured by the pipeline with ffprobe. Null until it has looked at the file. */
+  duration_seconds: number | null;
+  /** The style every clip accepted from this recording renders with. Chosen once
+   *  at upload rather than per candidate: the gate is a fast yes/no on several
+   *  clips, and a style picker on each would make it several Gate 1 decisions. */
+  style_preset_id: string;
+  status: ClipSourceStatus;
+  transcript: ClipTranscript;
+  /** How many candidates the model may propose. Bounded 1–20 because the
+   *  constraint is reviewer attention, not model capability — see GAPS B7. */
+  candidate_cap: number;
+  error: string | null;
+  leased_by: string | null;
+  lease_expires_at: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ClipDecision = 'pending' | 'accepted' | 'discarded';
+
+/**
+ * One proposed clip.
+ *
+ * Everything here is text and numbers, which is the feature: an owner decides
+ * from a title, a hook, a reason and two timecodes — plus a scrub preview of
+ * the recording at the start point — and nothing has been rendered to make that
+ * possible.
+ */
+export type ClipCandidateRow = {
+  id: string;
+  source_id: string;
+  /** The model's ranking, 1 = best. Unique per source. */
+  rank: number;
+  start_seconds: number;
+  end_seconds: number;
+  title: string;
+  hook: string | null;
+  /** Why the model says this range stands alone. Required of it, and shown here. */
+  reason: string | null;
+  /** The words spoken in the range. Becomes the production's script, so the
+   *  owner reads what the clip says before it is cut — and a correction made at
+   *  the script gate reaches the burned-in captions. */
+  transcript_excerpt: string | null;
+  decision: ClipDecision;
+  decided_by: string | null;
+  decided_at: string | null;
+  decision_note: string | null;
+  /** The idea created on acceptance. Each accepted candidate gets its own,
+   *  which is what keeps `productions_one_live_per_idea` intact for a batch. */
+  idea_id: string | null;
+  created_at: string;
+};
+
+/**
+ * The bounds `clip_candidates_publishable_length` enforces, mirrored for display.
+ *
+ * The floor is the quality check's own (`MIN_DURATION_S` in
+ * `pipeline/qc/slideshow.py`), which fails a render under it as too short to
+ * publish — so a shorter clip could be accepted and then flagged at Gate 2 for
+ * a reason settled before it was proposed.
+ */
+export const MIN_CLIP_SECONDS = 5;
+export const MAX_CLIP_SECONDS = 90;
+
+/** What `create_clip_source` accepts for `p_candidate_cap`. */
+export const MIN_CANDIDATE_CAP = 1;
+export const MAX_CANDIDATE_CAP = 20;
+export const DEFAULT_CANDIDATE_CAP = 6;
+
 export type IdeaRow = {
   id: string;
   title: string;
@@ -412,6 +561,16 @@ export type IdeaRow = {
   relevance: number | null;
   /** One sentence on how the idea connects to that description. Null unless the run had a prompt. */
   connection: string | null;
+  /** The uploaded recording this idea was clipped from, and the shared parent
+   *  for a batch: every clip accepted from one upload carries the same value,
+   *  which is how the queue groups them. Null on every non-clip idea. */
+  clip_source_id: string | null;
+  /** The candidate an owner accepted to create this idea. */
+  clip_candidate_id: string | null;
+  /** The range, copied from the candidate at the moment of acceptance rather
+   *  than read through it, so a re-run reproduces exactly what was said yes to. */
+  clip_start_seconds: number | null;
+  clip_end_seconds: number | null;
 };
 
 export type ProductionRow = {
@@ -528,8 +687,10 @@ export type ProductionEventOutcome =
 
 export type ApprovalRow = {
   id: string;
-  gate: 1 | 2;
-  subject_type: 'idea' | 'production';
+  /** 1 = an idea and its style, 2 = a finished cut, 3 = a proposed clip
+   *  candidate. Gate 3 exists only on the clipping path. */
+  gate: 1 | 2 | 3;
+  subject_type: 'idea' | 'production' | 'clip_candidate';
   subject_id: string;
   decision: ApprovalDecision;
   note: string | null;
@@ -585,11 +746,41 @@ export interface Database {
         Update: never;
         Relationships: [];
       };
+      clip_sources: {
+        Row: ClipSourceRow;
+        // Registered by `create_clip_source` and advanced by the service-role
+        // worker. Neither path goes through this client, and there is no insert
+        // or update policy on the table for one to go through.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
+      clip_candidates: {
+        Row: ClipCandidateRow;
+        // Written by the worker; decided by `accept_clip_candidate` and
+        // `discard_clip_candidate`, which is what keeps 'record the decision'
+        // and 'write the audit row' in one transaction.
+        Insert: never;
+        Update: never;
+        Relationships: [];
+      };
       ideas: {
         Row: IdeaRow;
         Insert: Omit<
           IdeaRow,
-          'id' | 'created_at' | 'target_platforms' | 'status' | 'trend_run_id' | 'relevance' | 'connection'
+          | 'id'
+          | 'created_at'
+          | 'target_platforms'
+          | 'status'
+          | 'trend_run_id'
+          | 'relevance'
+          | 'connection'
+          // Written only by `accept_clip_candidate`, which creates the idea and
+          // its production together.
+          | 'clip_source_id'
+          | 'clip_candidate_id'
+          | 'clip_start_seconds'
+          | 'clip_end_seconds'
         > & {
           id?: string;
           created_at?: string;
@@ -748,6 +939,43 @@ export interface Database {
       request_script_redraft: {
         Args: { p_production_id: string; p_note?: string | null };
         Returns: ProductionRow;
+      };
+      // Intelligent clipping. The bytes reach Storage under the `sources/`
+      // policies the footage lane added; `create_clip_source` is the row change
+      // that makes the object something the pipeline will pick up.
+      create_clip_source: {
+        // The key is validated against the `sources/clips/` prefix, so a caller
+        // cannot register an object it could not have written.
+        Args: {
+          p_key: string;
+          p_style_id: string;
+          p_filename?: string | null;
+          p_content_type?: string | null;
+          p_bytes?: number | null;
+          p_candidate_cap?: number | null;
+        };
+        Returns: ClipSourceRow;
+      };
+      // Another go at a recording that failed to transcribe or propose. Costs
+      // nothing — no render exists — and returns to the phase whose output is
+      // missing rather than to the start, so a transcript is not thrown away
+      // because the LLM call after it failed.
+      retry_clip_source: {
+        Args: { p_source_id: string };
+        Returns: ClipSourceRow;
+      };
+      // The clip gate. Accepting is the expensive direction: it creates an idea
+      // and a production, which will reach `submit_render`. Discarding writes a
+      // decision and nothing else. Both are owner-gated in SQL and both write a
+      // gate-3 row to `approvals`, so a clip decision is recorded exactly as
+      // every other gate decision is.
+      accept_clip_candidate: {
+        Args: { p_candidate_id: string; p_note?: string | null };
+        Returns: ClipCandidateRow;
+      };
+      discard_clip_candidate: {
+        Args: { p_candidate_id: string; p_note?: string | null };
+        Returns: ClipCandidateRow;
       };
       // The source-footage lane. Three inputs, three functions, and the same
       // owner check and audit row as everything above — but note what is *not*

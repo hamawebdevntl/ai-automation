@@ -120,7 +120,10 @@ boundary is what lets it be left undeployed.
 
 **Approval** is a small internal web app (`apps/web/`): a queue of pending ideas
 with cost per style at Gate 1, an editor for the drafted script at the script
-gate, and a preview with approve/reject at Gate 2. It is a static Vite +
+gate, a preview with approve/reject at Gate 2, and — when a recording has been
+uploaded to clip — a shortlist of proposed clips to accept or discard, each with
+its timecodes, the words it says and a scrub preview of the source. It is a
+static Vite +
 TanStack Router SPA talking to Supabase directly, with no server of its own —
 which means row-level security and a handful of Postgres functions, not the
 browser, are what decide who may pass a gate.
@@ -176,6 +179,18 @@ forgotten. Its preset (`fal-restyle`) ships **inactive**: video-to-video is
 priced above text-to-video, its cost depends on how long a file you upload, and
 there is no spend cap yet — so nobody should be able to pick it by accident
 before those two are answered.
+
+A sixth mode, `clip`, **generates nothing at all**. An owner uploads a long
+recording — a talk, a webinar, a call — it is transcribed once, and a model
+proposes ranked candidate clips with timecodes and a stated reason for each. The
+owner accepts the ones worth making at a third gate, and each accepted candidate
+becomes an ordinary production that cuts that range, reframes it to 9:16 and
+burns in captions from the transcript the range was chosen from.
+
+The point of the gate is what it costs to say no. Transcription and one LLM call
+are charged once per *upload*, not per clip, so discarding nine candidates out of
+ten costs cents — where a top-N auto-cutter would have paid for ten renders to
+find out the same thing. It is the script gate's argument applied to cuts.
 
 ---
 

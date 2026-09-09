@@ -82,6 +82,43 @@ def _paragraphs(preset: dict[str, Any]) -> int:
     return 1
 
 
+def _clip_excerpt(idea: dict[str, Any], supa: Supa) -> str | None:
+    """The words spoken in this clip, or None if this is not a clip.
+
+    Read from the candidate rather than recomputed from the transcript. The
+    candidate's excerpt is what the owner saw at the clip gate when they
+    accepted it, so using anything else here would show them different words at
+    the script gate than the ones they said yes to.
+
+    An excerpt that is empty parks the production, and that is the correct
+    outcome rather than a harsh one. The script gate structurally requires words
+    -- `clean_script` refuses an empty script and
+    `productions_approved_script_not_empty` refuses to record an approval of one
+    -- so a clip with nothing said in it would rest at the gate forever with
+    nothing an owner could approve. `clips.validate` drops such a range before
+    it is ever proposed, so reaching here means the two have drifted apart.
+    """
+    if not idea.get("clip_candidate_id"):
+        return None
+    candidate = supa.clip_candidate_for_idea(idea["id"])
+    if candidate is None:
+        # The idea says it came from a candidate and the candidate is gone.
+        # Parking is right: this is our inconsistency, not the owner's, and a
+        # drafted script would silently replace the recording's own words.
+        raise ValueError(
+            f"idea {idea['id']} was accepted from clip candidate "
+            f"{idea['clip_candidate_id']}, which no longer exists"
+        )
+    excerpt = (candidate.get("transcript_excerpt") or "").strip()
+    if not excerpt:
+        raise ValueError(
+            f"clip candidate {candidate['id']} has no transcribed words, so there "
+            f"is no script for an owner to approve. `clips.validate` should have "
+            f"dropped this candidate before it was proposed."
+        )
+    return excerpt
+
+
 def write_script(
     event: dict[str, Any], supa: Supa | None = None, mpt: TextGenerator | None = None
 ) -> dict[str, Any]:
@@ -116,6 +153,35 @@ def write_script(
             "script_chars": len(existing),
             "script_source": "kept",
             "drafted_redraft": drafted,
+            "redraft": requested,
+        }
+
+    # A clip already has its words: they were spoken in the recording. Drafting
+    # narration for one would be inventing a script for a video that says
+    # something else -- and the transcript excerpt is the *point* of the gate on
+    # this lane, because it is what the owner reads to check the clip says what
+    # the candidate claimed, and what gets burned in as captions if they correct
+    # it. See `clips.caption_segments`.
+    #
+    # No LLM call, so no retry policy is consumed and a deployment with no model
+    # key at all can still clip.
+    excerpt = _clip_excerpt(idea, supa)
+    if excerpt is not None:
+        supa.update_production(
+            production_id,
+            script=excerpt,
+            script_updated_at=_now_iso(),
+            stage="transcript ready to review",
+        )
+        log.info(
+            "production %s: script is the transcript of its clip (%d characters)",
+            production_id,
+            len(excerpt),
+        )
+        return {
+            "script_chars": len(excerpt),
+            "script_source": "transcript",
+            "drafted_redraft": requested,
             "redraft": requested,
         }
 

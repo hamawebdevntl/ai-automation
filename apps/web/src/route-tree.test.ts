@@ -33,6 +33,15 @@ describe('route tree', () => {
     expect(matchedRouteIds('/queue').at(-1)).toBe('/_app/queue');
     expect(matchedRouteIds('/review').at(-1)).toBe('/_app/review');
   });
+
+  // The clip gate is a signed-in page like the other two: under `_app`, so it
+  // inherits the auth guard rather than needing one of its own.
+  it('puts the clip gate behind the app layout', () => {
+    const ids = matchedRouteIds('/clips');
+
+    expect(ids.at(-1)).toBe('/_app/clips');
+    expect(ids).toContain('/_app');
+  });
 });
 
 /**

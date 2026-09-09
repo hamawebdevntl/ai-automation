@@ -85,6 +85,52 @@ class Settings(BaseSettings):
         default=6 * 3600, alias="SOURCE_VIDEO_URL_TTL_SECONDS"
     )
 
+    # --- Intelligent clipping -----------------------------------------------
+    # The lane that cuts an uploaded recording down rather than generating
+    # anything. Everything here is about the two calls that happen *before* the
+    # gate: transcription and one structured LLM call. Neither renders, which is
+    # what makes discarding a candidate free.
+
+    # How long to wait for a transcript.
+    #
+    # Far longer than `FalClient.wait`'s 240s default, which was sized for
+    # transcribing forty seconds of narration on the fal_full lane. Here the
+    # input is the whole recording -- an hour of webinar is a plausible upload --
+    # and the job also queues behind everything else in the fal account. Past
+    # this the source is marked failed, which costs nothing and is retryable.
+    clip_transcribe_budget_seconds: int = Field(
+        default=2700, alias="CLIP_TRANSCRIBE_BUDGET_SECONDS"
+    )
+
+    # How long a worker's claim on a `clip_sources` row survives unrenewed.
+    #
+    # Sized for the transcribe phase and deliberately longer than it, because a
+    # lease that expires mid-transcription hands the row to a second worker and
+    # pays fal twice for one file.
+    #
+    # "Longer than it" means longer than the *whole phase*, not just the
+    # transcription: that phase downloads the recording first -- up to the
+    # bucket's 5 GiB -- and runs ffprobe over it before fal is asked for
+    # anything. Against a 2700s transcribe budget, 3600s left only 900s for a
+    # multi-gigabyte transfer, which is not enough on a slow link. Twice the
+    # budget is, and an over-long lease costs only that a genuinely dead
+    # worker's row waits longer before being picked up again -- against paying
+    # for a transcription twice, that is the cheap direction to be wrong in.
+    clip_lease_seconds: int = Field(default=5400, alias="CLIP_LEASE_SECONDS")
+
+    # The longest recording that will be transcribed.
+    #
+    # A ceiling on the one cost here that scales with the owner's file rather
+    # than with our settings: fal bills transcription per minute of audio, and
+    # the upload length is chosen by whoever drags the file in. Four hours is
+    # generous for the intended input (a talk, a webinar, a podcast) and refuses
+    # the case that is almost certainly a mistake -- a whole day of recording
+    # dropped in by accident.
+    #
+    # Refused before transcription rather than after, so the bill is never
+    # incurred; the source fails with the measured duration in the message.
+    clip_max_source_seconds: int = Field(default=4 * 3600, alias="CLIP_MAX_SOURCE_SECONDS")
+
     # --- HeyGen -------------------------------------------------------------
     # The presenter lane. Selected per style preset via
     # style_presets.render_mode = 'heygen', so nothing here decides which

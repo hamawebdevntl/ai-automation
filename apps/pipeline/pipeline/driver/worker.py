@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 
+from pipeline.activities import clips as clip_activities
 from pipeline.clients.supa import Supa
 from pipeline.config import settings
 from pipeline.driver import engine
@@ -35,6 +36,11 @@ log = logging.getLogger(__name__)
 # How often the trends dispatcher looks for work. It returns in milliseconds
 # when there is none, which is almost every time.
 TRENDS_INTERVAL_SECONDS = 60
+
+# How often the clipping lane looks for an uploaded recording to work on. It
+# returns in milliseconds when there is none, which is almost every time -- one
+# indexed query against `clip_sources`.
+CLIPS_INTERVAL_SECONDS = 20
 
 
 def _worker_id(index: int) -> str:
@@ -97,6 +103,44 @@ def run_trends(stop: threading.Event) -> None:
     log.info("trend dispatcher stopped")
 
 
+def run_clips(stop: threading.Event) -> None:
+    """The clipping lane's pre-gate phases, as a thread.
+
+    Its own thread rather than a sweep slot, for the reason `driver/sweeps.py`
+    gives for keeping slow work out of that loop: "a slow one could starve
+    production stepping". Transcribing an hour of audio is minutes of waiting on
+    fal, and a sweep holding its slot for that long would stall lease recovery
+    for every production in the system.
+
+    The trend scout is in its own thread on exactly this argument and is the
+    pattern here. What is different is that this loop keeps going while there is
+    work: each call advances one recording by one phase, so a batch of three
+    uploads would otherwise take a minute to get started rather than seconds.
+    """
+    supa = Supa()
+    worker = _worker_id(0).replace("#0", "#clips")
+    log.info("clip worker %s started", worker)
+
+    while not stop.is_set():
+        try:
+            result = clip_activities.advance_clip_sources(supa, worker)
+        except Exception:
+            # `advance_clip_sources` already marks a failing source `failed` with
+            # the reason on the row. Reaching here means the claim itself failed
+            # -- a Supabase blip -- so there is nothing to record against and the
+            # right response is to wait and ask again.
+            log.exception("clip worker recovered from an error")
+            stop.wait(CLIPS_INTERVAL_SECONDS)
+            continue
+
+        if not result:
+            stop.wait(CLIPS_INTERVAL_SECONDS)
+        else:
+            log.info("clip worker: %s", result)
+
+    log.info("clip worker stopped")
+
+
 def main() -> int:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -118,6 +162,7 @@ def main() -> int:
     threads = [
         threading.Thread(target=run_sweeps, args=(stop,), name="sweeps", daemon=True),
         threading.Thread(target=run_trends, args=(stop,), name="trends", daemon=True),
+        threading.Thread(target=run_clips, args=(stop,), name="clips", daemon=True),
     ]
     threads += [
         threading.Thread(target=run_productions, args=(stop, i), name=f"prod-{i}", daemon=True)
